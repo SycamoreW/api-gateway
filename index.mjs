@@ -1269,6 +1269,16 @@ async function handleConfigAPI(req, res, url, body) {
     return true;
   }
 
+  if (url === '/api/config/export' && req.method === 'GET') {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    res.writeHead(200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Content-Disposition': `attachment; filename="api-gateway-backup-${stamp}.json"`,
+    });
+    res.end(JSON.stringify(config, null, 2));
+    return true;
+  }
+
   if (url === '/api/config/api-key' && req.method === 'POST') {
     const d = JSON.parse(body);
     const nextKey = String(d.api_key || '').trim();

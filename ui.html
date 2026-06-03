@@ -149,6 +149,7 @@
     <div id="channels"></div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
       <button class="btn btn-primary" onclick="showAddChannel()">+ 添加渠道</button>
+      <button class="btn btn-outline" onclick="exportBackup()">导出备份</button>
       <button class="btn btn-outline" onclick="showStopSequenceConfig()">流式截断设置</button>
       <button class="btn btn-outline" onclick="showApiKeyModal()">修改管理 Key</button>
     </div>
@@ -335,6 +336,35 @@ async function api(path, opts={}) {
     throw err;
   }
   return data;
+}
+
+async function exportBackup() {
+  if (!confirm('备份会包含所有渠道 Key 和管理 Key，确定导出？')) return;
+  try {
+    const res = await fetch('/api/config/export', {
+      headers: { 'Authorization': `Bearer ${KEY}` },
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error?.message || `HTTP ${res.status}`);
+    }
+    const blob = await res.blob();
+    const disposition = res.headers.get('content-disposition') || '';
+    const match = disposition.match(/filename="?([^"]+)"?/i);
+    const fallback = `api-gateway-backup-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+    const filename = match?.[1] || fallback;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    toast('备份已导出');
+  } catch(e) {
+    toast('导出失败: ' + e.message, false);
+  }
 }
 
 async function load() {
