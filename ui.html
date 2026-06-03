@@ -1,0 +1,932 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>聚合渠道</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d1117;color:#c9d1d9;min-height:100vh}
+  .container{max-width:960px;margin:0 auto;padding:24px 16px}
+  h1{font-size:26px;color:#58a6ff;margin-bottom:4px}
+  .subtitle{color:#8b949e;font-size:16px;margin-bottom:20px}
+  
+  .stats{display:flex;gap:16px;margin-bottom:20px;flex-wrap:wrap}
+  .stat{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px 16px;min-width:90px}
+  .stat .num{font-size:26px;font-weight:700;color:#58a6ff}
+  .stat .label{font-size:13px;color:#8b949e;margin-top:2px}
+  .stat .sub{font-size:12px;color:#484f58;margin-top:2px}
+  
+  .endpoint{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px 18px;margin-bottom:20px}
+  .endpoint h2{font-size:17px;color:#58a6ff;margin-bottom:10px}
+  .endpoint code{background:#0d1117;padding:3px 8px;border-radius:4px;font-size:14px;color:#79c0ff;word-break:break-all}
+  .endpoint .row{display:flex;gap:16px;flex-wrap:wrap;margin:6px 0}
+  .endpoint .col{flex:1;min-width:200px}
+  .endpoint .col label{font-size:13px;color:#8b949e;display:block;margin-bottom:2px}
+
+  .section-title{font-size:18px;color:#f0f6fc;margin:24px 0 12px;display:flex;align-items:center;gap:8px}
+  .section-title .badge{background:#238636;color:#fff;font-size:13px;padding:2px 8px;border-radius:10px}
+
+  .tabs{display:flex;gap:8px;border-bottom:1px solid #30363d;margin:0 0 18px;overflow-x:auto}
+  .tab-btn{background:transparent;border:none;border-bottom:2px solid transparent;color:#8b949e;cursor:pointer;font-size:16px;font-weight:600;padding:10px 14px;white-space:nowrap}
+  .tab-btn:hover{color:#c9d1d9;background:#161b22}
+  .tab-btn.active{color:#58a6ff;border-bottom-color:#58a6ff}
+  .tab-panel{display:none}
+  .tab-panel.active{display:block}
+  .tab-panel .section-title{margin-top:0}
+  
+  .btn{padding:6px 14px;border-radius:6px;border:none;cursor:pointer;font-size:15px;font-weight:500;transition:all .15s}
+  .btn-primary{background:#238636;color:#fff}.btn-primary:hover{background:#2ea043}
+  .btn-danger{background:#da3633;color:#fff}.btn-danger:hover{background:#f85149}
+  .btn-outline{background:transparent;border:1px solid #30363d;color:#c9d1d9}.btn-outline:hover{background:#1f2937}
+  .btn-sm{padding:3px 10px;font-size:13px}
+  
+  .channel{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px 18px;margin-bottom:10px}
+  .channel-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+  .channel-name{font-size:17px;font-weight:600;color:#f0f6fc}
+  .channel-info{font-size:13px;color:#8b949e}
+  .models{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}
+  .model-tag{background:#1f2937;color:#c9d1d9;font-size:13px;padding:2px 8px;border-radius:10px;border:1px solid #30363d;display:flex;align-items:center;gap:4px}
+  .stop-tag{background:#172033;color:#79c0ff;border-color:#264f78}
+  .model-tag .del{color:#f85149;cursor:pointer;font-weight:700;margin-left:2px;opacity:0;transition:opacity .15s}
+  .model-tag:hover .del{opacity:1}
+  .model-add{background:transparent;border:1px dashed #30363d;color:#58a6ff;font-size:13px;padding:3px 10px;border-radius:10px;cursor:pointer}
+  .model-add:hover{background:#1f2937}
+  
+  .modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:100;align-items:center;justify-content:center}
+  .modal-overlay.active{display:flex}
+  .modal{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:20px 24px;max-width:580px;width:92%;max-height:80vh;overflow-y:auto}
+  .modal h3{font-size:18px;color:#f0f6fc;margin-bottom:14px}
+  .modal label{font-size:14px;color:#8b949e;display:block;margin:10px 0 3px}
+  .modal input,.modal select,.modal textarea{width:100%;padding:8px 10px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;font-size:15px}
+  .modal textarea{min-height:78px;resize:vertical;font-family:inherit}
+  .modal input:focus,.modal select:focus,.modal textarea:focus{outline:none;border-color:#58a6ff}
+  .modal .hint{font-size:13px;color:#484f58;margin-top:2px}
+  .modal .checkbox-label{display:flex;align-items:center;gap:6px;font-size:14px;color:#c9d1d9;margin:8px 0;cursor:pointer}
+  .modal .checkbox-label input{width:auto}
+  .modal .actions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
+  
+  .model-picker{max-height:180px;overflow-y:auto;border:1px solid #30363d;border-radius:6px;margin:8px 0;padding:6px}
+  .model-picker label{display:flex;align-items:center;gap:6px;padding:4px 6px;border-radius:4px;cursor:pointer;margin:0;font-size:14px;color:#c9d1d9}
+  .model-picker label:hover{background:#1f2937}
+  .model-picker input{width:auto}
+  .model-picker .count{font-size:13px;color:#484f58;margin-left:auto}
+
+  .stats-panel{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px 18px;margin-top:12px}
+  .stats-toolbar{display:flex;gap:8px;align-items:center;justify-content:space-between;flex-wrap:wrap;margin-bottom:12px}
+  .stats-filters{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .stats-filters select,.stats-filters input{background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;font-size:14px;padding:5px 8px}
+  .stats-custom{display:none;gap:8px;align-items:center;flex-wrap:wrap}
+  .stats-custom.active{display:flex}
+  .stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+  .usage-card{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:12px}
+  .usage-card h3{font-size:15px;color:#f0f6fc;margin-bottom:10px}
+  .usage-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:10px;align-items:center;padding:7px 0;border-bottom:1px solid #21262d;font-size:14px}
+  .usage-row:last-child{border-bottom:none}
+  .usage-name{color:#c9d1d9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .usage-count{color:#79c0ff;font-variant-numeric:tabular-nums}
+  .usage-tokens{color:#8b949e;font-variant-numeric:tabular-nums}
+  .recent-list{display:flex;flex-direction:column;gap:6px;max-height:260px;overflow:auto}
+  .recent-entry{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px 10px;font-size:14px}
+  .recent-entry.fail{border-color:#7d2b2b;background:#1c1113}
+  .recent-top{display:flex;justify-content:space-between;gap:10px;margin-bottom:4px}
+  .recent-model{color:#f0f6fc;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .recent-time{color:#8b949e;font-size:13px;flex:none}
+  .recent-meta{color:#8b949e;display:flex;gap:8px;flex-wrap:wrap}
+
+  .logs-panel{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px 18px;margin-top:12px}
+  .logs-toolbar{display:flex;gap:8px;align-items:center;justify-content:space-between;flex-wrap:wrap;margin-bottom:10px}
+  .logs-toolbar .left{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .logs-toolbar select{background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;font-size:14px;padding:5px 8px}
+  .log-file{font-size:13px;color:#8b949e;word-break:break-all;margin-bottom:10px}
+  .log-list{display:flex;flex-direction:column;gap:6px;max-height:420px;overflow:auto}
+  .log-entry{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px 10px;font-size:14px}
+  .log-entry.error{border-color:#7d2b2b;background:#1c1113}
+  .log-entry.warn{border-color:#6b4d16;background:#18150c}
+  .log-top{display:flex;gap:8px;align-items:center;justify-content:space-between;flex-wrap:wrap;margin-bottom:4px}
+  .log-event{color:#79c0ff;font-weight:600}
+  .log-entry.error .log-event{color:#ff7b72}
+  .log-entry.warn .log-event{color:#d29922}
+  .log-time{color:#8b949e;font-size:13px}
+  .log-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:4px 10px;color:#8b949e}
+  .log-grid b{color:#c9d1d9;font-weight:500}
+  .log-details{margin-top:6px;color:#8b949e;white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}
+  
+  .toast{position:fixed;top:20px;right:20px;padding:10px 18px;border-radius:8px;font-size:15px;z-index:200;opacity:0;transition:opacity .3s}
+  .toast.show{opacity:1}
+  .toast-success{background:#238636;color:#fff}
+  .toast-error{background:#da3633;color:#fff}
+  
+  .footer{margin-top:28px;padding-top:14px;border-top:1px solid #30363d;font-size:13px;color:#484f58;text-align:center}
+  
+  .empty{text-align:center;padding:40px;color:#484f58;font-size:16px}
+  .empty .btn{margin-top:12px}
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>🔀 聚合渠道</h1>
+  <div class="subtitle">聚合模型代理 · SillyTavern / 任意 OpenAI 兼容客户端可用</div>
+  
+  <div class="stats" id="stats"></div>
+
+  <div class="endpoint">
+    <h2>📡 连接信息</h2>
+    <div class="row">
+      <div class="col"><label>API 地址</label><code id="apiUrl"></code></div>
+      <div class="col"><label>API Key</label><code id="apiKeyLabel">未设置</code></div>
+    </div>
+  </div>
+
+  <div class="tabs">
+    <button class="tab-btn active" data-tab="channels" onclick="switchTab('channels')">📦 渠道</button>
+    <button class="tab-btn" data-tab="logs" onclick="switchTab('logs')">🧾 日志</button>
+    <button class="tab-btn" data-tab="stats" onclick="switchTab('stats')">📊 统计</button>
+  </div>
+
+  <div class="tab-panel active" id="tab-channels">
+    <div class="section-title">📦 渠道 <span class="badge" id="chCount"></span></div>
+    <div id="channels"></div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
+      <button class="btn btn-primary" onclick="showAddChannel()">+ 添加渠道</button>
+      <button class="btn btn-outline" onclick="showStopSequenceConfig()">流式截断设置</button>
+      <button class="btn btn-outline" onclick="showApiKeyModal()">修改管理 Key</button>
+    </div>
+  </div>
+
+  <div class="tab-panel" id="tab-logs">
+    <div class="section-title">🧾 日志 <span class="badge" id="logCount">0</span></div>
+    <div class="logs-panel">
+      <div class="logs-toolbar">
+        <div class="left">
+          <button class="btn btn-outline btn-sm" onclick="loadLogs()">刷新</button>
+          <select id="logEventFilter" onchange="renderLogs()">
+            <option value="">全部事件</option>
+          </select>
+          <select id="logLimit" onchange="loadLogs()">
+            <option value="50">最近 50 条</option>
+            <option value="100" selected>最近 100 条</option>
+            <option value="200">最近 200 条</option>
+            <option value="500">最近 500 条</option>
+          </select>
+        </div>
+        <span class="channel-info">请求链路 / 路由 / 上游错误</span>
+      </div>
+      <div class="log-file" id="logFile">未加载</div>
+      <div class="log-list" id="logs"><div class="empty">暂无日志</div></div>
+    </div>
+  </div>
+
+  <div class="tab-panel" id="tab-stats">
+    <div class="section-title">📊 统计 <span class="badge" id="statsUpdated">未加载</span></div>
+    <div class="stats-panel">
+      <div class="stats-toolbar">
+        <div class="stats-filters">
+          <select id="statsRange" onchange="renderStatsForRange()">
+            <option value="all">全部时间</option>
+            <option value="today">今天</option>
+            <option value="7d">最近 7 天</option>
+            <option value="30d">最近 30 天</option>
+            <option value="custom">自定义</option>
+          </select>
+          <div class="stats-custom" id="statsCustomRange">
+            <input type="date" id="statsStart" onchange="renderStatsForRange()">
+            <span class="channel-info">到</span>
+            <input type="date" id="statsEnd" onchange="renderStatsForRange()">
+          </div>
+          <span class="channel-info" id="statsRangeLabel">全部时间</span>
+        </div>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-outline btn-sm" onclick="loadStats()">刷新</button>
+          <button class="btn btn-danger btn-sm" onclick="resetStats()">重置统计</button>
+        </div>
+      </div>
+      <div class="stats-grid">
+        <div class="usage-card">
+          <h3>热门模型</h3>
+          <div id="modelUsage"><div class="empty">暂无统计</div></div>
+        </div>
+        <div class="usage-card">
+          <h3>热门渠道</h3>
+          <div id="channelUsage"><div class="empty">暂无统计</div></div>
+        </div>
+        <div class="usage-card">
+          <h3>最近请求</h3>
+          <div class="recent-list" id="recentUsage"><div class="empty">暂无请求</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="footer">聚合渠道 · 小咲出品 💕</div>
+</div>
+
+<div class="modal-overlay" id="modal">
+  <div class="modal" id="modalContent"></div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const KEY_STORAGE = 'apiGatewayKey';
+let KEY = localStorage.getItem(KEY_STORAGE) || '';
+if (!KEY) {
+  KEY = prompt('聚合渠道管理 Key（初始默认 123456）') || '';
+  if (KEY) localStorage.setItem(KEY_STORAGE, KEY);
+}
+const HOST = location.hostname || '170.106.64.129';
+document.getElementById('apiUrl').textContent = `http://${HOST}:8300/v1`;
+document.getElementById('apiKeyLabel').textContent = KEY ? '已保存在本浏览器' : '未设置';
+
+let channels = {};
+let editingKey = null;
+let gatewayLogs = [];
+let logFile = '';
+let gatewayStats = null;
+let statsView = { label: '全部时间', totalRequests: 0, totalTokens: 0, modelUsage: {}, channelUsage: {}, recentLogs: [] };
+
+function toast(msg, ok=true) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = `toast toast-${ok?'success':'error'} show`;
+  setTimeout(() => el.classList.remove('show'), 2000);
+}
+
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, c => ({
+    '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+  }[c]));
+}
+
+function jsArg(value) {
+  return escapeHtml(JSON.stringify(String(value ?? '')));
+}
+
+function parseStopSequences(value) {
+  if (Array.isArray(value)) return [...new Set(value.map(v => String(v || '').trim()).filter(Boolean))];
+  return [...new Set(String(value || '').split(/[\n,，]+/).map(v => v.trim()).filter(Boolean))];
+}
+
+function getStopSequences(ch) {
+  if (Object.prototype.hasOwnProperty.call(ch, 'stream_stop_sequences')) {
+    return parseStopSequences(ch.stream_stop_sequences);
+  }
+  if (Object.prototype.hasOwnProperty.call(ch, 'stop_sequences')) {
+    return parseStopSequences(ch.stop_sequences);
+  }
+  return ch?.name === 'pio' ? ['<answer>'] : [];
+}
+
+function stopSequencesText(ch) {
+  return getStopSequences(ch).join('\n');
+}
+
+function showApiKeyModal() {
+  document.getElementById('modalContent').innerHTML = `
+    <h3>修改管理 Key</h3>
+    <label>新的管理 Key</label>
+    <input id="newApiKey" type="password" placeholder="至少 4 位" autocomplete="new-password">
+    <div class="hint">保存后会写入 config.json，并自动更新当前浏览器保存的 Key</div>
+    <div class="actions">
+      <button class="btn btn-outline" onclick="closeModal()">取消</button>
+      <button class="btn btn-primary" onclick="saveApiKey()">保存</button>
+    </div>`;
+  document.getElementById('modal').classList.add('active');
+  setTimeout(() => document.getElementById('newApiKey')?.focus(), 0);
+}
+
+async function saveApiKey() {
+  const nextKey = document.getElementById('newApiKey').value.trim();
+  if (nextKey.length < 4) { toast('管理 Key 至少 4 位', false); return; }
+  try {
+    const res = await api('/api/config/api-key', {
+      method: 'POST',
+      body: JSON.stringify({ api_key: nextKey })
+    });
+    if (res.ok) {
+      KEY = nextKey;
+      localStorage.setItem(KEY_STORAGE, KEY);
+      document.getElementById('apiKeyLabel').textContent = '已保存在本浏览器';
+      toast('管理 Key 已修改');
+      closeModal();
+    } else {
+      toast(res.error || '修改失败', false);
+    }
+  } catch(e) {
+    toast('修改失败: '+e.message, false);
+  }
+}
+
+function switchTab(tab) {
+  document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.tab === tab);
+  });
+  document.querySelectorAll('.tab-panel').forEach(panel => {
+    panel.classList.toggle('active', panel.id === `tab-${tab}`);
+  });
+}
+
+async function api(path, opts={}) {
+  const res = await fetch(path, { headers: { 'Authorization': `Bearer ${KEY}`, 'Content-Type': 'application/json' }, ...opts });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(data.error?.message || `HTTP ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
+  return data;
+}
+
+async function load() {
+  try {
+    const d = await api('/api/config');
+    channels = d.channels || {};
+  } catch(e) {
+    if (e.status === 401) {
+      localStorage.removeItem(KEY_STORAGE);
+      document.getElementById('apiKeyLabel').textContent = 'Key 错误，请刷新后重输';
+      document.getElementById('stats').innerHTML = `
+        <div class="stat"><div class="num" style="color:#f85149">!</div><div class="label">认证失败</div></div>
+      `;
+      document.getElementById('chCount').textContent = '认证失败';
+      document.getElementById('channels').innerHTML = '<div class="empty">聚合渠道 API Key 不正确<br><button class="btn btn-primary" onclick="location.reload()" style="margin-top:12px">重新输入 Key</button></div>';
+      toast('聚合渠道 API Key 不正确，已清除本地保存值', false);
+      return;
+    }
+    toast('加载配置失败', false);
+    return;
+  }
+  render();
+  loadStats();
+  loadLogs();
+}
+
+async function loadStats() {
+  try {
+    gatewayStats = await api('/api/stats');
+    renderStatsForRange();
+  } catch(e) {
+    document.getElementById('statsUpdated').textContent = '加载失败';
+    toast('统计加载失败: '+e.message, false);
+  }
+}
+
+async function resetStats() {
+  if (!confirm('确定清空所有请求统计？')) return;
+  try {
+    await api('/api/stats/reset', { method: 'POST', body: '{}' });
+    toast('统计已重置');
+    await loadStats();
+  } catch(e) {
+    toast('重置失败: '+e.message, false);
+  }
+}
+
+async function loadLogs() {
+  try {
+    const limit = document.getElementById('logLimit')?.value || '100';
+    const d = await api(`/api/logs?limit=${limit}`);
+    gatewayLogs = d.logs || [];
+    logFile = d.file || '';
+    renderLogFilter();
+    renderLogs();
+  } catch(e) {
+    document.getElementById('logs').innerHTML = '<div class="empty">日志加载失败</div>';
+    toast('日志加载失败: '+e.message, false);
+  }
+}
+
+function renderLogFilter() {
+  const select = document.getElementById('logEventFilter');
+  const current = select.value;
+  const hiddenEvents = new Set(['http_request', 'model_params', 'model_routed']);
+  const events = [...new Set(gatewayLogs.map(l => l.event).filter(Boolean))]
+    .filter(event => !hiddenEvents.has(event))
+    .sort();
+  select.innerHTML = '<option value="">全部事件</option>' + events.map(e => `<option value="${escapeHtml(e)}">${escapeHtml(e)}</option>`).join('');
+  if (events.includes(current)) select.value = current;
+}
+
+function logClass(entry) {
+  const event = entry.event || '';
+  if (Number(entry.statusCode) >= 400) return 'error';
+  if (event.includes('error') || event.includes('not_found') || event.includes('rejected') || event.includes('invalid')) return 'error';
+  if (event.includes('filtered') || event.includes('timeout') || event.includes('partial')) return 'warn';
+  return '';
+}
+
+function formatLogTime(ts) {
+  if (!ts) return '';
+  try {
+    return new Date(ts).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+  } catch {
+    return ts;
+  }
+}
+
+function renderLogs() {
+  const filter = document.getElementById('logEventFilter').value;
+  const logs = filter ? gatewayLogs.filter(l => l.event === filter) : gatewayLogs;
+  document.getElementById('logCount').textContent = logs.length;
+  document.getElementById('logFile').textContent = logFile || '未加载';
+  if (!logs.length) {
+    document.getElementById('logs').innerHTML = '<div class="empty">没有匹配日志</div>';
+    return;
+  }
+  document.getElementById('logs').innerHTML = logs.map(entry => {
+    const details = { ...entry };
+    delete details.timestamp;
+    delete details.event;
+    delete details.requestId;
+    delete details.model;
+    delete details.requestedModel;
+    delete details.channel;
+    delete details.clientIp;
+    delete details.client;
+    delete details.statusCode;
+    delete details.durationMs;
+    delete details.tokens;
+    delete details.inputTokens;
+    delete details.outputTokens;
+    delete details.totalTokens;
+    delete details.errorMessage;
+    const summary = [
+      entry.requestId ? `<span>requestId: <b>${escapeHtml(entry.requestId)}</b></span>` : '',
+      entry.model ? `<span>模型: <b>${escapeHtml(entry.model)}</b></span>` : '',
+      entry.requestedModel && entry.requestedModel !== entry.model ? `<span>请求模型: <b>${escapeHtml(entry.requestedModel)}</b></span>` : '',
+      entry.channel ? `<span>渠道: <b>${escapeHtml(entry.channel)}</b></span>` : '',
+      (entry.clientIp || entry.client) ? `<span>IP: <b>${escapeHtml(entry.clientIp || entry.client)}</b></span>` : '',
+      entry.statusCode ? `<span>状态: <b>${escapeHtml(entry.statusCode)}</b></span>` : '',
+      entry.durationMs != null ? `<span>耗时: <b>${escapeHtml(entry.durationMs)}ms</b></span>` : '',
+      entry.inputTokens != null ? `<span>输入: <b>${formatNumber(entry.inputTokens)} tok</b></span>` : '',
+      entry.outputTokens != null ? `<span>输出: <b>${formatNumber(entry.outputTokens)} tok</b></span>` : '',
+      (entry.totalTokens != null || entry.tokens != null) ? `<span>总计: <b>${formatNumber(entry.totalTokens ?? entry.tokens)} tok</b></span>` : '',
+      entry.errorMessage ? `<span>错误: <b>${escapeHtml(entry.errorMessage)}</b></span>` : '',
+    ].filter(Boolean).join('');
+    const detailsText = Object.keys(details).length ? JSON.stringify(details, null, 2) : '';
+    return `<div class="log-entry ${logClass(entry)}">
+      <div class="log-top">
+        <span class="log-event">${escapeHtml(entry.event)}</span>
+        <span class="log-time">${escapeHtml(formatLogTime(entry.timestamp))}</span>
+      </div>
+      <div class="log-grid">${summary}</div>
+      ${detailsText ? `<div class="log-details">${escapeHtml(detailsText)}</div>` : ''}
+    </div>`;
+  }).join('');
+}
+
+function getChModels() {
+  // Get all models from all channels for the picker
+  const all = [];
+  for (const [ckey, ch] of Object.entries(channels)) {
+    for (const m of ch.models) {
+      all.push({ channel: ckey, name: m, url: ch.base_url });
+    }
+  }
+  return all;
+}
+
+function formatNumber(value) {
+  return Number(value || 0).toLocaleString('zh-CN');
+}
+
+function addUsage(target, name, item = {}) {
+  if (!name) return;
+  if (!target[name]) target[name] = { count: 0, tokens: 0 };
+  target[name].count += item.count || 0;
+  target[name].tokens += item.tokens || 0;
+}
+
+function shiftDateKey(daysAgo) {
+  const date = new Date();
+  date.setUTCDate(date.getUTCDate() - daysAgo);
+  return date.toISOString().slice(0, 10);
+}
+
+function getDateKeysBetween(start, end) {
+  if (!start || !end || start > end) return [];
+  const keys = [];
+  const cursor = new Date(`${start}T00:00:00Z`);
+  const last = new Date(`${end}T00:00:00Z`);
+  while (cursor <= last) {
+    keys.push(cursor.toISOString().slice(0, 10));
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+  return keys;
+}
+
+function getStatsDateRange() {
+  const mode = document.getElementById('statsRange')?.value || 'all';
+  const today = shiftDateKey(0);
+  if (mode === 'today') return { mode, label: '今天', keys: [today] };
+  if (mode === '7d') return { mode, label: '最近 7 天', keys: getDateKeysBetween(shiftDateKey(6), today) };
+  if (mode === '30d') return { mode, label: '最近 30 天', keys: getDateKeysBetween(shiftDateKey(29), today) };
+  if (mode === 'custom') {
+    const start = document.getElementById('statsStart')?.value || today;
+    const end = document.getElementById('statsEnd')?.value || today;
+    return { mode, label: `${start} 到 ${end}`, keys: getDateKeysBetween(start, end) };
+  }
+  return { mode: 'all', label: '全部时间', keys: null };
+}
+
+function getFilteredStats() {
+  const range = getStatsDateRange();
+  if (!gatewayStats) {
+    return { label: range.label, totalRequests: 0, totalTokens: 0, modelUsage: {}, channelUsage: {}, recentLogs: [] };
+  }
+  if (!range.keys) {
+    const modelUsage = gatewayStats.modelUsage || {};
+    return {
+      label: range.label,
+      totalRequests: gatewayStats.totalRequests || 0,
+      totalTokens: Object.values(modelUsage).reduce((sum, item) => sum + (item?.tokens || 0), 0),
+      modelUsage,
+      channelUsage: gatewayStats.channelUsage || {},
+      recentLogs: gatewayStats.recentLogs || []
+    };
+  }
+
+  const keySet = new Set(range.keys);
+  const view = { label: range.label, totalRequests: 0, totalTokens: 0, modelUsage: {}, channelUsage: {}, recentLogs: [] };
+  for (const key of range.keys) {
+    const day = gatewayStats.dailyStats?.[key];
+    if (!day) continue;
+    view.totalRequests += day.requests || 0;
+    view.totalTokens += day.tokens || 0;
+    for (const [name, item] of Object.entries(day.models || {})) addUsage(view.modelUsage, name, item);
+    for (const [name, item] of Object.entries(day.channels || {})) addUsage(view.channelUsage, name, item);
+  }
+  view.recentLogs = (gatewayStats.recentLogs || []).filter(entry => {
+    const key = entry.timestamp ? new Date(entry.timestamp).toISOString().slice(0, 10) : '';
+    return keySet.has(key);
+  });
+  return view;
+}
+
+function renderStatsForRange() {
+  const custom = document.getElementById('statsCustomRange');
+  const mode = document.getElementById('statsRange')?.value || 'all';
+  custom?.classList.toggle('active', mode === 'custom');
+  if (mode === 'custom') {
+    const today = shiftDateKey(0);
+    if (!document.getElementById('statsStart').value) document.getElementById('statsStart').value = today;
+    if (!document.getElementById('statsEnd').value) document.getElementById('statsEnd').value = today;
+  }
+  statsView = getFilteredStats();
+  document.getElementById('statsRangeLabel').textContent = statsView.label;
+  renderHeaderStats();
+  renderUsageStats();
+}
+
+function formatUsageRows(usage = {}) {
+  const entries = Object.entries(usage)
+    .sort((a, b) => (b[1]?.count || 0) - (a[1]?.count || 0))
+    .slice(0, 8);
+  if (!entries.length) return '<div class="empty">暂无统计</div>';
+  return entries.map(([name, item]) => `
+    <div class="usage-row">
+      <span class="usage-name" title="${escapeHtml(name)}">${escapeHtml(name)}</span>
+      <span class="usage-count">${formatNumber(item?.count)} 次</span>
+      <span class="usage-tokens">${formatNumber(item?.tokens)} tok</span>
+    </div>
+  `).join('');
+}
+
+function renderHeaderStats() {
+  const keys = Object.keys(channels);
+  const totalModels = Object.values(channels).reduce((s,c)=>s+c.models.length,0);
+  document.getElementById('stats').innerHTML = `
+    <div class="stat"><div class="num">${keys.length}</div><div class="label">渠道</div></div>
+    <div class="stat"><div class="num">${totalModels}</div><div class="label">模型</div></div>
+    <div class="stat"><div class="num">${formatNumber(statsView.totalRequests)}</div><div class="label">请求</div><div class="sub">${escapeHtml(statsView.label)}</div></div>
+    <div class="stat"><div class="num">${formatNumber(statsView.totalTokens)}</div><div class="label">Token</div><div class="sub">${escapeHtml(statsView.label)}</div></div>
+    <div class="stat"><div class="num" style="color:#3fb950">●</div><div class="label">运行中</div></div>
+  `;
+}
+
+function renderUsageStats() {
+  document.getElementById('statsUpdated').textContent = gatewayStats ? statsView.label : '未加载';
+  document.getElementById('modelUsage').innerHTML = formatUsageRows(statsView.modelUsage);
+  document.getElementById('channelUsage').innerHTML = formatUsageRows(statsView.channelUsage);
+  const recent = statsView.recentLogs || [];
+  document.getElementById('recentUsage').innerHTML = recent.length ? recent.slice(0, 20).map(entry => `
+    <div class="recent-entry ${entry.success ? '' : 'fail'}">
+      <div class="recent-top">
+        <span class="recent-model" title="${escapeHtml(entry.model)}">${escapeHtml(entry.model)}</span>
+        <span class="recent-time">${escapeHtml(entry.time || '')}</span>
+      </div>
+      <div class="recent-meta">
+        <span>${entry.success ? '成功' : '失败'}</span>
+        <span>${escapeHtml(entry.channel)}</span>
+        <span>${formatNumber(entry.tokens)} tok</span>
+        ${entry.error ? `<span>${escapeHtml(entry.error)}</span>` : ''}
+      </div>
+    </div>
+  `).join('') : '<div class="empty">暂无请求</div>';
+}
+
+function render() {
+  const keys = Object.keys(channels);
+  renderHeaderStats();
+  document.getElementById('chCount').textContent = keys.length;
+  
+  let html = '';
+  if (keys.length === 0) {
+    html = '<div class="empty">还没有渠道<br><button class="btn btn-primary" onclick="showAddChannel()" style="margin-top:12px">添加第一个渠道</button></div>';
+  }
+  for (const [ckey, ch] of Object.entries(channels)) {
+    const stopSequences = getStopSequences(ch);
+    html += `<div class="channel">
+      <div class="channel-header">
+        <div>
+          <span class="channel-name">${escapeHtml(ch.name)}</span>
+          <span class="channel-info"> · ${escapeHtml(ch.base_url)}</span>
+        </div>
+        <div style="display:flex;gap:6px">
+          <button class="btn btn-outline btn-sm" onclick="testChannel(${jsArg(ckey)})">测试</button>
+          <button class="btn btn-outline btn-sm" onclick="editChannel(${jsArg(ckey)})">编辑</button>
+          <button class="btn btn-danger btn-sm" onclick="deleteChannel(${jsArg(ckey)})">删除</button>
+        </div>
+      </div>
+      <div class="models">
+        ${ch.models.map(m => `<span class="model-tag">${escapeHtml(m)}<span class="del" onclick="removeModel(${jsArg(ckey)},${jsArg(m)})">×</span></span>`).join('')}
+        <span class="model-add" onclick="addModel(${jsArg(ckey)})">+ 加模型</span>
+      </div>
+      ${stopSequences.length ? `<div class="models">${stopSequences.map(seq => `<span class="model-tag stop-tag">截断: ${escapeHtml(seq)}</span>`).join('')}</div>` : ''}
+    </div>`;
+  }
+  document.getElementById('channels').innerHTML = html;
+}
+
+async function fetchUpstreamModels(baseUrl, key) {
+  try {
+    const url = baseUrl.replace(/\/$/,'') + '/v1/models';
+    const resp = await fetch(url, { headers: { 'Authorization': `Bearer ${key}` } });
+    const d = await resp.json();
+    return (d.data || []).map(m => m.id);
+  } catch(e) {
+    return null;
+  }
+}
+
+async function showAddChannel() {
+  editingKey = null;
+  document.getElementById('modalContent').innerHTML = `
+    <h3>添加渠道</h3>
+    <label>渠道名称</label>
+    <input id="chName" placeholder="例如: provider">
+    <label>前缀 (模型名显示前缀)</label>
+    <input id="chPrefix" placeholder="例如: ds (留空=不添加前缀)">
+    <div class="hint">模型会显示为 ds/model-name</div>
+    <label>API 地址</label>
+    <input id="chUrl" placeholder="https://api.example.com/v1">
+    <label>API Key</label>
+    <input id="chKey" type="password" placeholder="上游 API Key">
+    <div style="margin-top:10px">
+      <button class="btn btn-outline btn-sm" onclick="probeModels()">🔍 探测上游模型</button>
+      <span id="probeResult" style="font-size:13px;color:#8b949e;margin-left:8px"></span>
+    </div>
+    <div class="model-picker" id="modelPicker" style="display:none"></div>
+    <label>模型列表 (逗号分隔)</label>
+    <input id="chModels" placeholder="model-a, model-b">
+    <div class="hint">也可以从上方探测结果中选择</div>
+    <label>流式截断关键词</label>
+    <textarea id="chStopSequences" placeholder="例如: &lt;answer&gt;"></textarea>
+    <div class="hint">一行一个或用逗号分隔；只对当前渠道的流式 SSE 响应生效，留空=不启用</div>
+    <div class="actions">
+      <button class="btn btn-outline" onclick="closeModal()">取消</button>
+      <button class="btn btn-primary" onclick="saveChannel()">保存</button>
+    </div>`;
+  document.getElementById('modal').classList.add('active');
+}
+
+async function probeModels() {
+  const url = document.getElementById('chUrl').value.trim();
+  const key = document.getElementById('chKey').value.trim();
+  const result = document.getElementById('probeResult');
+  const picker = document.getElementById('modelPicker');
+  
+  if (!url || !key) { result.textContent = '请先填地址和Key'; return; }
+  result.textContent = '探测中...';
+  
+  const models = await fetchUpstreamModels(url, key);
+  if (!models) { result.textContent = '❌ 探测失败'; picker.style.display='none'; return; }
+  if (models.length === 0) { result.textContent = '⚠️ 上游无模型'; picker.style.display='none'; return; }
+  
+  result.textContent = `✅ 发现 ${models.length} 个模型`;
+  picker.style.display = 'block';
+  picker.innerHTML = models.map(m => `
+    <label><input type="checkbox" value="${m}" onchange="updateModelInput()"> ${m}</label>
+  `).join('');
+}
+
+function updateModelInput() {
+  const checked = [...document.querySelectorAll('#modelPicker input:checked')].map(c => c.value);
+  document.getElementById('chModels').value = checked.join(', ');
+}
+
+function editChannel(ckey) {
+  editingKey = ckey;
+  const ch = channels[ckey];
+  document.getElementById('modalContent').innerHTML = `
+    <h3>编辑渠道</h3>
+    <label>渠道名称</label>
+    <input id="chName" value="${ch.name}">
+    <label>前缀</label>
+    <input id="chPrefix" placeholder="当前前缀: ${ckey} (不可改)" readonly>
+    <div class="hint">前缀在添加时就固定了，要改前缀请删除后重新添加</div>
+    <label>API 地址</label>
+    <input id="chUrl" value="${ch.base_url || ''}">
+    <label>API Key</label>
+    <input id="chKey" type="password" value="${ch.key || ''}" placeholder="留空保持不变">
+    <div style="margin-top:10px">
+      <button class="btn btn-outline btn-sm" onclick="probeModels()">🔍 探测上游模型</button>
+      <span id="probeResult" style="font-size:13px;color:#8b949e;margin-left:8px"></span>
+    </div>
+    <div class="model-picker" id="modelPicker" style="display:none"></div>
+    <label>模型列表 (逗号分隔)</label>
+    <input id="chModels" value="${ch.models.join(', ')}">
+    <label>流式截断关键词</label>
+    <textarea id="chStopSequences" placeholder="例如: &lt;answer&gt;">${escapeHtml(stopSequencesText(ch))}</textarea>
+    <div class="hint">一行一个或用逗号分隔；保存为空会关闭该渠道的流式截断</div>
+    <div class="actions">
+      <button class="btn btn-outline" onclick="closeModal()">取消</button>
+      <button class="btn btn-primary" onclick="saveChannel()">保存</button>
+    </div>`;
+  document.getElementById('modal').classList.add('active');
+}
+
+async function saveChannel() {
+  const name = document.getElementById('chName').value.trim();
+  const prefix = document.getElementById('chPrefix')?.value.trim() || '';
+  const url = document.getElementById('chUrl').value.trim();
+  const key = document.getElementById('chKey').value.trim();
+  const models = document.getElementById('chModels').value.split(',').map(m => m.trim()).filter(Boolean);
+  const streamStopSequences = parseStopSequences(document.getElementById('chStopSequences')?.value || '');
+  
+  if (!name || !url) { toast('名称和地址必填', false); return; }
+  if (!editingKey && !key) { toast('新渠道必须填写 API Key', false); return; }
+  if (models.length === 0) { toast('至少填一个模型', false); return; }
+  
+  // Determine channel key
+  let ckey;
+  if (editingKey) {
+    ckey = editingKey;
+  } else {
+    ckey = prefix || name.toLowerCase().replace(/[^a-z0-9]/g,'');
+    // Prefix models
+    const finalModels = prefix ? models.map(m => prefix + '/' + m.replace(new RegExp(`^${prefix}/`), '')) : models;
+    document.getElementById('chModels').value = finalModels.join(', ');
+    // Save with raw key
+    try {
+      const res = await api('/api/config/save', {
+        method: 'POST',
+        body: JSON.stringify({
+          channelKey: ckey,
+          name, base_url: url,
+          key,
+          models: finalModels,
+          stream_stop_sequences: streamStopSequences,
+          isNew: true,
+        })
+      });
+      if (res.ok) { toast('渠道已添加'); closeModal(); await load(); }
+      else toast(res.error || '保存失败', false);
+    } catch(e) { toast('保存失败: '+e.message, false); }
+    return;
+  }
+  
+  try {
+    const res = await api('/api/config/save', {
+      method: 'POST',
+      body: JSON.stringify({
+        channelKey: ckey,
+        name, base_url: url,
+        key: key || channels[editingKey]?.key,
+        models,
+        stream_stop_sequences: streamStopSequences,
+        isNew: false,
+      })
+    });
+    if (res.ok) { toast('渠道已更新'); closeModal(); await load(); }
+    else toast(res.error || '保存失败', false);
+  } catch(e) { toast('保存失败: '+e.message, false); }
+}
+
+function showStopSequenceConfig() {
+  const channelEntries = Object.entries(channels);
+  const allSequences = [...new Set(channelEntries.flatMap(([, ch]) => getStopSequences(ch)))];
+  document.getElementById('modalContent').innerHTML = `
+    <h3>流式截断设置</h3>
+    <label>截断关键词</label>
+    <textarea id="batchStopSequences" placeholder="例如: &lt;answer&gt;">${escapeHtml(allSequences.join('\n'))}</textarea>
+    <div class="hint">一行一个或用逗号分隔；命中后停止继续转发，并不会把关键词发给客户端</div>
+    <label>适用渠道</label>
+    <div class="model-picker" style="display:block;max-height:260px">
+      ${channelEntries.map(([ckey, ch]) => {
+        const checked = getStopSequences(ch).length ? 'checked' : '';
+        return `<label><input type="checkbox" class="stop-channel" value="${escapeHtml(ckey)}" ${checked}> ${escapeHtml(ch.name || ckey)} <span class="count">${escapeHtml(ckey)}</span></label>`;
+      }).join('') || '<div class="empty">暂无渠道</div>'}
+    </div>
+    <div class="hint">保存后，勾选渠道会使用上面的关键词；未勾选渠道会关闭自定义流式截断</div>
+    <div class="actions">
+      <button class="btn btn-outline" onclick="closeModal()">取消</button>
+      <button class="btn btn-primary" onclick="saveStopSequenceConfig()">保存</button>
+    </div>`;
+  document.getElementById('modal').classList.add('active');
+}
+
+async function saveStopSequenceConfig() {
+  const sequences = parseStopSequences(document.getElementById('batchStopSequences')?.value || '');
+  const selected = new Set([...document.querySelectorAll('.stop-channel:checked')].map(el => el.value));
+  try {
+    for (const [ckey, ch] of Object.entries(channels)) {
+      await api('/api/config/save', {
+        method: 'POST',
+        body: JSON.stringify({
+          channelKey: ckey,
+          name: ch.name,
+          base_url: ch.base_url,
+          key: ch.key,
+          format: ch.format,
+          anthropic_version: ch.anthropic_version,
+          models: ch.models || [],
+          stream_stop_sequences: selected.has(ckey) ? sequences : [],
+          isNew: false,
+        })
+      });
+    }
+    toast('流式截断设置已保存');
+    closeModal();
+    await load();
+  } catch(e) {
+    toast('保存失败: '+e.message, false);
+  }
+}
+
+function closeModal() { document.getElementById('modal').classList.remove('active'); }
+
+async function deleteChannel(ckey) {
+  if (!confirm(`确定删除渠道 "${channels[ckey].name}"？`)) return;
+  try {
+    const res = await api('/api/config/delete', {
+      method: 'POST',
+      body: JSON.stringify({ channelKey: ckey })
+    });
+    if (res.ok) { toast('已删除'); await load(); }
+    else toast(res.error || '删除失败', false);
+  } catch(e) { toast('删除失败', false); }
+}
+
+async function removeModel(ckey, model) {
+  try {
+    const res = await api('/api/config/remove-model', {
+      method: 'POST',
+      body: JSON.stringify({ channelKey: ckey, model })
+    });
+    if (res.ok) { toast('模型已移除'); await load(); }
+    else toast(res.error || '失败', false);
+  } catch(e) { toast('失败', false); }
+}
+
+async function addModel(ckey) {
+  const model = prompt(`给 ${channels[ckey].name} 添加模型名：`);
+  if (!model) return;
+  try {
+    const res = await api('/api/config/add-model', {
+      method: 'POST',
+      body: JSON.stringify({ channelKey: ckey, model })
+    });
+    if (res.ok) { toast('模型已添加'); await load(); }
+    else toast(res.error || '失败', false);
+  } catch(e) { toast('失败', false); }
+}
+
+async function testChannel(ckey) {
+  const ch = channels[ckey];
+  const model = ch.models[0];
+  if (!model) { toast('该渠道没有模型', false); return; }
+  
+  toast('测试中...');
+  try {
+    // Strip prefix for upstream
+    const realModel = model.replace(/^[a-z]+\//, '');
+    const resp = await fetch(`http://localhost:8300/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, messages:[{role:'user',content:'hi'}], max_tokens:5 })
+    });
+    const d = await resp.json();
+    if (d.choices) toast(`✅ ${ckey} 正常: ${d.choices[0].message.content}`);
+    else toast(`❌ ${ckey}: ${d.error?.message || '未知错误'}`, false);
+  } catch(e) { toast(`❌ ${ckey}: ${e.message}`, false); }
+}
+
+document.getElementById('modal').addEventListener('click', e => {
+  if (e.target === document.getElementById('modal')) closeModal();
+});
+
+load();
+</script>
+</body>
+</html>

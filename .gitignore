@@ -1,0 +1,8 @@
+config.json
+config.json.bak
+stats.json
+*.log
+node_modules/
+.env
+.env.*
+
