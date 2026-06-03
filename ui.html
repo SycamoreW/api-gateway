@@ -150,6 +150,7 @@
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
       <button class="btn btn-primary" onclick="showAddChannel()">+ 添加渠道</button>
       <button class="btn btn-outline" onclick="exportBackup()">导出备份</button>
+      <button class="btn btn-outline" onclick="importBackup()">导入备份</button>
       <button class="btn btn-outline" onclick="showStopSequenceConfig()">流式截断设置</button>
       <button class="btn btn-outline" onclick="showApiKeyModal()">修改管理 Key</button>
     </div>
@@ -365,6 +366,42 @@ async function exportBackup() {
   } catch(e) {
     toast('导出失败: ' + e.message, false);
   }
+}
+
+async function importBackup() {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = 'application/json,.json';
+  input.onchange = async () => {
+    const file = input.files?.[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const data = JSON.parse(text);
+      const importedConfig = data?.config && typeof data.config === 'object' ? data.config : data;
+      const channelCount = Object.keys(importedConfig?.channels || {}).length;
+      const modelCount = Array.isArray(importedConfig?.models) ? importedConfig.models.length : 0;
+      if (!importedConfig?.channels || typeof importedConfig.channels !== 'object' || Array.isArray(importedConfig.channels)) {
+        throw new Error('备份文件缺少 channels');
+      }
+      const warning = `确定导入这个备份？\n\n渠道: ${channelCount}\n模型: ${modelCount}\n\n导入会覆盖当前配置，包含管理 Key 和所有渠道 Key。`;
+      if (!confirm(warning)) return;
+      const res = await api('/api/config/import', {
+        method: 'POST',
+        body: JSON.stringify(data)
+      });
+      if (importedConfig.api_key) {
+        KEY = String(importedConfig.api_key);
+        localStorage.setItem(KEY_STORAGE, KEY);
+        document.getElementById('apiKeyLabel').textContent = '已保存在本浏览器';
+      }
+      toast(`备份已导入：${res.channels} 个渠道`);
+      await load();
+    } catch(e) {
+      toast('导入失败: ' + e.message, false);
+    }
+  };
+  input.click();
 }
 
 async function load() {

@@ -1262,6 +1262,32 @@ function saveConfig() {
   fs.writeFileSync(path.resolve('config.json'), JSON.stringify(config, null, 2));
 }
 
+function normalizeImportedConfig(input) {
+  const nextConfig = input && typeof input === 'object' && input.config && typeof input.config === 'object'
+    ? input.config
+    : input;
+  if (!nextConfig || typeof nextConfig !== 'object' || Array.isArray(nextConfig)) {
+    throw new Error('备份文件格式不正确');
+  }
+  if (!nextConfig.channels || typeof nextConfig.channels !== 'object' || Array.isArray(nextConfig.channels)) {
+    throw new Error('备份文件缺少 channels');
+  }
+  if (nextConfig.models && !Array.isArray(nextConfig.models)) {
+    throw new Error('models 必须是数组');
+  }
+  const normalized = {
+    ...nextConfig,
+    port: Number(nextConfig.port) || config.port || 8300,
+    api_key: String(nextConfig.api_key || config.api_key || '').trim(),
+    channels: nextConfig.channels,
+    models: Array.isArray(nextConfig.models) ? nextConfig.models : [],
+  };
+  if (normalized.api_key.length < 4) {
+    throw new Error('管理 Key 至少 4 位');
+  }
+  return normalized;
+}
+
 async function handleConfigAPI(req, res, url, body) {
   if (url === '/api/config' && req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1292,6 +1318,29 @@ async function handleConfigAPI(req, res, url, body) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true }));
     return true;
+  }
+
+  if (url === '/api/config/import' && req.method === 'POST') {
+    try {
+      const imported = normalizeImportedConfig(JSON.parse(body));
+      for (const key of Object.keys(config)) {
+        delete config[key];
+      }
+      Object.assign(config, imported);
+      saveConfig();
+      rebuildModelMap();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        channels: Object.keys(config.channels || {}).length,
+        models: [...modelMap.keys()].length,
+      }));
+      return true;
+    } catch (err) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: err.message || '导入失败' }));
+      return true;
+    }
   }
 
   if (url.startsWith('/api/logs') && req.method === 'GET') {
