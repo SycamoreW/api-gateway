@@ -72,6 +72,8 @@ Config field:
 
 When a keyword is detected in an SSE streaming response, the gateway stops forwarding and sends `[DONE]`. The keyword itself is not forwarded to the client.
 
+For Pioneer channels, use `https://api.pioneer.ai/v1` when stream stop keywords are enabled. If a Pioneer channel is saved as `https://api.pioneer.ai` with stop keywords configured, the gateway normalizes it to the native `/v1` endpoint to avoid the aggregate upstream charging before the local truncation takes effect.
+
 ## Files
 
 - `index.mjs`: server, auth, routing, proxying, logs, stats, config API

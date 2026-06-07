@@ -778,6 +778,25 @@ function getChannelStreamAppendBeforeDone(channel) {
   return String(channel.stream_append_before_done || '');
 }
 
+function normalizePioneerNativeBaseUrl(baseUrl, stopSequences = []) {
+  if (!baseUrl) return baseUrl;
+  if (!stopSequences.length) return baseUrl;
+  try {
+    const parsed = new URL(baseUrl);
+    if (parsed.hostname !== 'api.pioneer.ai') return baseUrl;
+    const path = parsed.pathname.replace(/\/+$/, '');
+    if (path && path !== '/') return baseUrl;
+    parsed.pathname = '/v1';
+    return parsed.toString().replace(/\/$/, '');
+  } catch {
+    return baseUrl;
+  }
+}
+
+function getEffectiveChannelBaseUrl(channel) {
+  return normalizePioneerNativeBaseUrl(channel.base_url, getChannelStopSequences(channel));
+}
+
 function sanitizePayloadForUpstream(data, upstreamModel) {
   if (!data || typeof data !== 'object') return { data, removedParams: [] };
   const next = { ...data };
@@ -797,10 +816,11 @@ function sanitizePayloadForUpstream(data, upstreamModel) {
 }
 
 async function proxyRequest(channel, req, res, body, modelName = '', requestId = '', logContext = {}) {
-  const targetUrl = new URL(channel.base_url);
+  const effectiveBaseUrl = getEffectiveChannelBaseUrl(channel);
+  const targetUrl = new URL(effectiveBaseUrl);
   // Append the request path (strip /v1 prefix if base_url already has it)
   const reqPath = req.url.startsWith('/v1/') ? req.url.slice(3) : req.url;
-  const fullUrl = `${channel.base_url}${reqPath}`;
+  const fullUrl = `${effectiveBaseUrl.replace(/\/$/, '')}${reqPath}`;
   
   const headers = {};
   // Forward only necessary headers
@@ -836,6 +856,8 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
     let appendedBeforeDone = false;
     let appendedStopSequence = null;
     let streamErrorMessage = '';
+    let proxyResRef = null;
+    let clientAbortLogged = false;
     const startedAt = Date.now();
     writeGatewayLog('upstream_request', {
       requestId,
@@ -845,15 +867,62 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
       requestedModel: logContext.requestedModel,
       upstreamHost: parsed.host,
       upstreamPath: parsed.pathname,
+      ...(effectiveBaseUrl !== channel.base_url ? {
+        configuredBaseUrl: channel.base_url,
+        effectiveBaseUrl,
+        routeNote: 'pioneer_native_base_for_stream_stop',
+      } : {}),
       method: req.method,
       requestBytes: Buffer.byteLength(body || ''),
       inputContent: logContext.inputContent,
     });
     
+    function abortUpstreamForClientClose(reason) {
+      if (stopped || clientAbortLogged || res.writableEnded) return;
+      stopped = true;
+      clientAbortLogged = true;
+      proxy.destroy(new Error(reason));
+      if (proxyResRef && !proxyResRef.destroyed) proxyResRef.destroy(new Error(reason));
+      logRequest(modelName || 'unknown', channel.name, 0, false, reason);
+      writeGatewayLog('client_aborted', {
+        requestId,
+        model: modelName || 'unknown',
+        channel: channel.name,
+        reason,
+        clientIp: logContext.clientIp,
+      });
+      writeGatewayLog('request_complete', responseLogFields(logContext, {
+        requestId,
+        model: modelName || 'unknown',
+        channel: channel.name,
+        statusCode: 499,
+        durationMs: Date.now() - startedAt,
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        outputContent: truncateText(accumulatedContent),
+        errorMessage: reason,
+      }));
+      resolve();
+    }
+
     const proxy = transport.request(options, (proxyRes) => {
-      res.writeHead(proxyRes.statusCode, proxyRes.headers);
+      proxyResRef = proxyRes;
       const contentType = String(proxyRes.headers['content-type'] || '');
       const isEventStream = contentType.includes('text/event-stream');
+      const responseHeaders = { ...proxyRes.headers };
+      if (isEventStream && proxyRes.statusCode < 400) {
+        responseHeaders['Content-Type'] = 'text/event-stream; charset=utf-8';
+        responseHeaders['Cache-Control'] = 'no-cache';
+        responseHeaders['Connection'] = 'keep-alive';
+        responseHeaders['X-Accel-Buffering'] = 'no';
+        delete responseHeaders['content-length'];
+        delete responseHeaders['Content-Length'];
+      }
+      res.writeHead(proxyRes.statusCode, responseHeaders);
+      if (isEventStream && proxyRes.statusCode < 400 && typeof res.flushHeaders === 'function') {
+        res.flushHeaders();
+      }
 
       function findStopSequence(text) {
         let found = null;
@@ -1045,34 +1114,10 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
         // 尝试解析 token 使用量和输出内容
         const responseDetails = extractResponseLogDetails(responseData);
         const errorMessage = streamErrorMessage || responseDetails.errorMessage;
-        const syntheticStopMessage = appendedStopSequence ? 'stop_sequence' : '';
         const tokens = responseDetails.totalTokens;
         
         // 记录成功的请求
-        if (proxyRes.statusCode < 400 && syntheticStopMessage) {
-          logRequest(modelName || 'unknown', channel.name, 0, true, requestLogOptions(logContext, requestId, syntheticStopMessage));
-          writeGatewayLog('stop_sequence_detected', {
-            requestId,
-            model: modelName || 'unknown',
-            channel: channel.name,
-            sequence: appendedStopSequence.seq,
-            position: appendedStopSequence.idx,
-            contentLength: accumulatedContent.length,
-            synthetic: true,
-          });
-          writeGatewayLog('request_complete', responseLogFields(logContext, {
-            requestId,
-            model: modelName || 'unknown',
-            channel: channel.name,
-            statusCode: proxyRes.statusCode,
-            durationMs: Date.now() - startedAt,
-            inputTokens: 0,
-            outputTokens: 0,
-            totalTokens: 0,
-            outputContent: truncateText(accumulatedContent),
-            errorMessage: syntheticStopMessage,
-          }));
-        } else if (proxyRes.statusCode < 400 && !errorMessage) {
+        if (proxyRes.statusCode < 400 && !errorMessage) {
           logRequest(modelName || 'unknown', channel.name, tokens, true, requestLogOptions(logContext, requestId));
           writeGatewayLog('request_complete', responseLogFields(logContext, {
             requestId,
@@ -1085,6 +1130,10 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
             outputTokens: responseDetails.outputTokens,
             totalTokens: responseDetails.totalTokens,
             outputContent: responseDetails.outputContent,
+            ...(appendedStopSequence ? {
+              suppressedSyntheticStopSequence: appendedStopSequence.seq,
+              suppressedSyntheticStopPosition: appendedStopSequence.idx,
+            } : {}),
           }));
         } else {
           const finalErrorMessage = errorMessage || `HTTP ${proxyRes.statusCode}`;
@@ -1109,6 +1158,11 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
       });
       
       proxyRes.on('error', reject);
+    });
+
+    req.on('aborted', () => abortUpstreamForClientClose('client_aborted'));
+    res.on('close', () => {
+      if (!res.writableEnded) abortUpstreamForClientClose('client_closed');
     });
     
     proxy.on('error', (err) => {
@@ -1186,6 +1240,8 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
     let streamInputTokens = 0;
     let streamOutputTokens = 0;
     let streamOutputContent = '';
+    let proxyResRef = null;
+    let clientAborted = false;
     const streamId = `chatcmpl-${requestId || newRequestId()}`;
     const streamCreated = Math.floor(Date.now() / 1000);
 
@@ -1220,7 +1276,40 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
       format: 'anthropic',
     });
 
+    function abortAnthropicUpstreamForClientClose(reason) {
+      if (clientAborted || res.writableEnded) return;
+      clientAborted = true;
+      proxy.destroy(new Error(reason));
+      if (proxyResRef && !proxyResRef.destroyed) proxyResRef.destroy(new Error(reason));
+      logRequest(upstreamModel || requestedModel || 'unknown', channel.name, 0, false, reason);
+      writeGatewayLog('client_aborted', {
+        requestId,
+        model: upstreamModel || 'unknown',
+        channel: channel.name,
+        requestedModel,
+        reason,
+        clientIp: logContext.clientIp,
+        format: 'anthropic',
+      });
+      writeGatewayLog('request_complete', responseLogFields(logContext, {
+        requestId,
+        model: upstreamModel || 'unknown',
+        channel: channel.name,
+        requestedModel,
+        statusCode: 499,
+        durationMs: Date.now() - startedAt,
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        outputContent: truncateText(streamOutputContent),
+        errorMessage: reason,
+        format: 'anthropic',
+      }));
+      resolve();
+    }
+
     const proxy = transport.request(options, (proxyRes) => {
+      proxyResRef = proxyRes;
       const contentType = String(proxyRes.headers['content-type'] || '').toLowerCase();
       const isEventStream = contentType.includes('text/event-stream');
       if (wantsStream && proxyRes.statusCode < 400) {
@@ -1228,10 +1317,13 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
           'Content-Type': 'text/event-stream; charset=utf-8',
           'Cache-Control': 'no-cache',
           'Connection': 'keep-alive',
+          'X-Accel-Buffering': 'no',
         });
+        if (typeof res.flushHeaders === 'function') res.flushHeaders();
       }
 
       proxyRes.on('data', (chunk) => {
+        if (clientAborted) return;
         const chunkStr = chunk.toString();
         if (!wantsStream || proxyRes.statusCode >= 400 || !isEventStream) {
           responseData += chunkStr;
@@ -1275,6 +1367,7 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
       });
 
       proxyRes.on('end', () => {
+        if (clientAborted) return;
         if (wantsStream && proxyRes.statusCode < 400) {
           if (!isEventStream) {
             try {
@@ -1410,7 +1503,13 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
       proxyRes.on('error', reject);
     });
 
+    req.on('aborted', () => abortAnthropicUpstreamForClientClose('client_aborted'));
+    res.on('close', () => {
+      if (!res.writableEnded) abortAnthropicUpstreamForClientClose('client_closed');
+    });
+
     proxy.on('error', (err) => {
+      if (clientAborted) return;
       logRequest(upstreamModel || requestedModel || 'unknown', channel.name, 0, false, err.message);
       writeGatewayLog('request_complete', responseLogFields(logContext, {
         requestId,
@@ -1428,6 +1527,7 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
     });
 
     proxy.on('timeout', () => {
+      if (clientAborted) return;
       logRequest(upstreamModel || requestedModel || 'unknown', channel.name, 0, false, 'timeout');
       writeGatewayLog('request_complete', responseLogFields(logContext, {
         requestId,
@@ -1811,6 +1911,54 @@ async function handleConfigAPI(req, res, url, body) {
     res.end(JSON.stringify({ ok: true }));
     return true;
   }
+
+  // Pioneer 额度查询 API
+  if (url === '/api/billing' && req.method === 'GET') {
+    // 查找 base_url 为 Pioneer 的渠道
+    let pioneerChannel = null;
+    for (const [ckey, ch] of Object.entries(config.channels)) {
+      if (ch.base_url && ch.base_url.includes('api.pioneer.ai')) {
+        pioneerChannel = ch;
+        break;
+      }
+    }
+    if (!pioneerChannel || !pioneerChannel.key) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: '未配置 Pioneer 渠道' }));
+      return true;
+    }
+    try {
+      const billingRes = await new Promise((resolve, reject) => {
+        const billingReq = https.request('https://api.pioneer.ai/billing/billing-status', {
+          method: 'GET',
+          headers: { 'X-API-Key': pioneerChannel.key },
+        }, (r) => {
+          let data = '';
+          r.on('data', c => data += c);
+          r.on('end', () => {
+            if (r.statusCode >= 200 && r.statusCode < 300) {
+              resolve(JSON.parse(data));
+            } else {
+              reject(new Error(`Pioneer API error: ${r.statusCode} ${data}`));
+            }
+          });
+        });
+        billingReq.on('error', reject);
+        billingReq.setTimeout(10000, () => {
+          billingReq.destroy();
+          reject(new Error('Pioneer API timeout'));
+        });
+        billingReq.end();
+      });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, billing: billingRes }));
+      return true;
+    } catch (err) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: err.message }));
+      return true;
+    }
+  }
   
   if (url === '/api/config/save' && req.method === 'POST') {
     const d = JSON.parse(body);
@@ -1829,15 +1977,24 @@ async function handleConfigAPI(req, res, url, body) {
     }
     
     const existingChannel = config.channels[channelKey] || {};
+    const normalizedStopSequences = stream_stop_sequences !== undefined
+      ? normalizeStopSequences(stream_stop_sequences)
+      : (
+        existingChannel.stream_stop_sequences !== undefined
+          ? normalizeStopSequences(existingChannel.stream_stop_sequences)
+          : []
+      );
+    const channelBaseUrl = normalizePioneerNativeBaseUrl(
+      base_url || existingChannel.base_url || '',
+      normalizedStopSequences,
+    );
     config.channels[channelKey] = {
       name: name || existingChannel.name || channelKey,
-      base_url: base_url || existingChannel.base_url || '',
+      base_url: channelBaseUrl,
       key: key || existingChannel.key || '',
       ...(format || existingChannel.format ? { format: format || existingChannel.format } : {}),
       ...(anthropic_version || existingChannel.anthropic_version ? { anthropic_version: anthropic_version || existingChannel.anthropic_version } : {}),
-      ...(stream_stop_sequences !== undefined ? { stream_stop_sequences: normalizeStopSequences(stream_stop_sequences) } : (
-        existingChannel.stream_stop_sequences !== undefined ? { stream_stop_sequences: normalizeStopSequences(existingChannel.stream_stop_sequences) } : {}
-      )),
+      ...(stream_stop_sequences !== undefined || existingChannel.stream_stop_sequences !== undefined ? { stream_stop_sequences: normalizedStopSequences } : {}),
       ...(stream_append_before_done !== undefined ? { stream_append_before_done: String(stream_append_before_done || '') } : (
         existingChannel.stream_append_before_done !== undefined ? { stream_append_before_done: String(existingChannel.stream_append_before_done || '') } : {}
       )),

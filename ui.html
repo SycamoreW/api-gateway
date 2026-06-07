@@ -285,6 +285,7 @@ let gatewayLogs = [];
 let logFile = '';
 let gatewayStats = null;
 let statsView = { label: '全部时间', totalRequests: 0, totalTokens: 0, modelUsage: {}, channelUsage: {}, ipUsage: {}, recentLogs: [] };
+let billingData = null;
 const HIDDEN_LOG_EVENTS = new Set([
   'http_request',
   'model_params',
@@ -581,6 +582,21 @@ async function loadStats() {
   }
 }
 
+async function loadBilling() {
+  try {
+    const d = await api('/api/billing');
+    if (d.ok && d.billing) {
+      billingData = d.billing;
+      renderHeaderStats();
+      toast(`Pioneer 剩余: $${billingData.free_tier_remaining.toFixed(2)}`);
+    } else {
+      toast('Pioneer 额度查询失败: ' + (d.error || '未知错误'), false);
+    }
+  } catch(e) {
+    toast('Pioneer 额度查询失败: '+e.message, false);
+  }
+}
+
 async function resetStats() {
   if (!confirm('确定清空所有请求统计？')) return;
   try {
@@ -844,12 +860,28 @@ function formatUsageRows(usage = {}) {
 function renderHeaderStats() {
   const keys = Object.keys(channels);
   const totalModels = Object.values(channels).reduce((s,c)=>s+c.models.length,0);
+  const billingHtml = billingData ? `
+    <div class="stat" style="cursor:pointer" onclick="loadBilling()" title="点击刷新">
+      <div class="num" style="color:${billingData.exceeds_free_tier ? '#f85149' : '#3fb950'}">
+        $${billingData.free_tier_remaining.toFixed(0)}
+      </div>
+      <div class="label">Pioneer 剩余</div>
+      <div class="sub">已用 $${billingData.total_usage.toFixed(2)}</div>
+    </div>
+  ` : `
+    <div class="stat" style="cursor:pointer" onclick="loadBilling()" title="点击加载">
+      <div class="num" style="color:#8b949e">?</div>
+      <div class="label">Pioneer 额度</div>
+      <div class="sub">点击查询</div>
+    </div>
+  `;
   document.getElementById('stats').innerHTML = `
     <div class="stat"><div class="num">${keys.length}</div><div class="label">渠道</div></div>
     <div class="stat"><div class="num">${totalModels}</div><div class="label">模型</div></div>
     <div class="stat"><div class="num">${clientKeys.length}</div><div class="label">调用 Key</div></div>
     <div class="stat"><div class="num">${formatNumber(statsView.totalRequests)}</div><div class="label">请求</div><div class="sub">${escapeHtml(statsView.label)}</div></div>
     <div class="stat"><div class="num">${formatNumber(statsView.totalTokens)}</div><div class="label">Token</div><div class="sub">${escapeHtml(statsView.label)}</div></div>
+    ${billingHtml}
     <div class="stat"><div class="num" style="color:#3fb950">●</div><div class="label">运行中</div></div>
   `;
 }
