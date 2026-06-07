@@ -249,9 +249,30 @@
 
 <script>
 const KEY_STORAGE = 'apiGatewayKey';
-let KEY = localStorage.getItem(KEY_STORAGE) || '';
+function normalizeApiKey(value) {
+  return String(value || '').trim();
+}
+
+function isHeaderSafe(value) {
+  return !/[^\x20-\x7e]/.test(String(value || ''));
+}
+
+function readStoredApiKey() {
+  const stored = normalizeApiKey(localStorage.getItem(KEY_STORAGE));
+  if (stored && !isHeaderSafe(stored)) {
+    localStorage.removeItem(KEY_STORAGE);
+    return '';
+  }
+  return stored;
+}
+
+let KEY = readStoredApiKey();
 if (!KEY) {
-  KEY = prompt('聚合渠道 API Key') || '';
+  KEY = normalizeApiKey(prompt('聚合渠道 API Key'));
+  if (KEY && !isHeaderSafe(KEY)) {
+    alert('API Key 只能使用英文、数字和常见半角符号，请重新输入。');
+    KEY = '';
+  }
   if (KEY) localStorage.setItem(KEY_STORAGE, KEY);
 }
 document.getElementById('apiUrl').textContent = `${location.origin}/v1`;
@@ -318,6 +339,12 @@ function switchTab(tab) {
 }
 
 async function api(path, opts={}) {
+  KEY = normalizeApiKey(KEY);
+  if (!KEY || !isHeaderSafe(KEY)) {
+    localStorage.removeItem(KEY_STORAGE);
+    document.getElementById('apiKeyLabel').textContent = 'Key 无效，请刷新后重输';
+    throw new Error('API Key 含有非法字符，请刷新页面重新输入');
+  }
   const res = await fetch(path, { headers: { 'Authorization': `Bearer ${KEY}`, 'Content-Type': 'application/json' }, ...opts });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
