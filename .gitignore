@@ -1,8 +1,9 @@
 config.json
 config.json.bak
+*.bak*
+*.mjs.bak*
 stats.json
 *.log
 node_modules/
 .env
 .env.*
-

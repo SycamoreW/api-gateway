@@ -1,5 +1,5 @@
 {
-  "port": 8300,
+  "port": 8302,
   "api_key": "replace-with-gateway-api-key",
   "channels": {
     "pio": {
@@ -11,11 +11,14 @@
         "<answer>"
       ],
       "models": [
-        "pio/claude-opus-4-6",
-        "pio/gemini-3.5-flash",
-        "pio/deepseek-ai/DeepSeek-V4-Pro"
+        "claude-opus-4-6",
+        "gemini-3.5-flash",
+        "gpt-5.5",
+        "deepseek-ai/DeepSeek-V4-Pro"
       ]
     }
   },
-  "models": []
+  "api_keys": [],
+  "disabled_api_keys": [],
+  "blocked_ips": []
 }
