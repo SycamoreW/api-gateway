@@ -246,6 +246,7 @@ let gatewayLogs = [];
 let logFile = '';
 let gatewayStats = null;
 let statsView = { label: '全部时间', totalRequests: 0, totalTokens: 0, modelUsage: {}, channelUsage: {}, recentLogs: [] };
+const HIDDEN_LOG_EVENTS = new Set(['http_request', 'model_params', 'model_routed']);
 
 function toast(msg, ok=true) {
   const el = document.getElementById('toast');
@@ -466,9 +467,8 @@ async function loadLogs() {
 function renderLogFilter() {
   const select = document.getElementById('logEventFilter');
   const current = select.value;
-  const hiddenEvents = new Set(['http_request', 'model_params', 'model_routed']);
   const events = [...new Set(gatewayLogs.map(l => l.event).filter(Boolean))]
-    .filter(event => !hiddenEvents.has(event))
+    .filter(event => !HIDDEN_LOG_EVENTS.has(event))
     .sort();
   select.innerHTML = '<option value="">全部事件</option>' + events.map(e => `<option value="${escapeHtml(e)}">${escapeHtml(e)}</option>`).join('');
   if (events.includes(current)) select.value = current;
@@ -493,7 +493,8 @@ function formatLogTime(ts) {
 
 function renderLogs() {
   const filter = document.getElementById('logEventFilter').value;
-  const logs = filter ? gatewayLogs.filter(l => l.event === filter) : gatewayLogs;
+  const visibleLogs = gatewayLogs.filter(l => !HIDDEN_LOG_EVENTS.has(l.event));
+  const logs = filter ? visibleLogs.filter(l => l.event === filter) : visibleLogs;
   document.getElementById('logCount').textContent = logs.length;
   document.getElementById('logFile').textContent = logFile || '未加载';
   if (!logs.length) {

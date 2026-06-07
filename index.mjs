@@ -6,6 +6,7 @@ import path from 'node:path';
 const config = JSON.parse(fs.readFileSync(path.resolve(process.argv[2] || 'config.json'), 'utf-8'));
 const LOG_DIR = path.resolve('logs');
 const LOG_MAX_BODY_CHARS = 2000;
+const HIDDEN_UI_LOG_EVENTS = new Set(['http_request', 'model_params', 'model_routed']);
 
 function ensureLogDir() {
   if (!fs.existsSync(LOG_DIR)) {
@@ -63,6 +64,29 @@ function readGatewayLogs(limit = 100) {
         return { timestamp: null, event: 'parse_error', raw: truncateText(line) };
       }
     });
+  } catch (err) {
+    return [{ timestamp: new Date().toISOString(), event: 'read_error', error: err.message }];
+  }
+}
+
+function readVisibleGatewayLogs(limit = 100) {
+  try {
+    const file = currentLogFile();
+    if (!fs.existsSync(file)) return [];
+    const lines = fs.readFileSync(file, 'utf-8').trim().split('\n').filter(Boolean);
+    const logs = [];
+    for (let i = lines.length - 1; i >= 0 && logs.length < limit; i--) {
+      let entry;
+      try {
+        entry = JSON.parse(lines[i]);
+      } catch {
+        entry = { timestamp: null, event: 'parse_error', raw: truncateText(lines[i]) };
+      }
+      if (!HIDDEN_UI_LOG_EVENTS.has(entry.event)) {
+        logs.push(entry);
+      }
+    }
+    return logs;
   } catch (err) {
     return [{ timestamp: new Date().toISOString(), event: 'read_error', error: err.message }];
   }
@@ -462,6 +486,29 @@ function getChannelStopSequences(channel) {
   return normalizeStopSequences(CHANNEL_STOP_SEQUENCES[channel.name]);
 }
 
+function getChannelStreamAppendBeforeDone(channel) {
+  if (!Object.prototype.hasOwnProperty.call(channel, 'stream_append_before_done')) return '';
+  return String(channel.stream_append_before_done || '');
+}
+
+function sanitizePayloadForUpstream(data, upstreamModel) {
+  if (!data || typeof data !== 'object') return { data, removedParams: [] };
+  const next = { ...data };
+  const removedParams = [];
+  const model = String(upstreamModel || next.model || '').toLowerCase();
+
+  if (model.includes('gemini')) {
+    for (const key of ['presence_penalty', 'frequency_penalty']) {
+      if (Object.prototype.hasOwnProperty.call(next, key)) {
+        delete next[key];
+        removedParams.push(key);
+      }
+    }
+  }
+
+  return { data: next, removedParams };
+}
+
 async function proxyRequest(channel, req, res, body, modelName = '', requestId = '', logContext = {}) {
   const targetUrl = new URL(channel.base_url);
   // Append the request path (strip /v1 prefix if base_url already has it)
@@ -479,6 +526,7 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
   const stopSequences = getChannelStopSequences(channel);
   const needsStopDetection = stopSequences.length > 0;
   const maxStopSequenceLength = Math.max(1, ...stopSequences.map(seq => seq.length));
+  const streamAppendBeforeDone = getChannelStreamAppendBeforeDone(channel);
   
   return new Promise((resolve, reject) => {
     const parsed = new URL(fullUrl);
@@ -498,6 +546,9 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
     let lastContentEvent = null;
     let streamBuffer = '';
     let stopped = false; // 是否已触发停止
+    let appendedBeforeDone = false;
+    let appendedStopSequence = null;
+    let streamErrorMessage = '';
     const startedAt = Date.now();
     writeGatewayLog('upstream_request', {
       requestId,
@@ -566,6 +617,7 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
         const line = rawLine.replace(/\r$/, '');
         if (line === 'data: [DONE]') {
           flushPendingContent();
+          if (!streamErrorMessage) appendBeforeDone();
           res.write(`${rawLine}\n`);
           return true;
         }
@@ -576,8 +628,14 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
 
         try {
           const json = JSON.parse(line.slice(6));
+          const errorMessage = extractErrorMessage(json);
+          if (errorMessage) streamErrorMessage ||= errorMessage;
           const choice = json?.choices?.[0];
-          const content = choice?.delta?.content;
+          const delta = choice?.delta || {};
+          const contentKey = typeof delta.content === 'string'
+            ? 'content'
+            : (typeof delta.reasoning_content === 'string' ? 'reasoning_content' : '');
+          const content = contentKey ? delta[contentKey] : undefined;
           if (typeof content !== 'string' || content.length === 0) {
             res.write(`${rawLine}\n`);
             return true;
@@ -587,13 +645,13 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
           pendingContent += content;
           const nextContent = accumulatedContent + pendingContent;
           const found = findStopSequence(nextContent);
-          if (!found) return flushSafePendingContent(json);
+          if (!found) return flushSafePendingContent(json, contentKey);
 
           const allowedLength = Math.max(0, found.idx - accumulatedContent.length);
           const allowedContent = pendingContent.slice(0, allowedLength);
           accumulatedContent += allowedContent;
           if (allowedContent) {
-            choice.delta.content = allowedContent;
+            choice.delta[contentKey] = allowedContent;
             res.write(`data: ${JSON.stringify(json)}\n\n`);
           }
           completeWithStopSequence(found.seq, found.idx);
@@ -617,13 +675,13 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
         res.write(`data: ${JSON.stringify(json)}\n\n`);
       }
 
-      function flushSafePendingContent(json) {
+      function flushSafePendingContent(json, contentKey = 'content') {
         const safeLength = Math.max(0, pendingContent.length - maxStopSequenceLength + 1);
         if (safeLength <= 0) return true;
         const safeContent = pendingContent.slice(0, safeLength);
         pendingContent = pendingContent.slice(safeLength);
         accumulatedContent += safeContent;
-        json.choices[0].delta.content = safeContent;
+        json.choices[0].delta[contentKey] = safeContent;
         res.write(`data: ${JSON.stringify(json)}\n\n`);
         return true;
       }
@@ -633,6 +691,28 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
         accumulatedContent += pendingContent;
         writeContentEvent(pendingContent);
         pendingContent = '';
+      }
+
+      function appendBeforeDone() {
+        if (!streamAppendBeforeDone || appendedBeforeDone) return;
+        appendedBeforeDone = true;
+        const appendedContent = accumulatedContent + streamAppendBeforeDone;
+        const found = findStopSequence(appendedContent);
+        const suppressedByStop = Boolean(found && found.idx >= accumulatedContent.length);
+        if (!suppressedByStop) {
+          accumulatedContent += streamAppendBeforeDone;
+          writeContentEvent(streamAppendBeforeDone);
+        } else {
+          appendedStopSequence = found;
+        }
+        writeGatewayLog('stream_append_before_done', {
+          requestId,
+          model: modelName || 'unknown',
+          channel: channel.name,
+          appendedLength: streamAppendBeforeDone.length,
+          suppressedByStop,
+          ...(suppressedByStop ? { sequence: found.seq, position: found.idx } : {}),
+        });
       }
 
       function writeFilteredStreamChunk(chunkStr) {
@@ -668,6 +748,7 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
         }
         if (needsStopDetection && isEventStream) {
           flushPendingContent();
+          if (!streamErrorMessage) appendBeforeDone();
         }
         
         if (!res.writableEnded) {
@@ -676,10 +757,35 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
         
         // 尝试解析 token 使用量和输出内容
         const responseDetails = extractResponseLogDetails(responseData);
+        const errorMessage = streamErrorMessage || responseDetails.errorMessage;
+        const syntheticStopMessage = appendedStopSequence ? 'stop_sequence' : '';
         const tokens = responseDetails.totalTokens;
         
         // 记录成功的请求
-        if (proxyRes.statusCode < 400) {
+        if (proxyRes.statusCode < 400 && syntheticStopMessage) {
+          logRequest(modelName || 'unknown', channel.name, 0, true, syntheticStopMessage);
+          writeGatewayLog('stop_sequence_detected', {
+            requestId,
+            model: modelName || 'unknown',
+            channel: channel.name,
+            sequence: appendedStopSequence.seq,
+            position: appendedStopSequence.idx,
+            contentLength: accumulatedContent.length,
+            synthetic: true,
+          });
+          writeGatewayLog('request_complete', responseLogFields(logContext, {
+            requestId,
+            model: modelName || 'unknown',
+            channel: channel.name,
+            statusCode: proxyRes.statusCode,
+            durationMs: Date.now() - startedAt,
+            inputTokens: 0,
+            outputTokens: 0,
+            totalTokens: 0,
+            outputContent: truncateText(accumulatedContent),
+            errorMessage: syntheticStopMessage,
+          }));
+        } else if (proxyRes.statusCode < 400 && !errorMessage) {
           logRequest(modelName || 'unknown', channel.name, tokens, true);
           writeGatewayLog('request_complete', responseLogFields(logContext, {
             requestId,
@@ -694,8 +800,8 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
             outputContent: responseDetails.outputContent,
           }));
         } else {
-          const errorMessage = responseDetails.errorMessage || `HTTP ${proxyRes.statusCode}`;
-          logRequest(modelName || 'unknown', channel.name, 0, false, errorMessage);
+          const finalErrorMessage = errorMessage || `HTTP ${proxyRes.statusCode}`;
+          logRequest(modelName || 'unknown', channel.name, 0, false, finalErrorMessage);
           writeGatewayLog('request_complete', responseLogFields(logContext, {
             requestId,
             model: modelName || 'unknown',
@@ -707,7 +813,7 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
             outputTokens: responseDetails.outputTokens,
             totalTokens: responseDetails.totalTokens,
             outputContent: responseDetails.outputContent,
-            errorMessage,
+            errorMessage: finalErrorMessage,
             responseBody: truncateText(responseData),
           }));
         }
@@ -1057,41 +1163,6 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
   });
 }
 
-// Optional model-specific parameter filters.
-// Example: { "provider/model": ["temperature", "top_p"] }
-const MODEL_PARAM_FILTERS = {};
-
-// 根据模型过滤不支持的参数
-function filterModelParams(data, modelName, requestId = '') {
-  // 调试：打印收到的参数
-  const paramKeys = Object.keys(data).filter(k => !['model', 'messages', 'stream'].includes(k));
-  if (paramKeys.length > 0) {
-    console.log(`[debug] ${modelName}: incoming params [${paramKeys.join(', ')}]`);
-    writeGatewayLog('model_params', {
-      requestId,
-      model: modelName,
-      params: paramKeys,
-    });
-  }
-  
-  const paramsToRemove = MODEL_PARAM_FILTERS[modelName];
-  if (paramsToRemove) {
-    const actuallyRemoved = paramsToRemove.filter(p => p in data);
-    for (const param of paramsToRemove) {
-      delete data[param];
-    }
-    if (actuallyRemoved.length > 0) {
-      console.log(`[filter] ${modelName}: removed params [${actuallyRemoved.join(', ')}]`);
-      writeGatewayLog('model_params_filtered', {
-        requestId,
-        model: modelName,
-        removed: actuallyRemoved,
-      });
-    }
-  }
-  return data;
-}
-
 async function handleChatCompletions(req, res, body, requestId) {
   let data;
   try {
@@ -1142,9 +1213,6 @@ async function handleChatCompletions(req, res, body, requestId) {
     });
     return;
   }
-  
-  // 应用参数过滤
-  data = filterModelParams(data, modelName, requestId);
   
   let entry = modelMap.get(modelName);
   if (!entry) {
@@ -1201,7 +1269,8 @@ async function handleChatCompletions(req, res, body, requestId) {
   const upstreamModel = entry.upstreamModel;
   // Remove provider prefixes like "local/" before passing upstream.
   const realModel = stripModelPrefix(upstreamModel);
-  data.model = realModel;
+  const sanitized = sanitizePayloadForUpstream({ ...data, model: realModel }, upstreamModel);
+  data = sanitized.data;
   body = JSON.stringify(data);  // 已经过滤过参数的 data
   writeGatewayLog('model_routed', {
     requestId,
@@ -1211,6 +1280,7 @@ async function handleChatCompletions(req, res, body, requestId) {
     channelKey: entry.channelKey,
     channel: channel.name,
     finalParams: Object.keys(data).filter(k => !['model', 'messages', 'stream'].includes(k)),
+    ...(sanitized.removedParams.length ? { removedParams: sanitized.removedParams } : {}),
   });
   
   try {
@@ -1349,7 +1419,7 @@ async function handleConfigAPI(req, res, url, body) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       file: currentLogFile(),
-      logs: readGatewayLogs(limit),
+      logs: readVisibleGatewayLogs(limit),
     }));
     return true;
   }
@@ -1377,7 +1447,7 @@ async function handleConfigAPI(req, res, url, body) {
   
   if (url === '/api/config/save' && req.method === 'POST') {
     const d = JSON.parse(body);
-    const { channelKey, name, base_url, key, models, format, anthropic_version, stream_stop_sequences, isNew } = d;
+    const { channelKey, name, base_url, key, models, format, anthropic_version, stream_stop_sequences, stream_append_before_done, isNew } = d;
     
     if (!channelKey) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -1400,6 +1470,9 @@ async function handleConfigAPI(req, res, url, body) {
       ...(anthropic_version || existingChannel.anthropic_version ? { anthropic_version: anthropic_version || existingChannel.anthropic_version } : {}),
       ...(stream_stop_sequences !== undefined ? { stream_stop_sequences: normalizeStopSequences(stream_stop_sequences) } : (
         existingChannel.stream_stop_sequences !== undefined ? { stream_stop_sequences: normalizeStopSequences(existingChannel.stream_stop_sequences) } : {}
+      )),
+      ...(stream_append_before_done !== undefined ? { stream_append_before_done: String(stream_append_before_done || '') } : (
+        existingChannel.stream_append_before_done !== undefined ? { stream_append_before_done: String(existingChannel.stream_append_before_done || '') } : {}
       )),
       models: models || [],
     };
