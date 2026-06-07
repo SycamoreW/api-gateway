@@ -303,7 +303,9 @@ function endStreamWithoutUpstream(req, res, data, requestId, logContext, reason)
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache',
     'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
   });
+  if (typeof res.flushHeaders === 'function') res.flushHeaders();
   res.write('data: [DONE]\n\n');
   res.end();
 
@@ -319,6 +321,40 @@ function endStreamWithoutUpstream(req, res, data, requestId, logContext, reason)
     totalTokens: 0,
     errorMessage: reason,
     blockedPattern: logContext.blockedPromptPattern || undefined,
+  }));
+}
+
+function endStreamWithPreemptiveSyntheticStop(req, res, data, requestId, logContext, channel, model, stopInfo) {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  if (typeof res.flushHeaders === 'function') res.flushHeaders();
+  res.write('data: [DONE]\n\n');
+  res.end();
+
+  const reason = 'synthetic_stop_preempted';
+  logRequest(model || data?.model || 'unknown', channel.name, 0, true, requestLogOptions(logContext, requestId, reason));
+  writeGatewayLog('synthetic_stop_preempted', {
+    requestId,
+    model: model || data?.model || 'unknown',
+    channel: channel.name,
+    sequence: stopInfo.seq,
+    position: stopInfo.idx,
+    appendedLength: stopInfo.appendedLength,
+    clientIp: logContext.clientIp,
+  });
+  writeGatewayLog('request_complete', responseLogFields(logContext, {
+    requestId,
+    model: model || data?.model || 'unknown',
+    channel: channel.name,
+    statusCode: 200,
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    errorMessage: reason,
   }));
 }
 
@@ -778,6 +814,32 @@ function getChannelStreamAppendBeforeDone(channel) {
   return String(channel.stream_append_before_done || '');
 }
 
+function findStopSequenceInText(text, stopSequences = []) {
+  let found = null;
+  for (const seq of stopSequences) {
+    const idx = text.indexOf(seq);
+    if (idx !== -1 && (!found || idx < found.idx)) {
+      found = { seq, idx };
+    }
+  }
+  return found;
+}
+
+function getPreemptiveSyntheticStop(channel) {
+  const streamAppendBeforeDone = getChannelStreamAppendBeforeDone(channel);
+  if (!streamAppendBeforeDone) return null;
+  const stopSequences = getChannelStopSequences(channel);
+  if (!stopSequences.length) return null;
+  const found = findStopSequenceInText(streamAppendBeforeDone, stopSequences);
+  if (!found) return null;
+  const prefix = streamAppendBeforeDone.slice(0, found.idx);
+  if (prefix.trim()) return null;
+  return {
+    ...found,
+    appendedLength: streamAppendBeforeDone.length,
+  };
+}
+
 function normalizePioneerNativeBaseUrl(baseUrl, stopSequences = []) {
   if (!baseUrl) return baseUrl;
   if (!stopSequences.length) return baseUrl;
@@ -925,14 +987,7 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
       }
 
       function findStopSequence(text) {
-        let found = null;
-        for (const seq of stopSequences) {
-          const idx = text.indexOf(seq);
-          if (idx !== -1 && (!found || idx < found.idx)) {
-            found = { seq, idx };
-          }
-        }
-        return found;
+        return findStopSequenceInText(text, stopSequences);
       }
 
       function completeWithStopSequence(seq, idx) {
@@ -1681,6 +1736,20 @@ async function handleChatCompletions(req, res, body, requestId) {
   
   // Strip prefix from model name for upstream
   const upstreamModel = entry.upstreamModel;
+  const preemptiveSyntheticStop = getPreemptiveSyntheticStop(channel);
+  if (preemptiveSyntheticStop) {
+    endStreamWithPreemptiveSyntheticStop(
+      req,
+      res,
+      data,
+      requestId,
+      logContext,
+      channel,
+      upstreamModel,
+      preemptiveSyntheticStop,
+    );
+    return;
+  }
   // Remove prefix like "local/", "ds/", "pio/", etc before passing upstream
   const realModel = stripModelPrefix(upstreamModel);
   const sanitized = sanitizePayloadForUpstream({ ...data, model: realModel }, upstreamModel);

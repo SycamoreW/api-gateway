@@ -74,6 +74,8 @@ When a keyword is detected in an SSE streaming response, the gateway stops forwa
 
 For Pioneer channels, use `https://api.pioneer.ai/v1` when stream stop keywords are enabled. If a Pioneer channel is saved as `https://api.pioneer.ai` with stop keywords configured, the gateway normalizes it to the native `/v1` endpoint to avoid the aggregate upstream charging before the local truncation takes effect.
 
+If `stream_append_before_done` would begin with a configured stop keyword (allowing leading whitespace), the gateway preempts the request and returns `[DONE]` without calling upstream. This keeps synthetic stop tests at 0 upstream tokens; real model output still requires an upstream request and can be billed until an actual stop keyword is received or the client disconnects.
+
 ## Files
 
 - `index.mjs`: server, auth, routing, proxying, logs, stats, config API
