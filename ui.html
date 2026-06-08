@@ -62,6 +62,11 @@
   .modal textarea{min-height:78px;resize:vertical;font-family:inherit}
   .modal input:focus,.modal select:focus,.modal textarea:focus{outline:none;border-color:#58a6ff}
   .modal .hint{font-size:13px;color:#484f58;margin-top:2px}
+  .modal .notice{border:1px solid #30363d;border-radius:8px;background:#0d1117;padding:9px 11px;margin:8px 0;color:#c9d1d9;font-size:13px;line-height:1.45}
+  .modal .notice strong{display:block;color:#f0f6fc;font-size:14px;margin-bottom:2px}
+  .modal .notice.info{border-color:#264f78;background:#0f1b2d}
+  .modal .notice.warn{border-color:#6b4d16;background:#18150c}
+  .modal .notice.ok{border-color:#1f6f43;background:#0f2418}
   .modal .checkbox-label{display:flex;align-items:center;gap:6px;font-size:14px;color:#c9d1d9;margin:8px 0;cursor:pointer}
   .modal .checkbox-label input{width:auto}
   .modal .actions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
@@ -287,6 +292,7 @@ let gatewayStats = null;
 let statsView = { label: '全部时间', totalRequests: 0, totalTokens: 0, modelUsage: {}, channelUsage: {}, ipUsage: {}, recentLogs: [] };
 let billingData = null;
 let stopSettingsPromptShown = false;
+const STOP_SETTINGS_DISMISSED_STORAGE = 'gateway_stop_settings_prompt_dismissed';
 const HIDDEN_LOG_EVENTS = new Set([
   'http_request',
   'model_params',
@@ -574,9 +580,9 @@ async function load() {
   render();
   loadStats();
   loadLogs();
-  if (!stopSettingsPromptShown) {
+  if (!stopSettingsPromptShown && localStorage.getItem(STOP_SETTINGS_DISMISSED_STORAGE) !== '1') {
     stopSettingsPromptShown = true;
-    setTimeout(() => showStopSequenceConfig(), 0);
+    setTimeout(() => showStopSequenceConfig({ auto: true }), 0);
   }
 }
 
@@ -1105,17 +1111,26 @@ async function saveChannel() {
   } catch(e) { toast('保存失败: '+e.message, false); }
 }
 
-function showStopSequenceConfig() {
+function showStopSequenceConfig(options = {}) {
   const channelEntries = Object.entries(channels);
   const allSequences = [...new Set(channelEntries.flatMap(([, ch]) => getStopSequences(ch)))];
+  const neverPromptButton = options.auto
+    ? '<button class="btn btn-outline" onclick="disableStopSequencePrompt()">以后不再提示</button>'
+    : '';
   document.getElementById('modalContent').innerHTML = `
     <h3>流式截断设置</h3>
     <label>截断关键词</label>
     <textarea id="batchStopSequences" placeholder="例如: &lt;answer&gt;">${escapeHtml(allSequences.join('\n'))}</textarea>
-    <div class="hint">一行一个或用逗号分隔；命中后停止继续转发，并不会把关键词发给客户端</div>
+    <div class="notice warn">
+      <strong>截断关键词会真正生效</strong>
+      一行一个或用逗号分隔；命中后停止继续转发，并不会把关键词发给客户端。
+    </div>
     <label>推荐加到酒馆预设的提示词</label>
     <textarea id="recommendedStopPrompt" readonly>${escapeHtml(RECOMMENDED_STOP_PROMPT)}</textarea>
-    <div class="hint">这里只是推荐文本，网关不会把它发给上游；请复制到酒馆预设里使用</div>
+    <div class="notice info">
+      <strong>这里只是推荐文本</strong>
+      网关不会把它发给上游；请复制到酒馆预设里使用。
+    </div>
     <label>适用渠道</label>
     <div class="model-picker" style="display:block;max-height:260px">
       ${channelEntries.map(([ckey, ch]) => {
@@ -1123,13 +1138,24 @@ function showStopSequenceConfig() {
         return `<label><input type="checkbox" class="stop-channel" value="${escapeHtml(ckey)}" ${checked}> ${escapeHtml(ch.name || ckey)} <span class="count">${escapeHtml(ckey)}</span></label>`;
       }).join('') || '<div class="empty">暂无渠道</div>'}
     </div>
-    <div class="hint">保存后，勾选渠道只会使用上面的关键词；未勾选渠道会关闭自定义流式截断</div>
+    <div class="notice ok">
+      <strong>保存后按渠道应用</strong>
+      勾选渠道只会使用上面的关键词；未勾选渠道会关闭自定义流式截断。
+    </div>
     <div class="actions">
+      ${neverPromptButton}
       <button class="btn btn-outline" onclick="copyRecommendedStopPrompt()">复制推荐提示词</button>
       <button class="btn btn-outline" onclick="closeModal()">取消</button>
       <button class="btn btn-primary" onclick="saveStopSequenceConfig()">保存</button>
     </div>`;
   document.getElementById('modal').classList.add('active');
+}
+
+function disableStopSequencePrompt() {
+  localStorage.setItem(STOP_SETTINGS_DISMISSED_STORAGE, '1');
+  stopSettingsPromptShown = true;
+  closeModal();
+  toast('以后不会自动弹出流式截断设置');
 }
 
 async function copyRecommendedStopPrompt() {
