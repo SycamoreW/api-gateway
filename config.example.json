@@ -6,10 +6,10 @@
       "name": "pio",
       "base_url": "https://api.pioneer.ai/v1",
       "key": "replace-with-pioneer-key",
-      "stream_append_before_done": "\n<answer>\n鸡兔同笼：共有35个头、94只脚。设兔子为x只，鸡为35-x只。兔子4只脚，鸡2只脚，所以4x+2(35-x)=94，化简得2x+70=94，x=12。兔子12只，鸡23只。\n</answer>",
       "stream_stop_sequences": [
         "<answer>"
       ],
+      "stream_stop_prompt": "请在本次回复末尾追加一段：<answer>最终答案</answer>。不要提前输出 <answer>，只在正文全部结束后输出。",
       "models": [
         "claude-opus-4-6",
         "gemini-3.5-flash",

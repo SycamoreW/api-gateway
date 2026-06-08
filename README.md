@@ -60,13 +60,15 @@ You can:
 
 - Enter one or more stop keywords, one per line or comma-separated
 - Select which channels the keywords apply to
+- Optionally inject a user prompt before the last user message so the model appends the stop keyword near the end of its own output
 - Save and use immediately
 
 Config field:
 
 ```json
 {
-  "stream_stop_sequences": ["<answer>"]
+  "stream_stop_sequences": ["<answer>"],
+  "stream_stop_prompt": "请在本次回复末尾追加一段：<answer>最终答案</answer>。不要提前输出 <answer>，只在正文全部结束后输出。"
 }
 ```
 
@@ -74,7 +76,7 @@ When a keyword is detected in an SSE streaming response, the gateway stops forwa
 
 For Pioneer channels, use `https://api.pioneer.ai/v1` when stream stop keywords are enabled. If a Pioneer channel is saved as `https://api.pioneer.ai` with stop keywords configured, the gateway normalizes it to the native `/v1` endpoint to avoid the aggregate upstream charging before the local truncation takes effect.
 
-If `stream_append_before_done` would begin with a configured stop keyword (allowing leading whitespace), the gateway preempts the request and returns `[DONE]` without calling upstream. This keeps synthetic stop tests at 0 upstream tokens; real model output still requires an upstream request and can be billed until an actual stop keyword is received or the client disconnects.
+`stream_stop_prompt` is sent upstream as a `user` message inserted before the last original `user` message. This prompts the model to emit the stop keyword itself near the end, letting the gateway abort the upstream stream as soon as the keyword appears.
 
 ## Files
 

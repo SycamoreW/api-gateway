@@ -330,6 +330,10 @@ function stopSequencesText(ch) {
   return getStopSequences(ch).join('\n');
 }
 
+function streamStopPromptText(ch) {
+  return String(ch?.stream_stop_prompt || '');
+}
+
 function switchTab(tab) {
   document.querySelectorAll('.tab-btn').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.tab === tab);
@@ -977,6 +981,9 @@ async function showAddChannel() {
     <label>流式截断关键词</label>
     <textarea id="chStopSequences" placeholder="例如: &lt;answer&gt;"></textarea>
     <div class="hint">一行一个或用逗号分隔；只对当前渠道的流式 SSE 响应生效，留空=不启用</div>
+    <label>末尾截断提示词</label>
+    <textarea id="chStopPrompt" placeholder="例如: 请在回复末尾追加 &lt;answer&gt;最终答案&lt;/answer&gt;"></textarea>
+    <div class="hint">保存后会以 user 身份插入到最后一条 user 消息前；用于诱导模型在末尾真实输出截断关键词，留空=不注入</div>
     <div class="actions">
       <button class="btn btn-outline" onclick="closeModal()">取消</button>
       <button class="btn btn-primary" onclick="saveChannel()">保存</button>
@@ -1033,6 +1040,9 @@ function editChannel(ckey) {
     <label>流式截断关键词</label>
     <textarea id="chStopSequences" placeholder="例如: &lt;answer&gt;">${escapeHtml(stopSequencesText(ch))}</textarea>
     <div class="hint">一行一个或用逗号分隔；保存为空会关闭该渠道的流式截断</div>
+    <label>末尾截断提示词</label>
+    <textarea id="chStopPrompt" placeholder="例如: 请在回复末尾追加 &lt;answer&gt;最终答案&lt;/answer&gt;">${escapeHtml(streamStopPromptText(ch))}</textarea>
+    <div class="hint">以 user 身份插入到最后一条 user 消息前；用于诱导模型在末尾真实输出截断关键词，留空=不注入</div>
     <div class="actions">
       <button class="btn btn-outline" onclick="closeModal()">取消</button>
       <button class="btn btn-primary" onclick="saveChannel()">保存</button>
@@ -1047,6 +1057,7 @@ async function saveChannel() {
   const key = document.getElementById('chKey').value.trim();
   const models = document.getElementById('chModels').value.split(',').map(m => m.trim()).filter(Boolean);
   const streamStopSequences = parseStopSequences(document.getElementById('chStopSequences')?.value || '');
+  const streamStopPrompt = document.getElementById('chStopPrompt')?.value || '';
   
   if (!name || !url) { toast('名称和地址必填', false); return; }
   if (!editingKey && !key) { toast('新渠道必须填写 API Key', false); return; }
@@ -1071,6 +1082,7 @@ async function saveChannel() {
           key,
           models: finalModels,
           stream_stop_sequences: streamStopSequences,
+          stream_stop_prompt: streamStopPrompt,
           isNew: true,
         })
       });
@@ -1089,6 +1101,7 @@ async function saveChannel() {
         key: key || channels[editingKey]?.key,
         models,
         stream_stop_sequences: streamStopSequences,
+        stream_stop_prompt: streamStopPrompt,
         isNew: false,
       })
     });
