@@ -60,15 +60,14 @@ You can:
 
 - Enter one or more stop keywords, one per line or comma-separated
 - Select which channels the keywords apply to
-- Optionally inject a user prompt before the last user message so the model appends the stop keyword near the end of its own output
+- Copy the recommended prompt into your SillyTavern preset if you want the model to emit the keyword near the end
 - Save and use immediately
 
 Config field:
 
 ```json
 {
-  "stream_stop_sequences": [],
-  "stream_stop_prompt": ""
+  "stream_stop_sequences": []
 }
 ```
 
@@ -76,7 +75,7 @@ When a keyword is detected in an SSE streaming response, the gateway stops forwa
 
 For Pioneer channels, use `https://api.pioneer.ai/v1` when stream stop keywords are enabled. If a Pioneer channel is saved as `https://api.pioneer.ai` with stop keywords configured, the gateway normalizes it to the native `/v1` endpoint to avoid the aggregate upstream charging before the local truncation takes effect.
 
-`stream_stop_prompt` is sent upstream as a `user` message inserted before the last original `user` message. This prompts the model to emit the stop keyword itself near the end, letting the gateway abort the upstream stream as soon as the keyword appears.
+The gateway does not inject a stop prompt into upstream requests. The prompt shown in the WebUI is only a recommendation for users to copy into their SillyTavern preset.
 
 ## Files
 

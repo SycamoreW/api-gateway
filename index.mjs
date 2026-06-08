@@ -814,26 +814,6 @@ function getChannelStreamAppendBeforeDone(channel) {
   return String(channel.stream_append_before_done || '');
 }
 
-function getChannelStreamStopPrompt(channel) {
-  if (!Object.prototype.hasOwnProperty.call(channel, 'stream_stop_prompt')) return '';
-  return String(channel.stream_stop_prompt || '').trim();
-}
-
-function injectMessageBeforeLastUser(data, content) {
-  if (!content || !data || typeof data !== 'object' || !Array.isArray(data.messages)) {
-    return { data, injected: false, index: -1 };
-  }
-  const messages = [...data.messages];
-  const message = { role: 'user', content };
-  const index = messages.map(item => item?.role).lastIndexOf('user');
-  if (index === -1) {
-    messages.push(message);
-    return { data: { ...data, messages }, injected: true, index: messages.length - 1 };
-  }
-  messages.splice(index, 0, message);
-  return { data: { ...data, messages }, injected: true, index };
-}
-
 function findStopSequenceInText(text, stopSequences = []) {
   let found = null;
   for (const seq of stopSequences) {
@@ -1770,22 +1750,6 @@ async function handleChatCompletions(req, res, body, requestId) {
     );
     return;
   }
-  const streamStopPrompt = getChannelStreamStopPrompt(channel);
-  const stopPromptInjection = injectMessageBeforeLastUser(data, streamStopPrompt);
-  if (stopPromptInjection.injected) {
-    data = stopPromptInjection.data;
-    logContext.inputContent = extractInputContent(data);
-    logContext.fullInputContent = extractInputContent(data, { truncate: false });
-    writeGatewayLog('stream_stop_prompt_injected', {
-      requestId,
-      requestedModel: modelName,
-      upstreamModel,
-      channel: channel.name,
-      index: stopPromptInjection.index,
-      promptLength: streamStopPrompt.length,
-      stopSequences: getChannelStopSequences(channel),
-    });
-  }
   // Remove prefix like "local/", "ds/", "pio/", etc before passing upstream
   const realModel = stripModelPrefix(upstreamModel);
   const sanitized = sanitizePayloadForUpstream({ ...data, model: realModel }, upstreamModel);
@@ -2067,7 +2031,7 @@ async function handleConfigAPI(req, res, url, body) {
   
   if (url === '/api/config/save' && req.method === 'POST') {
     const d = JSON.parse(body);
-    const { channelKey, name, base_url, key, models, format, anthropic_version, stream_stop_sequences, stream_stop_prompt, stream_append_before_done, isNew } = d;
+    const { channelKey, name, base_url, key, models, format, anthropic_version, stream_stop_sequences, stream_append_before_done, isNew } = d;
     
     if (!channelKey) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -2100,9 +2064,6 @@ async function handleConfigAPI(req, res, url, body) {
       ...(format || existingChannel.format ? { format: format || existingChannel.format } : {}),
       ...(anthropic_version || existingChannel.anthropic_version ? { anthropic_version: anthropic_version || existingChannel.anthropic_version } : {}),
       ...(stream_stop_sequences !== undefined || existingChannel.stream_stop_sequences !== undefined ? { stream_stop_sequences: normalizedStopSequences } : {}),
-      ...(stream_stop_prompt !== undefined ? { stream_stop_prompt: String(stream_stop_prompt || '') } : (
-        existingChannel.stream_stop_prompt !== undefined ? { stream_stop_prompt: String(existingChannel.stream_stop_prompt || '') } : {}
-      )),
       ...(stream_append_before_done !== undefined ? { stream_append_before_done: String(stream_append_before_done || '') } : (
         existingChannel.stream_append_before_done !== undefined ? { stream_append_before_done: String(existingChannel.stream_append_before_done || '') } : {}
       )),
