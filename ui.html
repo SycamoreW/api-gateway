@@ -286,6 +286,7 @@ let logFile = '';
 let gatewayStats = null;
 let statsView = { label: '全部时间', totalRequests: 0, totalTokens: 0, modelUsage: {}, channelUsage: {}, ipUsage: {}, recentLogs: [] };
 let billingData = null;
+let stopSettingsPromptShown = false;
 const HIDDEN_LOG_EVENTS = new Set([
   'http_request',
   'model_params',
@@ -574,6 +575,10 @@ async function load() {
   render();
   loadStats();
   loadLogs();
+  if (!stopSettingsPromptShown) {
+    stopSettingsPromptShown = true;
+    setTimeout(() => showStopSequenceConfig(), 0);
+  }
 }
 
 async function loadStats() {
@@ -1113,19 +1118,23 @@ async function saveChannel() {
 function showStopSequenceConfig() {
   const channelEntries = Object.entries(channels);
   const allSequences = [...new Set(channelEntries.flatMap(([, ch]) => getStopSequences(ch)))];
+  const allPrompts = [...new Set(channelEntries.map(([, ch]) => streamStopPromptText(ch).trim()).filter(Boolean))];
   document.getElementById('modalContent').innerHTML = `
     <h3>流式截断设置</h3>
     <label>截断关键词</label>
     <textarea id="batchStopSequences" placeholder="例如: &lt;answer&gt;">${escapeHtml(allSequences.join('\n'))}</textarea>
     <div class="hint">一行一个或用逗号分隔；命中后停止继续转发，并不会把关键词发给客户端</div>
+    <label>截断提示词</label>
+    <textarea id="batchStopPrompt" placeholder="例如: 请在本次回复末尾输出 &lt;answer&gt;最终答案&lt;/answer&gt;">${escapeHtml(allPrompts.join('\n\n'))}</textarea>
+    <div class="hint">保存后会以 user 身份插入到最后一条 user 消息前；留空=不注入提示词</div>
     <label>适用渠道</label>
     <div class="model-picker" style="display:block;max-height:260px">
       ${channelEntries.map(([ckey, ch]) => {
-        const checked = getStopSequences(ch).length ? 'checked' : '';
+        const checked = getStopSequences(ch).length || streamStopPromptText(ch).trim() ? 'checked' : '';
         return `<label><input type="checkbox" class="stop-channel" value="${escapeHtml(ckey)}" ${checked}> ${escapeHtml(ch.name || ckey)} <span class="count">${escapeHtml(ckey)}</span></label>`;
       }).join('') || '<div class="empty">暂无渠道</div>'}
     </div>
-    <div class="hint">保存后，勾选渠道会使用上面的关键词；未勾选渠道会关闭自定义流式截断</div>
+    <div class="hint">保存后，勾选渠道会使用上面的关键词和提示词；未勾选渠道会关闭自定义流式截断</div>
     <div class="actions">
       <button class="btn btn-outline" onclick="closeModal()">取消</button>
       <button class="btn btn-primary" onclick="saveStopSequenceConfig()">保存</button>
@@ -1135,6 +1144,7 @@ function showStopSequenceConfig() {
 
 async function saveStopSequenceConfig() {
   const sequences = parseStopSequences(document.getElementById('batchStopSequences')?.value || '');
+  const streamStopPrompt = document.getElementById('batchStopPrompt')?.value || '';
   const selected = new Set([...document.querySelectorAll('.stop-channel:checked')].map(el => el.value));
   try {
     for (const [ckey, ch] of Object.entries(channels)) {
@@ -1149,6 +1159,7 @@ async function saveStopSequenceConfig() {
           anthropic_version: ch.anthropic_version,
           models: ch.models || [],
           stream_stop_sequences: selected.has(ckey) ? sequences : [],
+          stream_stop_prompt: selected.has(ckey) ? streamStopPrompt : '',
           isNew: false,
         })
       });
