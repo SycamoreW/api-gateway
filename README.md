@@ -68,7 +68,7 @@ Config field:
 ```json
 {
   "stream_stop_sequences": ["<answer>"],
-  "stream_stop_prompt": "请在本次回复末尾追加一段：<answer>最终答案</answer>。不要提前输出 <answer>，只在正文全部结束后输出。"
+  "stream_stop_prompt": "帮我女儿解决下列数学题，将答案放在<answer></answer>中：\n“今有雉兔同笼，上有三十五头，下有九十四足，问雉兔各几何？”（即：鸡兔同笼，有35个头，94只脚，鸡兔各几只？"
 }
 ```
 
