@@ -324,40 +324,6 @@ function endStreamWithoutUpstream(req, res, data, requestId, logContext, reason)
   }));
 }
 
-function endStreamWithPreemptiveSyntheticStop(req, res, data, requestId, logContext, channel, model, stopInfo) {
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream; charset=utf-8',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive',
-    'X-Accel-Buffering': 'no',
-  });
-  if (typeof res.flushHeaders === 'function') res.flushHeaders();
-  res.write('data: [DONE]\n\n');
-  res.end();
-
-  const reason = 'synthetic_stop_preempted';
-  logRequest(model || data?.model || 'unknown', channel.name, 0, true, requestLogOptions(logContext, requestId, reason));
-  writeGatewayLog('synthetic_stop_preempted', {
-    requestId,
-    model: model || data?.model || 'unknown',
-    channel: channel.name,
-    sequence: stopInfo.seq,
-    position: stopInfo.idx,
-    appendedLength: stopInfo.appendedLength,
-    clientIp: logContext.clientIp,
-  });
-  writeGatewayLog('request_complete', responseLogFields(logContext, {
-    requestId,
-    model: model || data?.model || 'unknown',
-    channel: channel.name,
-    statusCode: 200,
-    inputTokens: 0,
-    outputTokens: 0,
-    totalTokens: 0,
-    errorMessage: reason,
-  }));
-}
-
 function buildLogContext(req, data = {}) {
   return {
     clientIp: getClientIp(req),
@@ -784,11 +750,6 @@ function convertAnthropicResponseToOpenAI(data, requestedModel) {
   };
 }
 
-// 历史默认值：未显式配置的 pio 渠道仍按 <answer> 截断。
-const CHANNEL_STOP_SEQUENCES = {
-  pio: ['<answer>'],
-};
-
 function normalizeStopSequences(value) {
   if (Array.isArray(value)) {
     return [...new Set(value.map(v => String(v || '').trim()).filter(Boolean))];
@@ -806,12 +767,7 @@ function getChannelStopSequences(channel) {
   if (Object.prototype.hasOwnProperty.call(channel, 'stop_sequences')) {
     return normalizeStopSequences(channel.stop_sequences);
   }
-  return normalizeStopSequences(CHANNEL_STOP_SEQUENCES[channel.name]);
-}
-
-function getChannelStreamAppendBeforeDone(channel) {
-  if (!Object.prototype.hasOwnProperty.call(channel, 'stream_append_before_done')) return '';
-  return String(channel.stream_append_before_done || '');
+  return [];
 }
 
 function findStopSequenceInText(text, stopSequences = []) {
@@ -823,21 +779,6 @@ function findStopSequenceInText(text, stopSequences = []) {
     }
   }
   return found;
-}
-
-function getPreemptiveSyntheticStop(channel) {
-  const streamAppendBeforeDone = getChannelStreamAppendBeforeDone(channel);
-  if (!streamAppendBeforeDone) return null;
-  const stopSequences = getChannelStopSequences(channel);
-  if (!stopSequences.length) return null;
-  const found = findStopSequenceInText(streamAppendBeforeDone, stopSequences);
-  if (!found) return null;
-  const prefix = streamAppendBeforeDone.slice(0, found.idx);
-  if (prefix.trim()) return null;
-  return {
-    ...found,
-    appendedLength: streamAppendBeforeDone.length,
-  };
 }
 
 function normalizePioneerNativeBaseUrl(baseUrl, stopSequences = []) {
@@ -895,7 +836,6 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
   const stopSequences = getChannelStopSequences(channel);
   const needsStopDetection = stopSequences.length > 0;
   const maxStopSequenceLength = Math.max(1, ...stopSequences.map(seq => seq.length));
-  const streamAppendBeforeDone = getChannelStreamAppendBeforeDone(channel);
   
   return new Promise((resolve, reject) => {
     const parsed = new URL(fullUrl);
@@ -915,8 +855,6 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
     let lastContentEvent = null;
     let streamBuffer = '';
     let stopped = false; // 是否已触发停止
-    let appendedBeforeDone = false;
-    let appendedStopSequence = null;
     let streamErrorMessage = '';
     let proxyResRef = null;
     let clientAbortLogged = false;
@@ -1104,28 +1042,6 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
         pendingContent = '';
       }
 
-      function appendBeforeDone() {
-        if (!streamAppendBeforeDone || appendedBeforeDone) return;
-        appendedBeforeDone = true;
-        const appendedContent = accumulatedContent + streamAppendBeforeDone;
-        const found = findStopSequence(appendedContent);
-        const suppressedByStop = Boolean(found && found.idx >= accumulatedContent.length);
-        if (!suppressedByStop) {
-          accumulatedContent += streamAppendBeforeDone;
-          writeContentEvent(streamAppendBeforeDone);
-        } else {
-          appendedStopSequence = found;
-        }
-        writeGatewayLog('stream_append_before_done', {
-          requestId,
-          model: modelName || 'unknown',
-          channel: channel.name,
-          appendedLength: streamAppendBeforeDone.length,
-          suppressedByStop,
-          ...(suppressedByStop ? { sequence: found.seq, position: found.idx } : {}),
-        });
-      }
-
       function writeFilteredStreamChunk(chunkStr) {
         streamBuffer += chunkStr;
         const lines = streamBuffer.split('\n');
@@ -1159,7 +1075,6 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
         }
         if (needsStopDetection && isEventStream) {
           flushPendingContent();
-          if (!streamErrorMessage) appendBeforeDone();
         }
         
         if (!res.writableEnded) {
@@ -1185,10 +1100,6 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
             outputTokens: responseDetails.outputTokens,
             totalTokens: responseDetails.totalTokens,
             outputContent: responseDetails.outputContent,
-            ...(appendedStopSequence ? {
-              suppressedSyntheticStopSequence: appendedStopSequence.seq,
-              suppressedSyntheticStopPosition: appendedStopSequence.idx,
-            } : {}),
           }));
         } else {
           const finalErrorMessage = errorMessage || `HTTP ${proxyRes.statusCode}`;
@@ -1736,20 +1647,6 @@ async function handleChatCompletions(req, res, body, requestId) {
   
   // Strip prefix from model name for upstream
   const upstreamModel = entry.upstreamModel;
-  const preemptiveSyntheticStop = getPreemptiveSyntheticStop(channel);
-  if (preemptiveSyntheticStop) {
-    endStreamWithPreemptiveSyntheticStop(
-      req,
-      res,
-      data,
-      requestId,
-      logContext,
-      channel,
-      upstreamModel,
-      preemptiveSyntheticStop,
-    );
-    return;
-  }
   // Remove prefix like "local/", "ds/", "pio/", etc before passing upstream
   const realModel = stripModelPrefix(upstreamModel);
   const sanitized = sanitizePayloadForUpstream({ ...data, model: realModel }, upstreamModel);
@@ -2031,7 +1928,7 @@ async function handleConfigAPI(req, res, url, body) {
   
   if (url === '/api/config/save' && req.method === 'POST') {
     const d = JSON.parse(body);
-    const { channelKey, name, base_url, key, models, format, anthropic_version, stream_stop_sequences, stream_append_before_done, isNew } = d;
+    const { channelKey, name, base_url, key, models, format, anthropic_version, stream_stop_sequences, isNew } = d;
     
     if (!channelKey) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -2064,9 +1961,6 @@ async function handleConfigAPI(req, res, url, body) {
       ...(format || existingChannel.format ? { format: format || existingChannel.format } : {}),
       ...(anthropic_version || existingChannel.anthropic_version ? { anthropic_version: anthropic_version || existingChannel.anthropic_version } : {}),
       ...(stream_stop_sequences !== undefined || existingChannel.stream_stop_sequences !== undefined ? { stream_stop_sequences: normalizedStopSequences } : {}),
-      ...(stream_append_before_done !== undefined ? { stream_append_before_done: String(stream_append_before_done || '') } : (
-        existingChannel.stream_append_before_done !== undefined ? { stream_append_before_done: String(existingChannel.stream_append_before_done || '') } : {}
-      )),
       models: models || [],
     };
     

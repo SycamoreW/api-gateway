@@ -330,7 +330,7 @@ function getStopSequences(ch) {
   if (Object.prototype.hasOwnProperty.call(ch, 'stop_sequences')) {
     return parseStopSequences(ch.stop_sequences);
   }
-  return ch?.name === 'pio' ? ['<answer>'] : [];
+  return [];
 }
 
 function stopSequencesText(ch) {
