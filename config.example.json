@@ -1,5 +1,5 @@
 {
-  "port": 8302,
+  "port": 8300,
   "api_key": "replace-with-gateway-api-key",
   "channels": {
     "pio": {
@@ -9,14 +9,24 @@
       "prompt_cache_enabled": true,
       "prompt_cache_ttl": "1h",
       "models": [
-        "claude-opus-4-6",
-        "gemini-3.5-flash",
-        "gpt-5.5",
-        "deepseek-ai/DeepSeek-V4-Pro"
+        "pio/claude-opus-4-6",
+        "pio/gemini-3.5-flash",
+        "pio/deepseek-ai/DeepSeek-V4-Pro"
+      ]
+    },
+    "anthropic": {
+      "name": "anthropic",
+      "base_url": "https://api.anthropic.com/v1",
+      "key": "replace-with-anthropic-key",
+      "format": "anthropic",
+      "anthropic_version": "2023-06-01",
+      "prompt_cache_enabled": true,
+      "prompt_cache_ttl": "1h",
+      "anthropic_thinking_type": "enabled",
+      "anthropic_thinking_budget_tokens": 32000,
+      "models": [
+        "anthropic/claude-3-7-sonnet-latest"
       ]
     }
-  },
-  "api_keys": [],
-  "disabled_api_keys": [],
-  "blocked_ips": []
+  }
 }

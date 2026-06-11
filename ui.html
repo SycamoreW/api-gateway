@@ -61,11 +61,6 @@
   .modal textarea{min-height:78px;resize:vertical;font-family:inherit}
   .modal input:focus,.modal select:focus,.modal textarea:focus{outline:none;border-color:#58a6ff}
   .modal .hint{font-size:13px;color:#484f58;margin-top:2px}
-  .modal .notice{border:1px solid #30363d;border-radius:8px;background:#0d1117;padding:9px 11px;margin:8px 0;color:#c9d1d9;font-size:13px;line-height:1.45}
-  .modal .notice strong{display:block;color:#f0f6fc;font-size:14px;margin-bottom:2px}
-  .modal .notice.info{border-color:#264f78;background:#0f1b2d}
-  .modal .notice.warn{border-color:#6b4d16;background:#18150c}
-  .modal .notice.ok{border-color:#1f6f43;background:#0f2418}
   .modal .checkbox-label{display:flex;align-items:center;gap:6px;font-size:14px;color:#c9d1d9;margin:8px 0;cursor:pointer}
   .modal .checkbox-label input{width:auto}
   .modal .actions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
@@ -82,19 +77,16 @@
   .stats-filters select,.stats-filters input{background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;font-size:14px;padding:5px 8px}
   .stats-custom{display:none;gap:8px;align-items:center;flex-wrap:wrap}
   .stats-custom.active{display:flex}
-  .stats-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;align-items:start}
-  .usage-card{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:12px;min-width:0}
+  .stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+  .usage-card{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:12px}
   .usage-card h3{font-size:15px;color:#f0f6fc;margin-bottom:10px}
-  .usage-card:not(.recent-card){min-height:194px}
-  .usage-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto auto auto;gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid #21262d;font-size:14px}
+  .usage-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto auto;gap:10px;align-items:center;padding:7px 0;border-bottom:1px solid #21262d;font-size:14px}
   .usage-row:last-child{border-bottom:none}
   .usage-name{color:#c9d1d9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .usage-count{color:#79c0ff;font-variant-numeric:tabular-nums}
-  .usage-zero-count{color:#f0883e;font-variant-numeric:tabular-nums}
   .usage-tokens{color:#8b949e;font-variant-numeric:tabular-nums}
   .usage-cache{color:#3fb950;font-variant-numeric:tabular-nums}
-  .recent-card{grid-column:1/-1}
-  .recent-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:8px;max-height:280px;overflow:auto;padding-right:2px}
+  .recent-list{display:flex;flex-direction:column;gap:6px;max-height:260px;overflow:auto}
   .recent-entry{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px 10px;font-size:14px}
   .recent-entry.fail{border-color:#7d2b2b;background:#1c1113}
   .recent-top{display:flex;justify-content:space-between;gap:10px;margin-bottom:4px}
@@ -129,16 +121,6 @@
   
   .empty{text-align:center;padding:40px;color:#484f58;font-size:16px}
   .empty .btn{margin-top:12px}
-
-  @media (max-width: 820px) {
-    .stats-grid{grid-template-columns:1fr}
-    .usage-card:not(.recent-card){min-height:auto}
-    .recent-card{grid-column:auto}
-    .recent-list{grid-template-columns:1fr}
-    .usage-row{grid-template-columns:minmax(0,1fr) auto;gap:4px 8px}
-    .usage-tokens{grid-column:2}
-    .usage-cache{grid-column:2}
-  }
 </style>
 </head>
 <body>
@@ -169,7 +151,6 @@
       <button class="btn btn-primary" onclick="showAddChannel()">+ 添加渠道</button>
       <button class="btn btn-outline" onclick="exportBackup()">导出备份</button>
       <button class="btn btn-outline" onclick="importBackup()">导入备份</button>
-      <button class="btn btn-outline" onclick="showClientKeysModal()">调用 Key</button>
       <button class="btn btn-outline" onclick="showApiKeyModal()">修改管理 Key</button>
     </div>
   </div>
@@ -180,7 +161,6 @@
       <div class="logs-toolbar">
         <div class="left">
           <button class="btn btn-outline btn-sm" onclick="loadLogs()">刷新</button>
-          <button class="btn btn-danger btn-sm" onclick="clearLogs()">清空日志</button>
           <select id="logEventFilter" onchange="renderLogs()">
             <option value="">全部事件</option>
           </select>
@@ -232,10 +212,6 @@
           <div id="channelUsage"><div class="empty">暂无统计</div></div>
         </div>
         <div class="usage-card">
-          <h3>热门 IP</h3>
-          <div id="ipUsage"><div class="empty">暂无统计</div></div>
-        </div>
-        <div class="usage-card recent-card">
           <h3>最近请求</h3>
           <div class="recent-list" id="recentUsage"><div class="empty">暂无请求</div></div>
         </div>
@@ -254,50 +230,23 @@
 
 <script>
 const KEY_STORAGE = 'apiGatewayKey';
-function normalizeApiKey(value) {
-  return String(value || '').trim();
-}
-
-function isHeaderSafe(value) {
-  return !/[^\x20-\x7e]/.test(String(value || ''));
-}
-
-function readStoredApiKey() {
-  const stored = normalizeApiKey(localStorage.getItem(KEY_STORAGE));
-  if (stored && !isHeaderSafe(stored)) {
-    localStorage.removeItem(KEY_STORAGE);
-    return '';
-  }
-  return stored;
-}
-
-let KEY = readStoredApiKey();
+let KEY = localStorage.getItem(KEY_STORAGE) || '';
 if (!KEY) {
-  KEY = normalizeApiKey(prompt('聚合渠道 API Key'));
-  if (KEY && !isHeaderSafe(KEY)) {
-    alert('API Key 只能使用英文、数字和常见半角符号，请重新输入。');
-    KEY = '';
-  }
+  KEY = prompt('聚合渠道管理 Key（初始默认 123456）') || '';
   if (KEY) localStorage.setItem(KEY_STORAGE, KEY);
 }
-document.getElementById('apiUrl').textContent = `${location.origin}/v1`;
+const HOST = location.hostname || '170.106.64.129';
+document.getElementById('apiUrl').textContent = `http://${HOST}:8300/v1`;
 document.getElementById('apiKeyLabel').textContent = KEY ? '已保存在本浏览器' : '未设置';
 
 let channels = {};
-let clientKeys = [];
 let editingKey = null;
 let gatewayLogs = [];
 let logFile = '';
 let gatewayStats = null;
-let statsView = { label: '全部时间', totalRequests: 0, totalTokens: 0, modelUsage: {}, channelUsage: {}, ipUsage: {}, recentLogs: [] };
 let billingData = null;
-const HIDDEN_LOG_EVENTS = new Set([
-  'http_request',
-  'model_params',
-  'model_routed',
-  'request_complete',
-  'upstream_request',
-]);
+let statsView = { label: '全部时间', totalRequests: 0, totalTokens: 0, cacheHitCount: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, modelUsage: {}, channelUsage: {}, recentLogs: [] };
+const HIDDEN_LOG_EVENTS = new Set(['http_request', 'model_params', 'model_routed']);
 
 function toast(msg, ok=true) {
   const el = document.getElementById('toast');
@@ -316,6 +265,42 @@ function jsArg(value) {
   return escapeHtml(JSON.stringify(String(value ?? '')));
 }
 
+function showApiKeyModal() {
+  document.getElementById('modalContent').innerHTML = `
+    <h3>修改管理 Key</h3>
+    <label>新的管理 Key</label>
+    <input id="newApiKey" type="password" placeholder="至少 4 位" autocomplete="new-password">
+    <div class="hint">保存后会写入 config.json，并自动更新当前浏览器保存的 Key</div>
+    <div class="actions">
+      <button class="btn btn-outline" onclick="closeModal()">取消</button>
+      <button class="btn btn-primary" onclick="saveApiKey()">保存</button>
+    </div>`;
+  document.getElementById('modal').classList.add('active');
+  setTimeout(() => document.getElementById('newApiKey')?.focus(), 0);
+}
+
+async function saveApiKey() {
+  const nextKey = document.getElementById('newApiKey').value.trim();
+  if (nextKey.length < 4) { toast('管理 Key 至少 4 位', false); return; }
+  try {
+    const res = await api('/api/config/api-key', {
+      method: 'POST',
+      body: JSON.stringify({ api_key: nextKey })
+    });
+    if (res.ok) {
+      KEY = nextKey;
+      localStorage.setItem(KEY_STORAGE, KEY);
+      document.getElementById('apiKeyLabel').textContent = '已保存在本浏览器';
+      toast('管理 Key 已修改');
+      closeModal();
+    } else {
+      toast(res.error || '修改失败', false);
+    }
+  } catch(e) {
+    toast('修改失败: '+e.message, false);
+  }
+}
+
 function switchTab(tab) {
   document.querySelectorAll('.tab-btn').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.tab === tab);
@@ -326,12 +311,6 @@ function switchTab(tab) {
 }
 
 async function api(path, opts={}) {
-  KEY = normalizeApiKey(KEY);
-  if (!KEY || !isHeaderSafe(KEY)) {
-    localStorage.removeItem(KEY_STORAGE);
-    document.getElementById('apiKeyLabel').textContent = 'Key 无效，请刷新后重输';
-    throw new Error('API Key 含有非法字符，请刷新页面重新输入');
-  }
   const res = await fetch(path, { headers: { 'Authorization': `Bearer ${KEY}`, 'Content-Type': 'application/json' }, ...opts });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
@@ -407,137 +386,10 @@ async function importBackup() {
   input.click();
 }
 
-function showApiKeyModal() {
-  document.getElementById('modalContent').innerHTML = `
-    <h3>修改管理 Key</h3>
-    <label>新的管理 Key</label>
-    <input id="newApiKey" type="password" placeholder="至少 4 位" autocomplete="new-password">
-    <div class="hint">保存后会写入 config.json，并自动更新当前浏览器保存的 Key</div>
-    <div class="actions">
-      <button class="btn btn-outline" onclick="closeModal()">取消</button>
-      <button class="btn btn-primary" onclick="saveApiKey()">保存</button>
-    </div>`;
-  document.getElementById('modal').classList.add('active');
-  setTimeout(() => document.getElementById('newApiKey')?.focus(), 0);
-}
-
-async function saveApiKey() {
-  const nextKey = document.getElementById('newApiKey').value.trim();
-  if (nextKey.length < 4) { toast('管理 Key 至少 4 位', false); return; }
-  try {
-    const res = await api('/api/config/api-key', {
-      method: 'POST',
-      body: JSON.stringify({ api_key: nextKey })
-    });
-    if (res.ok) {
-      KEY = nextKey;
-      localStorage.setItem(KEY_STORAGE, KEY);
-      document.getElementById('apiKeyLabel').textContent = '已保存在本浏览器';
-      toast('管理 Key 已修改');
-      closeModal();
-    } else {
-      toast(res.error || '修改失败', false);
-    }
-  } catch(e) {
-    toast('修改失败: ' + e.message, false);
-  }
-}
-
-async function copyText(text) {
-  const value = String(text || '');
-  if (!value) {
-    toast('没有可复制的内容', false);
-    return;
-  }
-  try {
-    if (!navigator.clipboard || !window.isSecureContext) throw new Error('clipboard unavailable');
-    await navigator.clipboard.writeText(value);
-    toast('已复制');
-    return;
-  } catch {}
-
-  const textarea = document.createElement('textarea');
-  textarea.value = value;
-  textarea.setAttribute('readonly', '');
-  textarea.style.position = 'fixed';
-  textarea.style.left = '-9999px';
-  textarea.style.top = '0';
-  document.body.appendChild(textarea);
-  textarea.focus();
-  textarea.select();
-  textarea.setSelectionRange(0, textarea.value.length);
-  try {
-    const ok = document.execCommand('copy');
-    toast(ok ? '已复制' : '复制失败，请手动复制', ok);
-  } catch {
-    toast('复制失败，请手动复制', false);
-  } finally {
-    document.body.removeChild(textarea);
-  }
-}
-
-function showClientKeysModal() {
-  const rows = clientKeys.length ? clientKeys.map(key => `
-    <div style="display:flex;gap:8px;align-items:center;margin:8px 0">
-      <code style="flex:1;word-break:break-all;background:#0d1117;padding:7px 9px;border-radius:6px">${escapeHtml(key)}</code>
-      <button class="btn btn-outline btn-sm" onclick="copyText(${jsArg(key)})">复制</button>
-      <button class="btn btn-danger btn-sm" onclick="deleteClientKey(${jsArg(key)})">删除</button>
-    </div>
-  `).join('') : '<div class="empty" style="padding:18px">还没有调用 Key</div>';
-  document.getElementById('modalContent').innerHTML = `
-    <h3>调用 Key</h3>
-    <div class="hint">调用 Key 给别人接入 /v1 使用；管理后台仍然使用管理 Key。</div>
-    <label>批量生成数量</label>
-    <input id="clientKeyCount" type="number" min="1" max="100" value="10">
-    <label>前缀</label>
-    <input id="clientKeyPrefix" value="pio" placeholder="例如 pio">
-    <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
-      <button class="btn btn-primary" onclick="generateClientKeys()">批量生成</button>
-      <button class="btn btn-outline" onclick="copyText(clientKeys.join('\\n'))">复制全部</button>
-    </div>
-    <div style="margin-top:14px">${rows}</div>
-    <div class="actions">
-      <button class="btn btn-outline" onclick="closeModal()">关闭</button>
-    </div>`;
-  document.getElementById('modal').classList.add('active');
-}
-
-async function generateClientKeys() {
-  const count = document.getElementById('clientKeyCount').value;
-  const prefix = document.getElementById('clientKeyPrefix').value;
-  try {
-    const res = await api('/api/config/client-keys/generate', {
-      method: 'POST',
-      body: JSON.stringify({ count, prefix })
-    });
-    clientKeys = res.api_keys || [];
-    toast(`已生成 ${res.keys?.length || 0} 个调用 Key`);
-    showClientKeysModal();
-  } catch(e) {
-    toast('生成失败: ' + e.message, false);
-  }
-}
-
-async function deleteClientKey(key) {
-  if (!confirm('确定删除这个调用 Key？')) return;
-  try {
-    const res = await api('/api/config/client-keys/delete', {
-      method: 'POST',
-      body: JSON.stringify({ key })
-    });
-    clientKeys = res.api_keys || [];
-    toast('调用 Key 已删除');
-    showClientKeysModal();
-  } catch(e) {
-    toast('删除失败: ' + e.message, false);
-  }
-}
-
 async function load() {
   try {
     const d = await api('/api/config');
     channels = d.channels || {};
-    clientKeys = d.api_keys || [];
   } catch(e) {
     if (e.status === 401) {
       localStorage.removeItem(KEY_STORAGE);
@@ -568,21 +420,6 @@ async function loadStats() {
   }
 }
 
-async function loadBilling() {
-  try {
-    const d = await api('/api/billing');
-    if (d.ok && d.billing) {
-      billingData = d.billing;
-      renderHeaderStats();
-      toast(`Pioneer 剩余: $${billingData.free_tier_remaining.toFixed(2)}`);
-    } else {
-      toast('Pioneer 额度查询失败: ' + (d.error || '未知错误'), false);
-    }
-  } catch(e) {
-    toast('Pioneer 额度查询失败: '+e.message, false);
-  }
-}
-
 async function resetStats() {
   if (!confirm('确定清空所有请求统计？')) return;
   try {
@@ -591,22 +428,6 @@ async function resetStats() {
     await loadStats();
   } catch(e) {
     toast('重置失败: '+e.message, false);
-  }
-}
-
-async function clearLogs() {
-  if (!confirm('确定清空当前日志文件？')) return;
-  try {
-    await api('/api/logs/clear', { method: 'POST', body: '{}' });
-    gatewayLogs = [];
-    logFile = '';
-    document.getElementById('logCount').textContent = '0';
-    document.getElementById('logFile').textContent = '当前日志已清空';
-    document.getElementById('logs').innerHTML = '<div class="empty">暂无日志</div>';
-    renderLogFilter();
-    toast('日志已清空');
-  } catch(e) {
-    toast('清空日志失败: '+e.message, false);
   }
 }
 
@@ -720,32 +541,12 @@ function formatNumber(value) {
 
 function addUsage(target, name, item = {}) {
   if (!name) return;
-  if (!target[name]) target[name] = { count: 0, tokenCount: 0, zeroTokenCount: 0, tokens: 0, cacheHitCount: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 };
+  if (!target[name]) target[name] = { count: 0, tokens: 0, cacheHitCount: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 };
   target[name].count += item.count || 0;
-  target[name].tokenCount += getTokenCount(item);
-  target[name].zeroTokenCount += getZeroTokenCount(item);
   target[name].tokens += item.tokens || 0;
   target[name].cacheHitCount += getCacheHitCount(item);
   target[name].cacheReadInputTokens += getCacheReadInputTokens(item);
   target[name].cacheCreationInputTokens += getCacheCreationInputTokens(item);
-}
-
-function getTokenCount(item = {}) {
-  if (item.tokenCount != null) return Number(item.tokenCount) || 0;
-  if ((Number(item.tokens) || 0) > 0) return Number(item.count) || 0;
-  return 0;
-}
-
-function getZeroTokenCount(item = {}) {
-  if (item.zeroTokenCount != null) return Number(item.zeroTokenCount) || 0;
-  if ((Number(item.tokens) || 0) > 0) return 0;
-  return Number(item.count) || 0;
-}
-
-function getUsageCount(item = {}) {
-  const count = Number(item.count);
-  if (Number.isFinite(count) && count > 0) return count;
-  return getTokenCount(item) + getZeroTokenCount(item);
 }
 
 function getCacheHitCount(item = {}) {
@@ -803,7 +604,7 @@ function getStatsDateRange() {
 function getFilteredStats() {
   const range = getStatsDateRange();
   if (!gatewayStats) {
-    return { label: range.label, totalRequests: 0, totalTokens: 0, cacheHitCount: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, modelUsage: {}, channelUsage: {}, ipUsage: {}, recentLogs: [] };
+    return { label: range.label, totalRequests: 0, totalTokens: 0, cacheHitCount: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, modelUsage: {}, channelUsage: {}, recentLogs: [] };
   }
   if (!range.keys) {
     const modelUsage = gatewayStats.modelUsage || {};
@@ -815,13 +616,12 @@ function getFilteredStats() {
       ...cache,
       modelUsage,
       channelUsage: gatewayStats.channelUsage || {},
-      ipUsage: gatewayStats.ipUsage || {},
       recentLogs: gatewayStats.recentLogs || []
     };
   }
 
   const keySet = new Set(range.keys);
-  const view = { label: range.label, totalRequests: 0, totalTokens: 0, cacheHitCount: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, modelUsage: {}, channelUsage: {}, ipUsage: {}, recentLogs: [] };
+  const view = { label: range.label, totalRequests: 0, totalTokens: 0, cacheHitCount: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, modelUsage: {}, channelUsage: {}, recentLogs: [] };
   for (const key of range.keys) {
     const day = gatewayStats.dailyStats?.[key];
     if (!day) continue;
@@ -829,7 +629,6 @@ function getFilteredStats() {
     view.totalTokens += day.tokens || 0;
     for (const [name, item] of Object.entries(day.models || {})) addUsage(view.modelUsage, name, item);
     for (const [name, item] of Object.entries(day.channels || {})) addUsage(view.channelUsage, name, item);
-    for (const [name, item] of Object.entries(day.ips || {})) addUsage(view.ipUsage, name, item);
   }
   view.recentLogs = (gatewayStats.recentLogs || []).filter(entry => {
     const key = entry.timestamp ? new Date(entry.timestamp).toISOString().slice(0, 10) : '';
@@ -856,18 +655,32 @@ function renderStatsForRange() {
 
 function formatUsageRows(usage = {}) {
   const entries = Object.entries(usage)
-    .sort((a, b) => getUsageCount(b[1]) - getUsageCount(a[1]))
+    .sort((a, b) => (b[1]?.count || 0) - (a[1]?.count || 0))
     .slice(0, 8);
   if (!entries.length) return '<div class="empty">暂无统计</div>';
   return entries.map(([name, item]) => `
     <div class="usage-row">
       <span class="usage-name" title="${escapeHtml(name)}">${escapeHtml(name)}</span>
-      <span class="usage-count">${formatNumber(getTokenCount(item))} 有tok</span>
-      <span class="usage-zero-count">${formatNumber(getZeroTokenCount(item))} 0tok</span>
+      <span class="usage-count">${formatNumber(item?.count)} 次</span>
       <span class="usage-tokens">${formatNumber(item?.tokens)} tok</span>
       <span class="usage-cache" title="缓存读取 ${formatNumber(getCacheReadInputTokens(item))} tok，缓存写入 ${formatNumber(getCacheCreationInputTokens(item))} tok">${formatNumber(getCacheHitCount(item))} hit</span>
     </div>
   `).join('');
+}
+
+async function loadBilling() {
+  try {
+    const d = await api('/api/billing');
+    if (d.ok && d.billing) {
+      billingData = d.billing;
+      renderHeaderStats();
+      toast(`Pioneer 剩余: $${billingData.free_tier_remaining.toFixed(2)}`);
+    } else {
+      toast('Pioneer 额度查询失败: ' + (d.error || '未知错误'), false);
+    }
+  } catch(e) {
+    toast('Pioneer 额度查询失败: '+e.message, false);
+  }
 }
 
 function renderHeaderStats() {
@@ -891,7 +704,6 @@ function renderHeaderStats() {
   document.getElementById('stats').innerHTML = `
     <div class="stat"><div class="num">${keys.length}</div><div class="label">渠道</div></div>
     <div class="stat"><div class="num">${totalModels}</div><div class="label">模型</div></div>
-    <div class="stat"><div class="num">${clientKeys.length}</div><div class="label">调用 Key</div></div>
     <div class="stat"><div class="num">${formatNumber(statsView.totalRequests)}</div><div class="label">请求</div><div class="sub">${escapeHtml(statsView.label)}</div></div>
     <div class="stat"><div class="num">${formatNumber(statsView.totalTokens)}</div><div class="label">Token</div><div class="sub">${escapeHtml(statsView.label)}</div></div>
     <div class="stat"><div class="num" style="color:#3fb950">${formatNumber(statsView.cacheHitCount)}</div><div class="label">缓存命中</div><div class="sub">读 ${formatNumber(statsView.cacheReadInputTokens)} tok</div></div>
@@ -905,7 +717,6 @@ function renderUsageStats() {
   document.getElementById('statsUpdated').textContent = gatewayStats ? statsView.label : '未加载';
   document.getElementById('modelUsage').innerHTML = formatUsageRows(statsView.modelUsage);
   document.getElementById('channelUsage').innerHTML = formatUsageRows(statsView.channelUsage);
-  document.getElementById('ipUsage').innerHTML = formatUsageRows(statsView.ipUsage);
   const recent = statsView.recentLogs || [];
   document.getElementById('recentUsage').innerHTML = recent.length ? recent.slice(0, 20).map(entry => `
     <div class="recent-entry ${entry.success ? '' : 'fail'}">
@@ -916,7 +727,6 @@ function renderUsageStats() {
       <div class="recent-meta">
         <span>${entry.success ? '成功' : '失败'}</span>
         <span>${escapeHtml(entry.channel)}</span>
-        ${entry.clientIp ? `<span>${escapeHtml(entry.clientIp)}</span>` : ''}
         <span>${formatNumber(entry.tokens)} tok</span>
         ${entry.cacheHit ? `<span style="color:#3fb950">缓存命中</span>` : ''}
         ${entry.cacheReadInputTokens ? `<span>读缓存 ${formatNumber(entry.cacheReadInputTokens)} tok</span>` : ''}
@@ -974,10 +784,10 @@ async function showAddChannel() {
   document.getElementById('modalContent').innerHTML = `
     <h3>添加渠道</h3>
     <label>渠道名称</label>
-    <input id="chName" placeholder="例如: deepseek">
+    <input id="chName" placeholder="例如: provider">
     <label>前缀 (模型名显示前缀)</label>
     <input id="chPrefix" placeholder="例如: ds (留空=不添加前缀)">
-    <div class="hint">模型会显示为 ds/deepseek-v4-pro</div>
+    <div class="hint">模型会显示为 ds/model-name</div>
     <label>API 地址</label>
     <input id="chUrl" placeholder="https://api.example.com/v1">
     <label>API Key</label>
@@ -996,7 +806,7 @@ async function showAddChannel() {
       <option value="1h" selected>1 小时（写入成本更高）</option>
       <option value="5m">5 分钟</option>
     </select>
-    <div class="hint">Anthropic 格式会转为 /messages cache_control；OpenAI 兼容格式会原样透传 cache_control，仅给支持该字段的 Claude 代理开启。</div>
+    <div class="hint">Anthropic 格式会转为 /messages cache_control；OpenAI 兼容格式会把 cache_control 加到可复用消息的 content block 上，仅给支持该字段的 Claude 代理开启。</div>
     <div id="anthropicFields" style="display:none">
       <label>Anthropic Version</label>
       <input id="chAnthropicVersion" value="2023-06-01">
@@ -1098,7 +908,7 @@ function editChannel(ckey) {
       <option value="1h" ${ch.prompt_cache_ttl !== '5m' ? 'selected' : ''}>1 小时（写入成本更高）</option>
       <option value="5m" ${ch.prompt_cache_ttl === '5m' ? 'selected' : ''}>5 分钟</option>
     </select>
-    <div class="hint">Anthropic 格式会转为 /messages cache_control；OpenAI 兼容格式会原样透传 cache_control，仅给支持该字段的 Claude 代理开启。</div>
+    <div class="hint">Anthropic 格式会转为 /messages cache_control；OpenAI 兼容格式会把 cache_control 加到可复用消息的 content block 上，仅给支持该字段的 Claude 代理开启。</div>
     <div id="anthropicFields" style="display:${ch.format === 'anthropic' ? 'block' : 'none'}">
       <label>Anthropic Version</label>
       <input id="chAnthropicVersion" value="${ch.anthropic_version || '2023-06-01'}">

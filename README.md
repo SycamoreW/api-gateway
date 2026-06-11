@@ -1,6 +1,6 @@
 # API Gateway
 
-OpenAI-compatible aggregate API gateway with a WebUI for channels, models, logs, stats, prompt cache, and Claude thinking controls.
+OpenAI-compatible aggregate API gateway with a WebUI for channels, models, logs, stats, and Pioneer billing status.
 
 ## Three Steps
 
@@ -53,31 +53,41 @@ On Termux, `start.sh` will try to open the WebUI automatically. If it does not o
 - Prompt Cache controls for Anthropic Messages API and compatible Claude proxy channels
 - Anthropic thinking controls for compatible Claude models and providers
 
+## Pioneer Billing Status
+
+If a channel's `base_url` points to `api.pioneer.ai`, the WebUI header shows a Pioneer quota card. Click it to query `GET /billing/billing-status` with that channel's API key and display remaining free tier and total usage.
+
 ## Anthropic Prompt Cache
 
 Enable Prompt Cache per channel in the WebUI. For channels that use the Anthropic Messages API, set the channel format to `anthropic`; the gateway converts OpenAI-compatible chat requests to `/v1/messages` and adds top-level Anthropic cache control.
 
-For OpenAI-compatible Claude proxy channels, leave the format as OpenAI compatible and enable Prompt Cache only if the upstream accepts Anthropic-style `cache_control` on message content blocks. The gateway marks the last cacheable message before the latest user message:
+For OpenAI-compatible Claude proxy channels, leave the format as OpenAI compatible and enable Prompt Cache only if the upstream accepts Anthropic-style content-block `cache_control`. The gateway adds `cache_control` to the last reusable message content block instead of sending it as a top-level field:
 
 ```json
 {
-  "role": "system",
-  "content": [
+  "messages": [
     {
-      "type": "text",
-      "text": "long reusable instructions...",
-      "cache_control": {
-        "type": "ephemeral",
-        "ttl": "1h"
-      }
+      "role": "system",
+      "content": [
+        {
+          "type": "text",
+          "text": "long reusable context...",
+          "cache_control": {
+            "type": "ephemeral",
+            "ttl": "1h"
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": "question"
     }
   ]
 }
 ```
 
 The WebUI defaults this option to `1h` for longer conversations. Use `5m` for short-lived cache if the provider charges less for 5-minute writes. The 1-hour cache can reduce repeated context processing after longer pauses, but cache writes cost more than the default 5-minute cache on Anthropic.
-
-The WebUI stats header shows cache hit count, cache read tokens, and cache creation tokens. Usage tables also show per-model, per-channel, and per-IP cache hits; recent requests show whether a request hit cache.
 
 ## Anthropic Thinking
 
@@ -108,13 +118,25 @@ Important fields:
   "port": 8300,
   "api_key": "123456",
   "channels": {
+    "anthropic": {
+      "name": "anthropic",
+      "base_url": "https://api.anthropic.com/v1",
+      "key": "sk-ant-...",
+      "format": "anthropic",
+      "anthropic_version": "2023-06-01",
+      "prompt_cache_enabled": true,
+      "prompt_cache_ttl": "1h",
+      "anthropic_thinking_type": "enabled",
+      "anthropic_thinking_budget_tokens": 32000,
+      "models": ["anthropic/claude-3-7-sonnet-latest"]
+    },
     "pio": {
       "name": "pio",
       "base_url": "https://api.pioneer.ai/v1",
       "key": "pio_sk_...",
       "prompt_cache_enabled": true,
       "prompt_cache_ttl": "1h",
-      "models": ["claude-opus-4-7"]
+      "models": ["pio/claude-opus-4-7"]
     }
   }
 }
