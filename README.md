@@ -57,14 +57,21 @@ On Termux, `start.sh` will try to open the WebUI automatically. If it does not o
 
 Enable Prompt Cache per channel in the WebUI. For channels that use the Anthropic Messages API, set the channel format to `anthropic`; the gateway converts OpenAI-compatible chat requests to `/v1/messages` and adds top-level Anthropic cache control.
 
-For OpenAI-compatible Claude proxy channels, leave the format as OpenAI compatible and enable Prompt Cache only if the upstream accepts Anthropic-style `cache_control`. The gateway forwards the same top-level field in the OpenAI-compatible request body:
+For OpenAI-compatible Claude proxy channels, leave the format as OpenAI compatible and enable Prompt Cache only if the upstream accepts Anthropic-style `cache_control` on message content blocks. The gateway marks the last cacheable message before the latest user message:
 
 ```json
 {
-  "cache_control": {
-    "type": "ephemeral",
-    "ttl": "1h"
-  }
+  "role": "system",
+  "content": [
+    {
+      "type": "text",
+      "text": "long reusable instructions...",
+      "cache_control": {
+        "type": "ephemeral",
+        "ttl": "1h"
+      }
+    }
+  ]
 }
 ```
 

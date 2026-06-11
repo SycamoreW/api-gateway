@@ -138,19 +138,27 @@ function extractTokenUsageDetails(data) {
 
   const usage = data.usage && typeof data.usage === 'object' ? data.usage : {};
   const tokenUsage = data.token_usage && typeof data.token_usage === 'object' ? data.token_usage : {};
+  const promptTokenDetails = usage.prompt_tokens_details && typeof usage.prompt_tokens_details === 'object'
+    ? usage.prompt_tokens_details
+    : {};
   const cacheCreationInputTokens =
     toTokenNumber(usage.cache_creation_input_tokens) +
-    toTokenNumber(tokenUsage.cache_creation_input_tokens);
+    toTokenNumber(tokenUsage.cache_creation_input_tokens) +
+    toTokenNumber(promptTokenDetails.cache_write_tokens);
   const cacheReadInputTokens =
     toTokenNumber(usage.cache_read_input_tokens) +
-    toTokenNumber(tokenUsage.cache_read_input_tokens);
-  const inputTokens =
+    toTokenNumber(tokenUsage.cache_read_input_tokens) +
+    toTokenNumber(promptTokenDetails.cached_tokens);
+  const promptTokens =
     toTokenNumber(usage.prompt_tokens) +
+    toTokenNumber(tokenUsage.prompt_tokens);
+  const uncachedInputTokens =
     toTokenNumber(usage.input_tokens) +
-    cacheCreationInputTokens +
-    cacheReadInputTokens +
-    toTokenNumber(tokenUsage.prompt_tokens) +
     toTokenNumber(tokenUsage.input_tokens);
+  const inputTokens =
+    promptTokens +
+    uncachedInputTokens +
+    (promptTokens > 0 ? 0 : cacheCreationInputTokens + cacheReadInputTokens);
   const outputTokens =
     toTokenNumber(usage.completion_tokens) +
     toTokenNumber(usage.output_tokens) +
@@ -740,12 +748,66 @@ function buildPromptCacheControl(ttl = '') {
   return cacheControl;
 }
 
+function contentPartHasPromptCache(part) {
+  return part && typeof part === 'object' && part.cache_control && typeof part.cache_control === 'object';
+}
+
+function messageHasPromptCache(message) {
+  if (!message || typeof message !== 'object') return false;
+  if (message.cache_control && typeof message.cache_control === 'object') return true;
+  const content = message.content;
+  if (Array.isArray(content)) return content.some(contentPartHasPromptCache);
+  return false;
+}
+
+function withPromptCacheOnContent(content, cacheControl) {
+  if (Array.isArray(content)) {
+    for (let i = content.length - 1; i >= 0; i--) {
+      const part = content[i];
+      if (typeof part === 'string') {
+        const next = [...content];
+        next[i] = { type: 'text', text: part, cache_control: cacheControl };
+        return next;
+      }
+      if (part && typeof part === 'object' && (part.type === 'text' || typeof part.text === 'string')) {
+        const next = [...content];
+        next[i] = { ...part, cache_control: cacheControl };
+        return next;
+      }
+    }
+    return [...content, { type: 'text', text: '', cache_control: cacheControl }];
+  }
+  if (typeof content === 'string') return [{ type: 'text', text: content, cache_control: cacheControl }];
+  return content;
+}
+
 function applyOpenAICompatiblePromptCache(data, channel = {}) {
   if (!data || typeof data !== 'object') return data;
-  if (!channel.prompt_cache_enabled || data.cache_control) return data;
+  if (!channel.prompt_cache_enabled || !Array.isArray(data.messages)) return data;
+  if (data.messages.some(messageHasPromptCache)) return data;
+  const cacheControl = data.cache_control && typeof data.cache_control === 'object'
+    ? data.cache_control
+    : buildPromptCacheControl(channel.prompt_cache_ttl);
+  const messages = [...data.messages];
+  let targetIndex = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (!message || typeof message !== 'object') continue;
+    if (message.role === 'user' && i === messages.length - 1) continue;
+    if (typeof message.content === 'string' || Array.isArray(message.content)) {
+      targetIndex = i;
+      break;
+    }
+  }
+  if (targetIndex < 0) return data;
+  messages[targetIndex] = {
+    ...messages[targetIndex],
+    content: withPromptCacheOnContent(messages[targetIndex].content, cacheControl),
+  };
+  const { cache_control, ...rest } = data;
   return {
-    ...data,
-    cache_control: buildPromptCacheControl(channel.prompt_cache_ttl),
+    ...rest,
+    messages,
   };
 }
 
