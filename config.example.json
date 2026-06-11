@@ -6,7 +6,8 @@
       "name": "pio",
       "base_url": "https://api.pioneer.ai/v1",
       "key": "replace-with-pioneer-key",
-      "stream_stop_sequences": [],
+      "prompt_cache_enabled": true,
+      "prompt_cache_ttl": "1h",
       "models": [
         "claude-opus-4-6",
         "gemini-3.5-flash",

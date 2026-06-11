@@ -688,7 +688,52 @@ function convertOpenAIContentToAnthropic(content) {
   });
 }
 
-function convertOpenAIChatToAnthropic(data, realModel) {
+function buildPromptCacheControl(ttl = '') {
+  const cacheControl = { type: 'ephemeral' };
+  if (ttl === '1h') cacheControl.ttl = '1h';
+  return cacheControl;
+}
+
+function applyOpenAICompatiblePromptCache(data, channel = {}) {
+  if (!data || typeof data !== 'object') return data;
+  if (!channel.prompt_cache_enabled || data.cache_control) return data;
+  return {
+    ...data,
+    cache_control: buildPromptCacheControl(channel.prompt_cache_ttl),
+  };
+}
+
+function toPositiveInteger(value, fallback = 0) {
+  const number = Number(value);
+  return Number.isInteger(number) && number > 0 ? number : fallback;
+}
+
+function applyAnthropicThinking(payload, data, channel = {}) {
+  if (data.output_config && typeof data.output_config === 'object') {
+    payload.output_config = data.output_config;
+  }
+
+  if (data.thinking && typeof data.thinking === 'object') {
+    payload.thinking = data.thinking;
+  } else if (channel.anthropic_thinking_type === 'enabled') {
+    const budgetTokens = toPositiveInteger(channel.anthropic_thinking_budget_tokens, 32000);
+    payload.thinking = { type: 'enabled', budget_tokens: budgetTokens };
+    if (payload.max_tokens <= budgetTokens) {
+      payload.max_tokens = budgetTokens + 1024;
+    }
+  } else if (channel.anthropic_thinking_type === 'adaptive') {
+    payload.thinking = { type: 'adaptive' };
+    if (channel.anthropic_thinking_display) {
+      payload.thinking.display = channel.anthropic_thinking_display;
+    }
+  }
+
+  if (!payload.output_config && channel.anthropic_output_effort) {
+    payload.output_config = { effort: channel.anthropic_output_effort };
+  }
+}
+
+function convertOpenAIChatToAnthropic(data, realModel, channel = {}) {
   const messages = [];
   const system = [];
 
@@ -716,6 +761,12 @@ function convertOpenAIChatToAnthropic(data, realModel) {
   if (typeof data.temperature === 'number') payload.temperature = data.temperature;
   if (typeof data.top_p === 'number') payload.top_p = data.top_p;
   if (typeof data.stop === 'string' || Array.isArray(data.stop)) payload.stop_sequences = Array.isArray(data.stop) ? data.stop : [data.stop];
+  if (data.cache_control && typeof data.cache_control === 'object') {
+    payload.cache_control = data.cache_control;
+  } else if (channel.prompt_cache_enabled) {
+    payload.cache_control = buildPromptCacheControl(channel.prompt_cache_ttl);
+  }
+  applyAnthropicThinking(payload, data, channel);
 
   return payload;
 }
@@ -724,8 +775,11 @@ function convertAnthropicResponseToOpenAI(data, requestedModel) {
   const text = Array.isArray(data.content)
     ? data.content.map((part) => part?.text || '').join('')
     : '';
-  const inputTokens = data.usage?.input_tokens || 0;
-  const outputTokens = data.usage?.output_tokens || 0;
+  const usage = data.usage || {};
+  const inputTokens = usage.input_tokens || 0;
+  const outputTokens = usage.output_tokens || 0;
+  const cacheCreationTokens = usage.cache_creation_input_tokens || 0;
+  const cacheReadTokens = usage.cache_read_input_tokens || 0;
 
   return {
     id: data.id || `chatcmpl-${newRequestId()}`,
@@ -745,59 +799,11 @@ function convertAnthropicResponseToOpenAI(data, requestedModel) {
     usage: {
       prompt_tokens: inputTokens,
       completion_tokens: outputTokens,
-      total_tokens: inputTokens + outputTokens,
+      cache_creation_input_tokens: cacheCreationTokens,
+      cache_read_input_tokens: cacheReadTokens,
+      total_tokens: inputTokens + cacheCreationTokens + cacheReadTokens + outputTokens,
     },
   };
-}
-
-function normalizeStopSequences(value) {
-  if (Array.isArray(value)) {
-    return [...new Set(value.map(v => String(v || '').trim()).filter(Boolean))];
-  }
-  if (typeof value === 'string') {
-    return [...new Set(value.split(/[\n,，]+/).map(v => v.trim()).filter(Boolean))];
-  }
-  return [];
-}
-
-function getChannelStopSequences(channel) {
-  if (Object.prototype.hasOwnProperty.call(channel, 'stream_stop_sequences')) {
-    return normalizeStopSequences(channel.stream_stop_sequences);
-  }
-  if (Object.prototype.hasOwnProperty.call(channel, 'stop_sequences')) {
-    return normalizeStopSequences(channel.stop_sequences);
-  }
-  return [];
-}
-
-function findStopSequenceInText(text, stopSequences = []) {
-  let found = null;
-  for (const seq of stopSequences) {
-    const idx = text.indexOf(seq);
-    if (idx !== -1 && (!found || idx < found.idx)) {
-      found = { seq, idx };
-    }
-  }
-  return found;
-}
-
-function normalizePioneerNativeBaseUrl(baseUrl, stopSequences = []) {
-  if (!baseUrl) return baseUrl;
-  if (!stopSequences.length) return baseUrl;
-  try {
-    const parsed = new URL(baseUrl);
-    if (parsed.hostname !== 'api.pioneer.ai') return baseUrl;
-    const path = parsed.pathname.replace(/\/+$/, '');
-    if (path && path !== '/') return baseUrl;
-    parsed.pathname = '/v1';
-    return parsed.toString().replace(/\/$/, '');
-  } catch {
-    return baseUrl;
-  }
-}
-
-function getEffectiveChannelBaseUrl(channel) {
-  return normalizePioneerNativeBaseUrl(channel.base_url, getChannelStopSequences(channel));
 }
 
 function sanitizePayloadForUpstream(data, upstreamModel) {
@@ -819,28 +825,23 @@ function sanitizePayloadForUpstream(data, upstreamModel) {
 }
 
 async function proxyRequest(channel, req, res, body, modelName = '', requestId = '', logContext = {}) {
-  const effectiveBaseUrl = getEffectiveChannelBaseUrl(channel);
+  const effectiveBaseUrl = channel.base_url;
   const targetUrl = new URL(effectiveBaseUrl);
   // Append the request path (strip /v1 prefix if base_url already has it)
   const reqPath = req.url.startsWith('/v1/') ? req.url.slice(3) : req.url;
-  const fullUrl = `${effectiveBaseUrl.replace(/\/$/, '')}${reqPath}`;
+  const fullUrl = effectiveBaseUrl.replace(/\/$/, '') + reqPath;
   
   const headers = {};
   // Forward only necessary headers
   if (req.headers['content-type']) headers['content-type'] = req.headers['content-type'];
   if (req.headers['accept']) headers['accept'] = req.headers['accept'];
-  headers['authorization'] = `Bearer ${channel.key}`;
+  headers['authorization'] = 'Bearer ' + channel.key;
   headers['content-length'] = body ? Buffer.byteLength(body) : 0;
-  
-  // 检查是否需要停止序列检测
-  const stopSequences = getChannelStopSequences(channel);
-  const needsStopDetection = stopSequences.length > 0;
-  const maxStopSequenceLength = Math.max(1, ...stopSequences.map(seq => seq.length));
   
   return new Promise((resolve, reject) => {
     const parsed = new URL(fullUrl);
     const options = {
-      hostname: parsed.hostname,
+      hostname: parsed.hostname || targetUrl.hostname,
       port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
       path: parsed.pathname + parsed.search,
       method: req.method,
@@ -850,12 +851,6 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
     
     const transport = parsed.protocol === 'https:' ? https : http;
     let responseData = '';
-    let accumulatedContent = ''; // 累积的内容用于检测停止序列
-    let pendingContent = ''; // 暂存末尾字符，避免截断词跨 chunk 时泄露前半段
-    let lastContentEvent = null;
-    let streamBuffer = '';
-    let stopped = false; // 是否已触发停止
-    let streamErrorMessage = '';
     let proxyResRef = null;
     let clientAbortLogged = false;
     const startedAt = Date.now();
@@ -867,23 +862,17 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
       requestedModel: logContext.requestedModel,
       upstreamHost: parsed.host,
       upstreamPath: parsed.pathname,
-      ...(effectiveBaseUrl !== channel.base_url ? {
-        configuredBaseUrl: channel.base_url,
-        effectiveBaseUrl,
-        routeNote: 'pioneer_native_base_for_stream_stop',
-      } : {}),
       method: req.method,
       requestBytes: Buffer.byteLength(body || ''),
       inputContent: logContext.inputContent,
     });
     
     function abortUpstreamForClientClose(reason) {
-      if (stopped || clientAbortLogged || res.writableEnded) return;
-      stopped = true;
+      if (clientAbortLogged || res.writableEnded) return;
       clientAbortLogged = true;
       proxy.destroy(new Error(reason));
       if (proxyResRef && !proxyResRef.destroyed) proxyResRef.destroy(new Error(reason));
-      logRequest(modelName || 'unknown', channel.name, 0, false, reason);
+      logRequest(modelName || 'unknown', channel.name, 0, false, requestLogOptions(logContext, requestId, reason));
       writeGatewayLog('client_aborted', {
         requestId,
         model: modelName || 'unknown',
@@ -900,7 +889,6 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
         inputTokens: 0,
         outputTokens: 0,
         totalTokens: 0,
-        outputContent: truncateText(accumulatedContent),
         errorMessage: reason,
       }));
       resolve();
@@ -924,166 +912,19 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
         res.flushHeaders();
       }
 
-      function findStopSequence(text) {
-        return findStopSequenceInText(text, stopSequences);
-      }
-
-      function completeWithStopSequence(seq, idx) {
-        stopped = true;
-        console.log(`[stop-seq] ${channel.name}/${modelName}: detected "${seq}" at pos ${idx}, truncating`);
-        writeGatewayLog('stop_sequence_detected', {
-          requestId,
-          model: modelName || 'unknown',
-          channel: channel.name,
-          sequence: seq,
-          position: idx,
-          contentLength: accumulatedContent.length,
-        });
-
-        if (!res.writableEnded) {
-          res.write('data: [DONE]\n\n');
-          res.end();
-        }
-
-        proxy.destroy();
-        logRequest(modelName || 'unknown', channel.name, 0, true, requestLogOptions(logContext, requestId, 'stop_sequence'));
-        writeGatewayLog('request_complete', responseLogFields(logContext, {
-          requestId,
-          model: modelName || 'unknown',
-          channel: channel.name,
-          statusCode: proxyRes.statusCode,
-          durationMs: Date.now() - startedAt,
-          inputTokens: 0,
-          outputTokens: 0,
-          totalTokens: 0,
-          outputContent: truncateText(accumulatedContent),
-          errorMessage: 'stop_sequence',
-        }));
-        resolve();
-      }
-
-      function writeStreamLine(rawLine) {
-        const line = rawLine.replace(/\r$/, '');
-        if (line === 'data: [DONE]') {
-          flushPendingContent();
-          if (!streamErrorMessage) appendBeforeDone();
-          res.write(`${rawLine}\n`);
-          return true;
-        }
-        if (!line.startsWith('data: ') || line === 'data: [DONE]') {
-          res.write(`${rawLine}\n`);
-          return true;
-        }
-
-        try {
-          const json = JSON.parse(line.slice(6));
-          const errorMessage = extractErrorMessage(json);
-          if (errorMessage) streamErrorMessage ||= errorMessage;
-          const choice = json?.choices?.[0];
-          const delta = choice?.delta || {};
-          const contentKey = typeof delta.content === 'string'
-            ? 'content'
-            : (typeof delta.reasoning_content === 'string' ? 'reasoning_content' : '');
-          const content = contentKey ? delta[contentKey] : undefined;
-          if (typeof content !== 'string' || content.length === 0) {
-            res.write(`${rawLine}\n`);
-            return true;
-          }
-
-          lastContentEvent = json;
-          pendingContent += content;
-          const nextContent = accumulatedContent + pendingContent;
-          const found = findStopSequence(nextContent);
-          if (!found) return flushSafePendingContent(json, contentKey);
-
-          const allowedLength = Math.max(0, found.idx - accumulatedContent.length);
-          const allowedContent = pendingContent.slice(0, allowedLength);
-          accumulatedContent += allowedContent;
-          if (allowedContent) {
-            choice.delta[contentKey] = allowedContent;
-            res.write(`data: ${JSON.stringify(json)}\n\n`);
-          }
-          completeWithStopSequence(found.seq, found.idx);
-          return false;
-        } catch (e) {
-          // 解析不了就按原样转发，避免破坏非标准 SSE。
-          res.write(`${rawLine}\n`);
-          return true;
-        }
-      }
-
-      function writeContentEvent(content) {
-        if (!content) return;
-        const json = lastContentEvent ? JSON.parse(JSON.stringify(lastContentEvent)) : {
-          choices: [{ delta: { content } }],
-        };
-        if (!json.choices) json.choices = [{ delta: {} }];
-        if (!json.choices[0]) json.choices[0] = { delta: {} };
-        if (!json.choices[0].delta) json.choices[0].delta = {};
-        json.choices[0].delta.content = content;
-        res.write(`data: ${JSON.stringify(json)}\n\n`);
-      }
-
-      function flushSafePendingContent(json, contentKey = 'content') {
-        const safeLength = Math.max(0, pendingContent.length - maxStopSequenceLength + 1);
-        if (safeLength <= 0) return true;
-        const safeContent = pendingContent.slice(0, safeLength);
-        pendingContent = pendingContent.slice(safeLength);
-        accumulatedContent += safeContent;
-        json.choices[0].delta[contentKey] = safeContent;
-        res.write(`data: ${JSON.stringify(json)}\n\n`);
-        return true;
-      }
-
-      function flushPendingContent() {
-        if (!pendingContent) return;
-        accumulatedContent += pendingContent;
-        writeContentEvent(pendingContent);
-        pendingContent = '';
-      }
-
-      function writeFilteredStreamChunk(chunkStr) {
-        streamBuffer += chunkStr;
-        const lines = streamBuffer.split('\n');
-        streamBuffer = lines.pop() || '';
-        for (const line of lines) {
-          if (!writeStreamLine(line)) return;
-        }
-      }
-      
-      // 收集响应数据以提取 token 使用量
       proxyRes.on('data', chunk => {
-        if (stopped) return; // 已停止，忽略后续数据
-        
-        const chunkStr = chunk.toString();
-        responseData += chunkStr;
-        
-        // 仅处理 OpenAI SSE 流式响应；普通 JSON 响应原样转发。
-        if (needsStopDetection && isEventStream && proxyRes.statusCode < 400) {
-          writeFilteredStreamChunk(chunkStr);
-          return;
-        }
-        
+        responseData += chunk.toString();
         res.write(chunk);
       });
       
       proxyRes.on('end', () => {
-        if (stopped) return; // 已经处理过了
-        if (needsStopDetection && isEventStream && streamBuffer) {
-          writeStreamLine(streamBuffer);
-          streamBuffer = '';
-        }
-        if (needsStopDetection && isEventStream) {
-          flushPendingContent();
-        }
-        
         if (!res.writableEnded) {
           res.end();
         }
         
         // 尝试解析 token 使用量和输出内容
         const responseDetails = extractResponseLogDetails(responseData);
-        const errorMessage = streamErrorMessage || responseDetails.errorMessage;
+        const errorMessage = responseDetails.errorMessage;
         const tokens = responseDetails.totalTokens;
         
         // 记录成功的请求
@@ -1102,7 +943,7 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
             outputContent: responseDetails.outputContent,
           }));
         } else {
-          const finalErrorMessage = errorMessage || `HTTP ${proxyRes.statusCode}`;
+          const finalErrorMessage = errorMessage || 'HTTP ' + proxyRes.statusCode;
           logRequest(modelName || 'unknown', channel.name, 0, false, finalErrorMessage);
           writeGatewayLog('request_complete', responseLogFields(logContext, {
             requestId,
@@ -1132,7 +973,7 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
     });
     
     proxy.on('error', (err) => {
-      if (stopped) return;
+      if (clientAbortLogged) return;
       logRequest(modelName || 'unknown', channel.name, 0, false, err.message);
       writeGatewayLog('request_complete', responseLogFields(logContext, {
         requestId,
@@ -1149,7 +990,7 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
     });
     
     proxy.on('timeout', () => {
-      if (stopped) return;
+      if (clientAbortLogged) return;
       logRequest(modelName || 'unknown', channel.name, 0, false, 'timeout');
       writeGatewayLog('request_complete', responseLogFields(logContext, {
         requestId,
@@ -1175,7 +1016,7 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
   const parsedBase = new URL(channel.base_url);
   const fullUrl = `${channel.base_url.replace(/\/$/, '')}/messages`;
   const parsed = new URL(fullUrl);
-  const anthropicPayload = convertOpenAIChatToAnthropic(data, stripModelPrefix(upstreamModel));
+  const anthropicPayload = convertOpenAIChatToAnthropic(data, stripModelPrefix(upstreamModel), channel);
   const wantsStream = data.stream === true;
   if (wantsStream) anthropicPayload.stream = true;
   const body = JSON.stringify(anthropicPayload);
@@ -1649,7 +1490,10 @@ async function handleChatCompletions(req, res, body, requestId) {
   const upstreamModel = entry.upstreamModel;
   // Remove prefix like "local/", "ds/", "pio/", etc before passing upstream
   const realModel = stripModelPrefix(upstreamModel);
-  const sanitized = sanitizePayloadForUpstream({ ...data, model: realModel }, upstreamModel);
+  const channelInput = channel.format === 'anthropic'
+    ? { ...data, model: realModel }
+    : applyOpenAICompatiblePromptCache({ ...data, model: realModel }, channel);
+  const sanitized = sanitizePayloadForUpstream(channelInput, upstreamModel);
   data = sanitized.data;
   body = JSON.stringify(data);  // 已经过滤过参数的 data
   writeGatewayLog('model_routed', {
@@ -1928,7 +1772,22 @@ async function handleConfigAPI(req, res, url, body) {
   
   if (url === '/api/config/save' && req.method === 'POST') {
     const d = JSON.parse(body);
-    const { channelKey, name, base_url, key, models, format, anthropic_version, stream_stop_sequences, isNew } = d;
+    const {
+      channelKey,
+      name,
+      base_url,
+      key,
+      models,
+      format,
+      anthropic_version,
+      prompt_cache_enabled,
+      prompt_cache_ttl,
+      anthropic_thinking_type,
+      anthropic_thinking_budget_tokens,
+      anthropic_output_effort,
+      anthropic_thinking_display,
+      isNew,
+    } = d;
     
     if (!channelKey) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -1943,24 +1802,18 @@ async function handleConfigAPI(req, res, url, body) {
     }
     
     const existingChannel = config.channels[channelKey] || {};
-    const normalizedStopSequences = stream_stop_sequences !== undefined
-      ? normalizeStopSequences(stream_stop_sequences)
-      : (
-        existingChannel.stream_stop_sequences !== undefined
-          ? normalizeStopSequences(existingChannel.stream_stop_sequences)
-          : []
-      );
-    const channelBaseUrl = normalizePioneerNativeBaseUrl(
-      base_url || existingChannel.base_url || '',
-      normalizedStopSequences,
-    );
     config.channels[channelKey] = {
       name: name || existingChannel.name || channelKey,
-      base_url: channelBaseUrl,
+      base_url: base_url || existingChannel.base_url || '',
       key: key || existingChannel.key || '',
       ...(format || existingChannel.format ? { format: format || existingChannel.format } : {}),
       ...(anthropic_version || existingChannel.anthropic_version ? { anthropic_version: anthropic_version || existingChannel.anthropic_version } : {}),
-      ...(stream_stop_sequences !== undefined || existingChannel.stream_stop_sequences !== undefined ? { stream_stop_sequences: normalizedStopSequences } : {}),
+      ...(prompt_cache_enabled ? { prompt_cache_enabled: true } : {}),
+      ...(prompt_cache_enabled && prompt_cache_ttl === '1h' ? { prompt_cache_ttl: '1h' } : {}),
+      ...(anthropic_thinking_type && anthropic_thinking_type !== 'off' ? { anthropic_thinking_type } : {}),
+      ...(anthropic_thinking_type === 'enabled' ? { anthropic_thinking_budget_tokens: toPositiveInteger(anthropic_thinking_budget_tokens, 32000) } : {}),
+      ...(anthropic_thinking_type === 'adaptive' && anthropic_output_effort ? { anthropic_output_effort } : {}),
+      ...(anthropic_thinking_type === 'adaptive' && anthropic_thinking_display ? { anthropic_thinking_display } : {}),
       models: models || [],
     };
     

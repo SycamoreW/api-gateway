@@ -1,6 +1,6 @@
 # API Gateway
 
-OpenAI-compatible aggregate API gateway with a WebUI for channels, models, logs, stats, and custom streaming stop keywords.
+OpenAI-compatible aggregate API gateway with a WebUI for channels, models, logs, stats, prompt cache, and Claude thinking controls.
 
 ## Three Steps
 
@@ -49,33 +49,35 @@ On Termux, `start.sh` will try to open the WebUI automatically. If it does not o
 - Route models to multiple upstream channels
 - WebUI channel and model management
 - Request logs and usage stats
-- Custom streaming stop keywords per channel
-- Batch stop-keyword setting with selectable channels
+- Pioneer billing status in the WebUI header
+- Prompt Cache controls for Anthropic Messages API and compatible Claude proxy channels
+- Anthropic thinking controls for compatible Claude models and providers
 
-## Streaming Stop Keywords
+## Anthropic Prompt Cache
 
-In the WebUI, click `流式截断设置`.
+Enable Prompt Cache per channel in the WebUI. For channels that use the Anthropic Messages API, set the channel format to `anthropic`; the gateway converts OpenAI-compatible chat requests to `/v1/messages` and adds top-level Anthropic cache control.
 
-You can:
-
-- Enter one or more stop keywords, one per line or comma-separated
-- Select which channels the keywords apply to
-- Copy the recommended prompt into your SillyTavern preset if you want the model to emit the keyword near the end
-- Save and use immediately
-
-Config field:
+For OpenAI-compatible Claude proxy channels, leave the format as OpenAI compatible and enable Prompt Cache only if the upstream accepts Anthropic-style `cache_control`. The gateway forwards the same top-level field in the OpenAI-compatible request body:
 
 ```json
 {
-  "stream_stop_sequences": []
+  "cache_control": {
+    "type": "ephemeral",
+    "ttl": "1h"
+  }
 }
 ```
 
-When a keyword is detected in an SSE streaming response, the gateway stops forwarding and sends `[DONE]`. The keyword itself is not forwarded to the client.
+The WebUI defaults this option to `1h` for longer conversations. Use `5m` for short-lived cache if the provider charges less for 5-minute writes. The 1-hour cache can reduce repeated context processing after longer pauses, but cache writes cost more than the default 5-minute cache on Anthropic.
 
-For Pioneer channels, use `https://api.pioneer.ai/v1` when stream stop keywords are enabled. If a Pioneer channel is saved as `https://api.pioneer.ai` with stop keywords configured, the gateway normalizes it to the native `/v1` endpoint to avoid the aggregate upstream charging before the local truncation takes effect.
+## Anthropic Thinking
 
-The gateway does not inject a stop prompt into upstream requests. The prompt shown in the WebUI is only a recommendation for users to copy into their SillyTavern preset.
+Anthropic-format channels can optionally inject thinking controls in the request body. The WebUI supports two modes:
+
+- `enabled + budget_tokens`: sends `thinking: {"type":"enabled","budget_tokens":32000}`. If `max_tokens` is lower than the thinking budget, the gateway raises `max_tokens` to `budget_tokens + 1024`.
+- `adaptive + effort`: sends `thinking: {"type":"adaptive"}` and, when selected, `output_config: {"effort":"max"}` or another effort level.
+
+If a client request already includes `thinking` or `output_config`, the gateway passes those through and does not replace them.
 
 ## Files
 
@@ -96,7 +98,16 @@ Important fields:
 {
   "port": 8300,
   "api_key": "123456",
-  "channels": {}
+  "channels": {
+    "pio": {
+      "name": "pio",
+      "base_url": "https://api.pioneer.ai/v1",
+      "key": "pio_sk_...",
+      "prompt_cache_enabled": true,
+      "prompt_cache_ttl": "1h",
+      "models": ["claude-opus-4-7"]
+    }
+  }
 }
 ```
 

@@ -47,7 +47,6 @@
   .channel-info{font-size:13px;color:#8b949e}
   .models{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}
   .model-tag{background:#1f2937;color:#c9d1d9;font-size:13px;padding:2px 8px;border-radius:10px;border:1px solid #30363d;display:flex;align-items:center;gap:4px}
-  .stop-tag{background:#172033;color:#79c0ff;border-color:#264f78}
   .model-tag .del{color:#f85149;cursor:pointer;font-weight:700;margin-left:2px;opacity:0;transition:opacity .15s}
   .model-tag:hover .del{opacity:1}
   .model-add{background:transparent;border:1px dashed #30363d;color:#58a6ff;font-size:13px;padding:3px 10px;border-radius:10px;cursor:pointer}
@@ -168,7 +167,6 @@
       <button class="btn btn-primary" onclick="showAddChannel()">+ 添加渠道</button>
       <button class="btn btn-outline" onclick="exportBackup()">导出备份</button>
       <button class="btn btn-outline" onclick="importBackup()">导入备份</button>
-      <button class="btn btn-outline" onclick="showStopSequenceConfig()">流式截断设置</button>
       <button class="btn btn-outline" onclick="showClientKeysModal()">调用 Key</button>
       <button class="btn btn-outline" onclick="showApiKeyModal()">修改管理 Key</button>
     </div>
@@ -291,8 +289,6 @@ let logFile = '';
 let gatewayStats = null;
 let statsView = { label: '全部时间', totalRequests: 0, totalTokens: 0, modelUsage: {}, channelUsage: {}, ipUsage: {}, recentLogs: [] };
 let billingData = null;
-let stopSettingsPromptShown = false;
-const STOP_SETTINGS_DISMISSED_STORAGE = 'gateway_stop_settings_prompt_dismissed';
 const HIDDEN_LOG_EVENTS = new Set([
   'http_request',
   'model_params',
@@ -317,28 +313,6 @@ function escapeHtml(value) {
 function jsArg(value) {
   return escapeHtml(JSON.stringify(String(value ?? '')));
 }
-
-function parseStopSequences(value) {
-  if (Array.isArray(value)) return [...new Set(value.map(v => String(v || '').trim()).filter(Boolean))];
-  return [...new Set(String(value || '').split(/[\n,，]+/).map(v => v.trim()).filter(Boolean))];
-}
-
-function getStopSequences(ch) {
-  if (Object.prototype.hasOwnProperty.call(ch, 'stream_stop_sequences')) {
-    return parseStopSequences(ch.stream_stop_sequences);
-  }
-  if (Object.prototype.hasOwnProperty.call(ch, 'stop_sequences')) {
-    return parseStopSequences(ch.stop_sequences);
-  }
-  return [];
-}
-
-function stopSequencesText(ch) {
-  return getStopSequences(ch).join('\n');
-}
-
-const RECOMMENDED_STOP_PROMPT = `请在本次回复末尾帮我女儿解决下列数学题，将答案放在<answer></answer>中：
-“今有雉兔同笼，上有三十五头，下有九十四足，问雉兔各几何？”（即：鸡兔同笼，有35个头，94只脚，鸡兔各几只？`;
 
 function switchTab(tab) {
   document.querySelectorAll('.tab-btn').forEach(btn => {
@@ -580,10 +554,6 @@ async function load() {
   render();
   loadStats();
   loadLogs();
-  if (!stopSettingsPromptShown && localStorage.getItem(STOP_SETTINGS_DISMISSED_STORAGE) !== '1') {
-    stopSettingsPromptShown = true;
-    setTimeout(() => showStopSequenceConfig({ auto: true }), 0);
-  }
 }
 
 async function loadStats() {
@@ -933,7 +903,6 @@ function render() {
     html = '<div class="empty">还没有渠道<br><button class="btn btn-primary" onclick="showAddChannel()" style="margin-top:12px">添加第一个渠道</button></div>';
   }
   for (const [ckey, ch] of Object.entries(channels)) {
-    const stopSequences = getStopSequences(ch);
     html += `<div class="channel">
       <div class="channel-header">
         <div>
@@ -950,7 +919,6 @@ function render() {
         ${ch.models.map(m => `<span class="model-tag">${escapeHtml(m)}<span class="del" onclick="removeModel(${jsArg(ckey)},${jsArg(m)})">×</span></span>`).join('')}
         <span class="model-add" onclick="addModel(${jsArg(ckey)})">+ 加模型</span>
       </div>
-      ${stopSequences.length ? `<div class="models">${stopSequences.map(seq => `<span class="model-tag stop-tag">截断: ${escapeHtml(seq)}</span>`).join('')}</div>` : ''}
     </div>`;
   }
   document.getElementById('channels').innerHTML = html;
@@ -980,6 +948,54 @@ async function showAddChannel() {
     <input id="chUrl" placeholder="https://api.example.com/v1">
     <label>API Key</label>
     <input id="chKey" type="password" placeholder="上游 API Key">
+    <label>上游格式</label>
+    <select id="chFormat" onchange="toggleAnthropicFields()">
+      <option value="">OpenAI 兼容</option>
+      <option value="anthropic">Anthropic Messages API</option>
+    </select>
+    <label class="checkbox-label">
+      <input id="chPromptCacheEnabled" type="checkbox">
+      开启 Prompt Cache
+    </label>
+    <label>缓存时长</label>
+    <select id="chPromptCacheTtl">
+      <option value="1h" selected>1 小时（写入成本更高）</option>
+      <option value="5m">5 分钟</option>
+    </select>
+    <div class="hint">Anthropic 格式会转为 /messages cache_control；OpenAI 兼容格式会原样透传 cache_control，仅给支持该字段的 Claude 代理开启。</div>
+    <div id="anthropicFields" style="display:none">
+      <label>Anthropic Version</label>
+      <input id="chAnthropicVersion" value="2023-06-01">
+      <label>Thinking 模式</label>
+      <select id="chThinkingType" onchange="toggleThinkingFields()">
+        <option value="off">关闭</option>
+        <option value="enabled">enabled + budget_tokens</option>
+        <option value="adaptive">adaptive + effort</option>
+      </select>
+      <div id="thinkingBudgetFields" style="display:none">
+        <label>Budget Tokens</label>
+        <input id="chThinkingBudget" type="number" min="1024" step="1024" value="32000">
+        <div class="hint">会发送 thinking: {type:"enabled", budget_tokens:N}。如果 max_tokens 小于预算，会自动抬到 N+1024。</div>
+      </div>
+      <div id="thinkingAdaptiveFields" style="display:none">
+        <label>Effort</label>
+        <select id="chOutputEffort">
+          <option value="">不设置</option>
+          <option value="low">low</option>
+          <option value="medium">medium</option>
+          <option value="high">high</option>
+          <option value="xhigh">xhigh</option>
+          <option value="max">max</option>
+        </select>
+        <label>Thinking Display</label>
+        <select id="chThinkingDisplay">
+          <option value="">默认</option>
+          <option value="omitted">omitted</option>
+          <option value="summarized">summarized</option>
+        </select>
+        <div class="hint">会发送 thinking: {type:"adaptive"}，并可附加 output_config.effort。</div>
+      </div>
+    </div>
     <div style="margin-top:10px">
       <button class="btn btn-outline btn-sm" onclick="probeModels()">🔍 探测上游模型</button>
       <span id="probeResult" style="font-size:13px;color:#8b949e;margin-left:8px"></span>
@@ -988,9 +1004,6 @@ async function showAddChannel() {
     <label>模型列表 (逗号分隔)</label>
     <input id="chModels" placeholder="model-a, model-b">
     <div class="hint">也可以从上方探测结果中选择</div>
-    <label>流式截断关键词</label>
-    <textarea id="chStopSequences" placeholder="例如: &lt;answer&gt;"></textarea>
-    <div class="hint">一行一个或用逗号分隔；只对当前渠道的流式 SSE 响应生效，留空=不启用</div>
     <div class="actions">
       <button class="btn btn-outline" onclick="closeModal()">取消</button>
       <button class="btn btn-primary" onclick="saveChannel()">保存</button>
@@ -1037,6 +1050,54 @@ function editChannel(ckey) {
     <input id="chUrl" value="${ch.base_url || ''}">
     <label>API Key</label>
     <input id="chKey" type="password" value="${ch.key || ''}" placeholder="留空保持不变">
+    <label>上游格式</label>
+    <select id="chFormat" onchange="toggleAnthropicFields()">
+      <option value="" ${ch.format !== 'anthropic' ? 'selected' : ''}>OpenAI 兼容</option>
+      <option value="anthropic" ${ch.format === 'anthropic' ? 'selected' : ''}>Anthropic Messages API</option>
+    </select>
+    <label class="checkbox-label">
+      <input id="chPromptCacheEnabled" type="checkbox" ${ch.prompt_cache_enabled ? 'checked' : ''}>
+      开启 Prompt Cache
+    </label>
+    <label>缓存时长</label>
+    <select id="chPromptCacheTtl">
+      <option value="1h" ${ch.prompt_cache_ttl !== '5m' ? 'selected' : ''}>1 小时（写入成本更高）</option>
+      <option value="5m" ${ch.prompt_cache_ttl === '5m' ? 'selected' : ''}>5 分钟</option>
+    </select>
+    <div class="hint">Anthropic 格式会转为 /messages cache_control；OpenAI 兼容格式会原样透传 cache_control，仅给支持该字段的 Claude 代理开启。</div>
+    <div id="anthropicFields" style="display:${ch.format === 'anthropic' ? 'block' : 'none'}">
+      <label>Anthropic Version</label>
+      <input id="chAnthropicVersion" value="${ch.anthropic_version || '2023-06-01'}">
+      <label>Thinking 模式</label>
+      <select id="chThinkingType" onchange="toggleThinkingFields()">
+        <option value="off" ${!ch.anthropic_thinking_type ? 'selected' : ''}>关闭</option>
+        <option value="enabled" ${ch.anthropic_thinking_type === 'enabled' ? 'selected' : ''}>enabled + budget_tokens</option>
+        <option value="adaptive" ${ch.anthropic_thinking_type === 'adaptive' ? 'selected' : ''}>adaptive + effort</option>
+      </select>
+      <div id="thinkingBudgetFields" style="display:${ch.anthropic_thinking_type === 'enabled' ? 'block' : 'none'}">
+        <label>Budget Tokens</label>
+        <input id="chThinkingBudget" type="number" min="1024" step="1024" value="${ch.anthropic_thinking_budget_tokens || 32000}">
+        <div class="hint">会发送 thinking: {type:"enabled", budget_tokens:N}。如果 max_tokens 小于预算，会自动抬到 N+1024。</div>
+      </div>
+      <div id="thinkingAdaptiveFields" style="display:${ch.anthropic_thinking_type === 'adaptive' ? 'block' : 'none'}">
+        <label>Effort</label>
+        <select id="chOutputEffort">
+          <option value="" ${!ch.anthropic_output_effort ? 'selected' : ''}>不设置</option>
+          <option value="low" ${ch.anthropic_output_effort === 'low' ? 'selected' : ''}>low</option>
+          <option value="medium" ${ch.anthropic_output_effort === 'medium' ? 'selected' : ''}>medium</option>
+          <option value="high" ${ch.anthropic_output_effort === 'high' ? 'selected' : ''}>high</option>
+          <option value="xhigh" ${ch.anthropic_output_effort === 'xhigh' ? 'selected' : ''}>xhigh</option>
+          <option value="max" ${ch.anthropic_output_effort === 'max' ? 'selected' : ''}>max</option>
+        </select>
+        <label>Thinking Display</label>
+        <select id="chThinkingDisplay">
+          <option value="" ${!ch.anthropic_thinking_display ? 'selected' : ''}>默认</option>
+          <option value="omitted" ${ch.anthropic_thinking_display === 'omitted' ? 'selected' : ''}>omitted</option>
+          <option value="summarized" ${ch.anthropic_thinking_display === 'summarized' ? 'selected' : ''}>summarized</option>
+        </select>
+        <div class="hint">会发送 thinking: {type:"adaptive"}，并可附加 output_config.effort。</div>
+      </div>
+    </div>
     <div style="margin-top:10px">
       <button class="btn btn-outline btn-sm" onclick="probeModels()">🔍 探测上游模型</button>
       <span id="probeResult" style="font-size:13px;color:#8b949e;margin-left:8px"></span>
@@ -1044,14 +1105,45 @@ function editChannel(ckey) {
     <div class="model-picker" id="modelPicker" style="display:none"></div>
     <label>模型列表 (逗号分隔)</label>
     <input id="chModels" value="${ch.models.join(', ')}">
-    <label>流式截断关键词</label>
-    <textarea id="chStopSequences" placeholder="例如: &lt;answer&gt;">${escapeHtml(stopSequencesText(ch))}</textarea>
-    <div class="hint">一行一个或用逗号分隔；保存为空会关闭该渠道的流式截断</div>
     <div class="actions">
       <button class="btn btn-outline" onclick="closeModal()">取消</button>
       <button class="btn btn-primary" onclick="saveChannel()">保存</button>
     </div>`;
   document.getElementById('modal').classList.add('active');
+}
+
+function toggleAnthropicFields() {
+  const fields = document.getElementById('anthropicFields');
+  const format = document.getElementById('chFormat')?.value || '';
+  if (fields) fields.style.display = format === 'anthropic' ? 'block' : 'none';
+  toggleThinkingFields();
+}
+
+function toggleThinkingFields() {
+  const type = document.getElementById('chThinkingType')?.value || 'off';
+  const budgetFields = document.getElementById('thinkingBudgetFields');
+  const adaptiveFields = document.getElementById('thinkingAdaptiveFields');
+  if (budgetFields) budgetFields.style.display = type === 'enabled' ? 'block' : 'none';
+  if (adaptiveFields) adaptiveFields.style.display = type === 'adaptive' ? 'block' : 'none';
+}
+
+function collectChannelOptions() {
+  const format = document.getElementById('chFormat')?.value || '';
+  const promptCacheEnabled = Boolean(document.getElementById('chPromptCacheEnabled')?.checked);
+  const thinkingType = format === 'anthropic' ? (document.getElementById('chThinkingType')?.value || 'off') : 'off';
+  const thinkingBudget = Number(document.getElementById('chThinkingBudget')?.value || 32000);
+  const outputEffort = document.getElementById('chOutputEffort')?.value || '';
+  const thinkingDisplay = document.getElementById('chThinkingDisplay')?.value || '';
+  return {
+    ...(format ? { format } : {}),
+    ...(format === 'anthropic' ? { anthropic_version: document.getElementById('chAnthropicVersion')?.value.trim() || '2023-06-01' } : {}),
+    prompt_cache_enabled: promptCacheEnabled,
+    prompt_cache_ttl: promptCacheEnabled ? (document.getElementById('chPromptCacheTtl')?.value || '1h') : '1h',
+    anthropic_thinking_type: thinkingType,
+    anthropic_thinking_budget_tokens: thinkingBudget,
+    anthropic_output_effort: outputEffort,
+    anthropic_thinking_display: thinkingDisplay,
+  };
 }
 
 async function saveChannel() {
@@ -1060,7 +1152,7 @@ async function saveChannel() {
   const url = document.getElementById('chUrl').value.trim();
   const key = document.getElementById('chKey').value.trim();
   const models = document.getElementById('chModels').value.split(',').map(m => m.trim()).filter(Boolean);
-  const streamStopSequences = parseStopSequences(document.getElementById('chStopSequences')?.value || '');
+  const channelOptions = collectChannelOptions();
   
   if (!name || !url) { toast('名称和地址必填', false); return; }
   if (!editingKey && !key) { toast('新渠道必须填写 API Key', false); return; }
@@ -1084,7 +1176,7 @@ async function saveChannel() {
           name, base_url: url,
           key,
           models: finalModels,
-          stream_stop_sequences: streamStopSequences,
+          ...channelOptions,
           isNew: true,
         })
       });
@@ -1102,99 +1194,13 @@ async function saveChannel() {
         name, base_url: url,
         key: key || channels[editingKey]?.key,
         models,
-        stream_stop_sequences: streamStopSequences,
+        ...channelOptions,
         isNew: false,
       })
     });
     if (res.ok) { toast('渠道已更新'); closeModal(); await load(); }
     else toast(res.error || '保存失败', false);
   } catch(e) { toast('保存失败: '+e.message, false); }
-}
-
-function showStopSequenceConfig(options = {}) {
-  const channelEntries = Object.entries(channels);
-  const allSequences = [...new Set(channelEntries.flatMap(([, ch]) => getStopSequences(ch)))];
-  const neverPromptButton = options.auto
-    ? '<button class="btn btn-outline" onclick="disableStopSequencePrompt()">以后不再提示</button>'
-    : '';
-  document.getElementById('modalContent').innerHTML = `
-    <h3>流式截断设置</h3>
-    <label>截断关键词</label>
-    <textarea id="batchStopSequences" placeholder="例如: &lt;answer&gt;">${escapeHtml(allSequences.join('\n'))}</textarea>
-    <div class="notice warn">
-      <strong>截断关键词会真正生效</strong>
-      一行一个或用逗号分隔；命中后停止继续转发，并不会把关键词发给客户端。
-    </div>
-    <label>推荐加到酒馆预设的提示词</label>
-    <textarea id="recommendedStopPrompt" readonly>${escapeHtml(RECOMMENDED_STOP_PROMPT)}</textarea>
-    <div class="notice info">
-      <strong>这里只是推荐文本</strong>
-      网关不会把它发给上游；请复制到酒馆预设里使用。
-    </div>
-    <label>适用渠道</label>
-    <div class="model-picker" style="display:block;max-height:260px">
-      ${channelEntries.map(([ckey, ch]) => {
-        const checked = getStopSequences(ch).length ? 'checked' : '';
-        return `<label><input type="checkbox" class="stop-channel" value="${escapeHtml(ckey)}" ${checked}> ${escapeHtml(ch.name || ckey)} <span class="count">${escapeHtml(ckey)}</span></label>`;
-      }).join('') || '<div class="empty">暂无渠道</div>'}
-    </div>
-    <div class="notice ok">
-      <strong>保存后按渠道应用</strong>
-      勾选渠道只会使用上面的关键词；未勾选渠道会关闭自定义流式截断。
-    </div>
-    <div class="actions">
-      ${neverPromptButton}
-      <button class="btn btn-outline" onclick="copyRecommendedStopPrompt()">复制推荐提示词</button>
-      <button class="btn btn-outline" onclick="closeModal()">取消</button>
-      <button class="btn btn-primary" onclick="saveStopSequenceConfig()">保存</button>
-    </div>`;
-  document.getElementById('modal').classList.add('active');
-}
-
-function disableStopSequencePrompt() {
-  localStorage.setItem(STOP_SETTINGS_DISMISSED_STORAGE, '1');
-  stopSettingsPromptShown = true;
-  closeModal();
-  toast('以后不会自动弹出流式截断设置');
-}
-
-async function copyRecommendedStopPrompt() {
-  try {
-    await navigator.clipboard.writeText(RECOMMENDED_STOP_PROMPT);
-    toast('推荐提示词已复制');
-  } catch(e) {
-    const el = document.getElementById('recommendedStopPrompt');
-    el?.select();
-    toast('已选中，请手动复制');
-  }
-}
-
-async function saveStopSequenceConfig() {
-  const sequences = parseStopSequences(document.getElementById('batchStopSequences')?.value || '');
-  const selected = new Set([...document.querySelectorAll('.stop-channel:checked')].map(el => el.value));
-  try {
-    for (const [ckey, ch] of Object.entries(channels)) {
-      await api('/api/config/save', {
-        method: 'POST',
-        body: JSON.stringify({
-          channelKey: ckey,
-          name: ch.name,
-          base_url: ch.base_url,
-          key: ch.key,
-          format: ch.format,
-          anthropic_version: ch.anthropic_version,
-          models: ch.models || [],
-          stream_stop_sequences: selected.has(ckey) ? sequences : [],
-          isNew: false,
-        })
-      });
-    }
-    toast('流式截断设置已保存');
-    closeModal();
-    await load();
-  } catch(e) {
-    toast('保存失败: '+e.message, false);
-  }
 }
 
 function closeModal() { document.getElementById('modal').classList.remove('active'); }
