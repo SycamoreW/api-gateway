@@ -72,7 +72,7 @@ The management key `api_key` can access both the WebUI and `/v1`. You can also g
 
 ## Pioneer Billing Status
 
-If a channel's `base_url` points to `api.pioneer.ai`, the WebUI header shows a Pioneer quota card. Click it to query `GET /billing/billing-status` with that channel's API key and display remaining free tier and total usage.
+If a channel's `base_url` points to `api.pioneer.ai`, the WebUI header shows a Pioneer quota card. Click it to query `GET /billing/billing-status` for every configured Pioneer upstream key, then display the aggregated remaining free tier and total usage. Hover the card to see per-key results by fingerprint.
 
 ## Anthropic Prompt Cache
 

@@ -341,6 +341,52 @@ function selectChannelKey(channel = {}, channelKey = '') {
   };
 }
 
+async function fetchPioneerBilling(key) {
+  return new Promise((resolve, reject) => {
+    const billingReq = https.request('https://api.pioneer.ai/billing/billing-status', {
+      method: 'GET',
+      headers: { 'X-API-Key': key },
+    }, (r) => {
+      let data = '';
+      r.on('data', c => data += c);
+      r.on('end', () => {
+        if (r.statusCode >= 200 && r.statusCode < 300) {
+          try { resolve(JSON.parse(data)); } catch (e) { reject(new Error('Pioneer API 返回非 JSON')); }
+        } else {
+          reject(new Error(`Pioneer API error: ${r.statusCode} ${data}`));
+        }
+      });
+    });
+    billingReq.on('error', reject);
+    billingReq.setTimeout(10000, () => {
+      billingReq.destroy();
+      reject(new Error('Pioneer API timeout'));
+    });
+    billingReq.end();
+  });
+}
+
+function toMoneyNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : 0;
+}
+
+function summarizePioneerBilling(items = []) {
+  const successful = items.filter(item => item.ok && item.billing);
+  const totalUsage = successful.reduce((sum, item) => sum + toMoneyNumber(item.billing.total_usage), 0);
+  const freeTierRemaining = successful.reduce((sum, item) => sum + toMoneyNumber(item.billing.free_tier_remaining), 0);
+  const exceedsFreeTier = successful.some(item => Boolean(item.billing.exceeds_free_tier));
+  return {
+    total_usage: totalUsage,
+    free_tier_remaining: freeTierRemaining,
+    exceeds_free_tier: exceedsFreeTier,
+    key_count: items.length,
+    successful_key_count: successful.length,
+    failed_key_count: items.length - successful.length,
+    items,
+  };
+}
+
 function normalizeChannelForSave(channel = {}) {
   const keys = getChannelKeys(channel);
   const next = { ...channel };
@@ -1605,28 +1651,26 @@ async function handleConfigAPI(req, res, url, body) {
       return true;
     }
     try {
-      const billingRes = await new Promise((resolve, reject) => {
-        const billingReq = https.request('https://api.pioneer.ai/billing/billing-status', {
-          method: 'GET',
-          headers: { 'X-API-Key': pioneerKeys[0] },
-        }, (r) => {
-          let data = '';
-          r.on('data', c => data += c);
-          r.on('end', () => {
-            if (r.statusCode >= 200 && r.statusCode < 300) {
-              try { resolve(JSON.parse(data)); } catch (e) { reject(new Error('Pioneer API 返回非 JSON')); }
-            } else {
-              reject(new Error(`Pioneer API error: ${r.statusCode} ${data}`));
-            }
-          });
-        });
-        billingReq.on('error', reject);
-        billingReq.setTimeout(10000, () => {
-          billingReq.destroy();
-          reject(new Error('Pioneer API timeout'));
-        });
-        billingReq.end();
-      });
+      const items = await Promise.all(pioneerKeys.map(async (key, index) => {
+        const item = {
+          index,
+          fingerprint: fingerprintKey(key),
+          ok: false,
+          billing: null,
+          error: '',
+        };
+        try {
+          item.billing = await fetchPioneerBilling(key);
+          item.ok = true;
+        } catch (err) {
+          item.error = err.message || '查询失败';
+        }
+        return item;
+      }));
+      const billingRes = summarizePioneerBilling(items);
+      if (billingRes.successful_key_count === 0) {
+        throw new Error(items.map(item => `#${item.index + 1}: ${item.error}`).join('; ') || 'Pioneer 额度查询失败');
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true, billing: billingRes }));
       return true;

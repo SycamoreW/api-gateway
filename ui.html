@@ -785,7 +785,7 @@ async function loadBilling() {
     if (d.ok && d.billing) {
       billingData = d.billing;
       renderHeaderStats();
-      toast(`Pioneer 剩余: $${billingData.free_tier_remaining.toFixed(2)}`);
+      toast(`Pioneer 剩余: $${Number(billingData.free_tier_remaining || 0).toFixed(2)}`);
     } else {
       toast('Pioneer 额度查询失败: ' + (d.error || '未知错误'), false);
     }
@@ -794,16 +794,30 @@ async function loadBilling() {
   }
 }
 
+function formatBillingTitle(data) {
+  const items = Array.isArray(data?.items) ? data.items : [];
+  if (!items.length) return '点击刷新';
+  return items.map(item => {
+    const label = `#${Number(item.index || 0) + 1} ${item.fingerprint || ''}`.trim();
+    if (!item.ok || !item.billing) return `${label}: ${item.error || '查询失败'}`;
+    return `${label}: 剩余 $${Number(item.billing.free_tier_remaining || 0).toFixed(2)}，已用 $${Number(item.billing.total_usage || 0).toFixed(2)}`;
+  }).join('\n');
+}
+
 function renderHeaderStats() {
   const keys = Object.keys(channels);
   const totalModels = Object.values(channels).reduce((s,c)=>s+c.models.length,0);
+  const failedBillingCount = Number(billingData?.failed_key_count || 0);
+  const billingSub = billingData
+    ? `${Number(billingData.successful_key_count || 0)}/${Number(billingData.key_count || 1)} keys · 已用 $${Number(billingData.total_usage || 0).toFixed(2)}${failedBillingCount ? ` · 失败 ${failedBillingCount}` : ''}`
+    : '';
   const billingHtml = billingData ? `
-    <div class="stat" style="cursor:pointer" onclick="loadBilling()" title="点击刷新">
-      <div class="num" style="color:${billingData.exceeds_free_tier ? '#f85149' : '#3fb950'}">
-        $${billingData.free_tier_remaining.toFixed(0)}
+    <div class="stat" style="cursor:pointer" onclick="loadBilling()" title="${escapeHtml(formatBillingTitle(billingData))}">
+      <div class="num" style="color:${billingData.exceeds_free_tier || failedBillingCount ? '#f85149' : '#3fb950'}">
+        $${Number(billingData.free_tier_remaining || 0).toFixed(0)}
       </div>
       <div class="label">Pioneer 剩余</div>
-      <div class="sub">已用 $${billingData.total_usage.toFixed(2)}</div>
+      <div class="sub">${escapeHtml(billingSub)}</div>
     </div>
   ` : `
     <div class="stat" style="cursor:pointer" onclick="loadBilling()" title="点击加载">
