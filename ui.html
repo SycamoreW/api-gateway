@@ -86,12 +86,13 @@
   .usage-card{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:12px;min-width:0}
   .usage-card h3{font-size:15px;color:#f0f6fc;margin-bottom:10px}
   .usage-card:not(.recent-card){min-height:194px}
-  .usage-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto auto;gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid #21262d;font-size:14px}
+  .usage-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto auto auto;gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid #21262d;font-size:14px}
   .usage-row:last-child{border-bottom:none}
   .usage-name{color:#c9d1d9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .usage-count{color:#79c0ff;font-variant-numeric:tabular-nums}
   .usage-zero-count{color:#f0883e;font-variant-numeric:tabular-nums}
   .usage-tokens{color:#8b949e;font-variant-numeric:tabular-nums}
+  .usage-cache{color:#3fb950;font-variant-numeric:tabular-nums}
   .recent-card{grid-column:1/-1}
   .recent-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:8px;max-height:280px;overflow:auto;padding-right:2px}
   .recent-entry{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px 10px;font-size:14px}
@@ -136,6 +137,7 @@
     .recent-list{grid-template-columns:1fr}
     .usage-row{grid-template-columns:minmax(0,1fr) auto;gap:4px 8px}
     .usage-tokens{grid-column:2}
+    .usage-cache{grid-column:2}
   }
 </style>
 </head>
@@ -718,11 +720,14 @@ function formatNumber(value) {
 
 function addUsage(target, name, item = {}) {
   if (!name) return;
-  if (!target[name]) target[name] = { count: 0, tokenCount: 0, zeroTokenCount: 0, tokens: 0 };
+  if (!target[name]) target[name] = { count: 0, tokenCount: 0, zeroTokenCount: 0, tokens: 0, cacheHitCount: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 };
   target[name].count += item.count || 0;
   target[name].tokenCount += getTokenCount(item);
   target[name].zeroTokenCount += getZeroTokenCount(item);
   target[name].tokens += item.tokens || 0;
+  target[name].cacheHitCount += getCacheHitCount(item);
+  target[name].cacheReadInputTokens += getCacheReadInputTokens(item);
+  target[name].cacheCreationInputTokens += getCacheCreationInputTokens(item);
 }
 
 function getTokenCount(item = {}) {
@@ -741,6 +746,26 @@ function getUsageCount(item = {}) {
   const count = Number(item.count);
   if (Number.isFinite(count) && count > 0) return count;
   return getTokenCount(item) + getZeroTokenCount(item);
+}
+
+function getCacheHitCount(item = {}) {
+  return Number(item.cacheHitCount) || 0;
+}
+
+function getCacheReadInputTokens(item = {}) {
+  return Number(item.cacheReadInputTokens) || 0;
+}
+
+function getCacheCreationInputTokens(item = {}) {
+  return Number(item.cacheCreationInputTokens) || 0;
+}
+
+function summarizeCache(usage = {}) {
+  return Object.values(usage).reduce((sum, item) => ({
+    cacheHitCount: sum.cacheHitCount + getCacheHitCount(item),
+    cacheReadInputTokens: sum.cacheReadInputTokens + getCacheReadInputTokens(item),
+    cacheCreationInputTokens: sum.cacheCreationInputTokens + getCacheCreationInputTokens(item),
+  }), { cacheHitCount: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 });
 }
 
 function shiftDateKey(daysAgo) {
@@ -778,14 +803,16 @@ function getStatsDateRange() {
 function getFilteredStats() {
   const range = getStatsDateRange();
   if (!gatewayStats) {
-    return { label: range.label, totalRequests: 0, totalTokens: 0, modelUsage: {}, channelUsage: {}, ipUsage: {}, recentLogs: [] };
+    return { label: range.label, totalRequests: 0, totalTokens: 0, cacheHitCount: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, modelUsage: {}, channelUsage: {}, ipUsage: {}, recentLogs: [] };
   }
   if (!range.keys) {
     const modelUsage = gatewayStats.modelUsage || {};
+    const cache = summarizeCache(modelUsage);
     return {
       label: range.label,
       totalRequests: gatewayStats.totalRequests || 0,
       totalTokens: Object.values(modelUsage).reduce((sum, item) => sum + (item?.tokens || 0), 0),
+      ...cache,
       modelUsage,
       channelUsage: gatewayStats.channelUsage || {},
       ipUsage: gatewayStats.ipUsage || {},
@@ -794,7 +821,7 @@ function getFilteredStats() {
   }
 
   const keySet = new Set(range.keys);
-  const view = { label: range.label, totalRequests: 0, totalTokens: 0, modelUsage: {}, channelUsage: {}, ipUsage: {}, recentLogs: [] };
+  const view = { label: range.label, totalRequests: 0, totalTokens: 0, cacheHitCount: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, modelUsage: {}, channelUsage: {}, ipUsage: {}, recentLogs: [] };
   for (const key of range.keys) {
     const day = gatewayStats.dailyStats?.[key];
     if (!day) continue;
@@ -808,6 +835,7 @@ function getFilteredStats() {
     const key = entry.timestamp ? new Date(entry.timestamp).toISOString().slice(0, 10) : '';
     return keySet.has(key);
   });
+  Object.assign(view, summarizeCache(view.modelUsage));
   return view;
 }
 
@@ -837,6 +865,7 @@ function formatUsageRows(usage = {}) {
       <span class="usage-count">${formatNumber(getTokenCount(item))} 有tok</span>
       <span class="usage-zero-count">${formatNumber(getZeroTokenCount(item))} 0tok</span>
       <span class="usage-tokens">${formatNumber(item?.tokens)} tok</span>
+      <span class="usage-cache" title="缓存读取 ${formatNumber(getCacheReadInputTokens(item))} tok，缓存写入 ${formatNumber(getCacheCreationInputTokens(item))} tok">${formatNumber(getCacheHitCount(item))} hit</span>
     </div>
   `).join('');
 }
@@ -865,6 +894,8 @@ function renderHeaderStats() {
     <div class="stat"><div class="num">${clientKeys.length}</div><div class="label">调用 Key</div></div>
     <div class="stat"><div class="num">${formatNumber(statsView.totalRequests)}</div><div class="label">请求</div><div class="sub">${escapeHtml(statsView.label)}</div></div>
     <div class="stat"><div class="num">${formatNumber(statsView.totalTokens)}</div><div class="label">Token</div><div class="sub">${escapeHtml(statsView.label)}</div></div>
+    <div class="stat"><div class="num" style="color:#3fb950">${formatNumber(statsView.cacheHitCount)}</div><div class="label">缓存命中</div><div class="sub">读 ${formatNumber(statsView.cacheReadInputTokens)} tok</div></div>
+    <div class="stat"><div class="num" style="color:#d29922">${formatNumber(statsView.cacheCreationInputTokens)}</div><div class="label">缓存写入</div><div class="sub">input tok</div></div>
     ${billingHtml}
     <div class="stat"><div class="num" style="color:#3fb950">●</div><div class="label">运行中</div></div>
   `;
@@ -887,6 +918,9 @@ function renderUsageStats() {
         <span>${escapeHtml(entry.channel)}</span>
         ${entry.clientIp ? `<span>${escapeHtml(entry.clientIp)}</span>` : ''}
         <span>${formatNumber(entry.tokens)} tok</span>
+        ${entry.cacheHit ? `<span style="color:#3fb950">缓存命中</span>` : ''}
+        ${entry.cacheReadInputTokens ? `<span>读缓存 ${formatNumber(entry.cacheReadInputTokens)} tok</span>` : ''}
+        ${entry.cacheCreationInputTokens ? `<span>写缓存 ${formatNumber(entry.cacheCreationInputTokens)} tok</span>` : ''}
         ${entry.error ? `<span>${escapeHtml(entry.error)}</span>` : ''}
       </div>
     </div>

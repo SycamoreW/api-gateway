@@ -132,15 +132,23 @@ function extractTokenUsage(data) {
 }
 
 function extractTokenUsageDetails(data) {
-  if (!data || typeof data !== 'object') return { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+  if (!data || typeof data !== 'object') {
+    return { inputTokens: 0, outputTokens: 0, totalTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 };
+  }
 
   const usage = data.usage && typeof data.usage === 'object' ? data.usage : {};
   const tokenUsage = data.token_usage && typeof data.token_usage === 'object' ? data.token_usage : {};
+  const cacheCreationInputTokens =
+    toTokenNumber(usage.cache_creation_input_tokens) +
+    toTokenNumber(tokenUsage.cache_creation_input_tokens);
+  const cacheReadInputTokens =
+    toTokenNumber(usage.cache_read_input_tokens) +
+    toTokenNumber(tokenUsage.cache_read_input_tokens);
   const inputTokens =
     toTokenNumber(usage.prompt_tokens) +
     toTokenNumber(usage.input_tokens) +
-    toTokenNumber(usage.cache_creation_input_tokens) +
-    toTokenNumber(usage.cache_read_input_tokens) +
+    cacheCreationInputTokens +
+    cacheReadInputTokens +
     toTokenNumber(tokenUsage.prompt_tokens) +
     toTokenNumber(tokenUsage.input_tokens);
   const outputTokens =
@@ -159,7 +167,7 @@ function extractTokenUsageDetails(data) {
     toTokenNumber(tokenUsage.total_tokens) ||
     toTokenNumber(tokenUsage.totalTokens);
   const totalTokens = directTotal || inputTokens + outputTokens;
-  return { inputTokens, outputTokens, totalTokens };
+  return { inputTokens, outputTokens, totalTokens, cacheCreationInputTokens, cacheReadInputTokens };
 }
 
 function extractOutputContent(data) {
@@ -209,6 +217,8 @@ function extractResponseLogDetails(responseData) {
   let inputTokens = 0;
   let outputTokens = 0;
   let totalTokens = 0;
+  let cacheCreationInputTokens = 0;
+  let cacheReadInputTokens = 0;
   let outputContent = '';
   let errorMessage = '';
   for (const line of responseData.split('\n')) {
@@ -222,10 +232,17 @@ function extractResponseLogDetails(responseData) {
       inputTokens = Math.max(inputTokens, usage.inputTokens);
       outputTokens = Math.max(outputTokens, usage.outputTokens);
       totalTokens = Math.max(totalTokens, usage.totalTokens);
+      cacheCreationInputTokens = Math.max(cacheCreationInputTokens, usage.cacheCreationInputTokens);
+      cacheReadInputTokens = Math.max(cacheReadInputTokens, usage.cacheReadInputTokens);
       outputContent += extractOutputContent(data);
       errorMessage ||= extractErrorMessage(data);
       if (data.type === 'content_block_delta' && data.delta?.text) outputContent += data.delta.text;
-      if (data.type === 'message_start') inputTokens = Math.max(inputTokens, toTokenNumber(data.message?.usage?.input_tokens));
+      if (data.type === 'message_start') {
+        const messageUsage = extractTokenUsageDetails(data.message);
+        inputTokens = Math.max(inputTokens, messageUsage.inputTokens);
+        cacheCreationInputTokens = Math.max(cacheCreationInputTokens, messageUsage.cacheCreationInputTokens);
+        cacheReadInputTokens = Math.max(cacheReadInputTokens, messageUsage.cacheReadInputTokens);
+      }
       if (data.type === 'message_delta') outputTokens = Math.max(outputTokens, toTokenNumber(data.usage?.output_tokens));
     } catch {
       // Ignore non-JSON stream lines.
@@ -234,6 +251,8 @@ function extractResponseLogDetails(responseData) {
   return {
     inputTokens,
     outputTokens,
+    cacheCreationInputTokens,
+    cacheReadInputTokens,
     totalTokens: totalTokens || inputTokens + outputTokens,
     outputContent: truncateText(outputContent),
     errorMessage: truncateText(errorMessage),
@@ -359,7 +378,7 @@ function responseLogFields(context = {}, extra = {}) {
   return fields;
 }
 
-function requestLogOptions(context = {}, requestId = '', error = null) {
+function requestLogOptions(context = {}, requestId = '', error = null, extra = {}) {
   return {
     error,
     requestId,
@@ -367,6 +386,7 @@ function requestLogOptions(context = {}, requestId = '', error = null) {
     clientKey: context.clientKey || '',
     clientKeyFingerprint: context.clientKeyFingerprint || '',
     clientKeyType: context.clientKeyType || '',
+    ...extra,
   };
 }
 
@@ -403,19 +423,27 @@ function saveStats() {
 }
 
 function makeUsageBucket() {
-  return { count: 0, tokenCount: 0, zeroTokenCount: 0, tokens: 0 };
+  return { count: 0, tokenCount: 0, zeroTokenCount: 0, tokens: 0, cacheHitCount: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 };
 }
 
-function addUsageRequest(bucket, tokens) {
+function addUsageRequest(bucket, tokens, options = {}) {
   bucket.count = (bucket.count || 0) + 1;
   bucket.tokenCount = bucket.tokenCount || 0;
   bucket.zeroTokenCount = bucket.zeroTokenCount || 0;
+  bucket.cacheHitCount = bucket.cacheHitCount || 0;
+  bucket.cacheReadInputTokens = bucket.cacheReadInputTokens || 0;
+  bucket.cacheCreationInputTokens = bucket.cacheCreationInputTokens || 0;
   if (tokens > 0) {
     bucket.tokenCount++;
   } else {
     bucket.zeroTokenCount++;
   }
   bucket.tokens = (bucket.tokens || 0) + tokens;
+  const cacheReadInputTokens = toTokenNumber(options.cacheReadInputTokens);
+  const cacheCreationInputTokens = toTokenNumber(options.cacheCreationInputTokens);
+  if (cacheReadInputTokens > 0) bucket.cacheHitCount++;
+  bucket.cacheReadInputTokens += cacheReadInputTokens;
+  bucket.cacheCreationInputTokens += cacheCreationInputTokens;
 }
 
 function applyUsageSplitFromLogs(bucket, logs) {
@@ -423,10 +451,22 @@ function applyUsageSplitFromLogs(bucket, logs) {
   const count = bucket.count || 0;
   const tokenCount = bucket.tokenCount || 0;
   const zeroTokenCount = bucket.zeroTokenCount || 0;
-  if (logs.length !== count || tokenCount + zeroTokenCount === count) return false;
-  bucket.tokenCount = logs.filter(entry => toTokenNumber(entry.tokens) > 0).length;
-  bucket.zeroTokenCount = logs.length - bucket.tokenCount;
-  return true;
+  let changed = false;
+  if (logs.length === count && tokenCount + zeroTokenCount !== count) {
+    bucket.tokenCount = logs.filter(entry => toTokenNumber(entry.tokens) > 0).length;
+    bucket.zeroTokenCount = logs.length - bucket.tokenCount;
+    changed = true;
+  }
+  const cacheReadInputTokens = logs.reduce((sum, entry) => sum + toTokenNumber(entry.cacheReadInputTokens), 0);
+  const cacheCreationInputTokens = logs.reduce((sum, entry) => sum + toTokenNumber(entry.cacheCreationInputTokens), 0);
+  const cacheHitCount = logs.filter(entry => toTokenNumber(entry.cacheReadInputTokens) > 0).length;
+  if ((bucket.cacheReadInputTokens == null || bucket.cacheCreationInputTokens == null || bucket.cacheHitCount == null) && logs.length === count) {
+    bucket.cacheReadInputTokens = cacheReadInputTokens;
+    bucket.cacheCreationInputTokens = cacheCreationInputTokens;
+    bucket.cacheHitCount = cacheHitCount;
+    changed = true;
+  }
+  return changed;
 }
 
 function backfillUsageSplitsFromRecentLogs() {
@@ -517,6 +557,9 @@ function logRequest(model, channel, tokens = 0, success = true, error = null) {
     : { error };
   error = options.error ?? null;
   tokens = toTokenNumber(tokens);
+  const cacheReadInputTokens = toTokenNumber(options.cacheReadInputTokens);
+  const cacheCreationInputTokens = toTokenNumber(options.cacheCreationInputTokens);
+  const cacheHit = cacheReadInputTokens > 0;
   const now = new Date();
   const date = now.toISOString().split('T')[0];
   const time = now.toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai' });
@@ -528,13 +571,13 @@ function logRequest(model, channel, tokens = 0, success = true, error = null) {
   if (!stats.modelUsage[model]) {
     stats.modelUsage[model] = makeUsageBucket();
   }
-  addUsageRequest(stats.modelUsage[model], tokens);
+  addUsageRequest(stats.modelUsage[model], tokens, { cacheReadInputTokens, cacheCreationInputTokens });
   
   // 更新渠道使用统计
   if (!stats.channelUsage[channel]) {
     stats.channelUsage[channel] = makeUsageBucket();
   }
-  addUsageRequest(stats.channelUsage[channel], tokens);
+  addUsageRequest(stats.channelUsage[channel], tokens, { cacheReadInputTokens, cacheCreationInputTokens });
 
   // 更新 IP 使用统计
   const clientIp = options.clientIp || 'unknown';
@@ -542,7 +585,7 @@ function logRequest(model, channel, tokens = 0, success = true, error = null) {
   if (!stats.ipUsage[clientIp]) {
     stats.ipUsage[clientIp] = makeUsageBucket();
   }
-  addUsageRequest(stats.ipUsage[clientIp], tokens);
+  addUsageRequest(stats.ipUsage[clientIp], tokens, { cacheReadInputTokens, cacheCreationInputTokens });
   
   // 更新每日统计
   if (!stats.dailyStats[date]) {
@@ -556,15 +599,15 @@ function logRequest(model, channel, tokens = 0, success = true, error = null) {
   if (!stats.dailyStats[date].models[model]) {
     stats.dailyStats[date].models[model] = makeUsageBucket();
   }
-  addUsageRequest(stats.dailyStats[date].models[model], tokens);
+  addUsageRequest(stats.dailyStats[date].models[model], tokens, { cacheReadInputTokens, cacheCreationInputTokens });
   if (!stats.dailyStats[date].channels[channel]) {
     stats.dailyStats[date].channels[channel] = makeUsageBucket();
   }
-  addUsageRequest(stats.dailyStats[date].channels[channel], tokens);
+  addUsageRequest(stats.dailyStats[date].channels[channel], tokens, { cacheReadInputTokens, cacheCreationInputTokens });
   if (!stats.dailyStats[date].ips[clientIp]) {
     stats.dailyStats[date].ips[clientIp] = makeUsageBucket();
   }
-  addUsageRequest(stats.dailyStats[date].ips[clientIp], tokens);
+  addUsageRequest(stats.dailyStats[date].ips[clientIp], tokens, { cacheReadInputTokens, cacheCreationInputTokens });
   
   // 添加到最近日志（保留最近100条）
   const logEntry = {
@@ -576,6 +619,9 @@ function logRequest(model, channel, tokens = 0, success = true, error = null) {
     success: success,
     error: error,
     clientIp,
+    cacheHit,
+    cacheReadInputTokens,
+    cacheCreationInputTokens,
     ...(options.clientKeyFingerprint ? { clientKeyFingerprint: options.clientKeyFingerprint } : {}),
     ...(options.clientKeyType ? { clientKeyType: options.clientKeyType } : {}),
   };
@@ -929,7 +975,7 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
         
         // 记录成功的请求
         if (proxyRes.statusCode < 400 && !errorMessage) {
-          logRequest(modelName || 'unknown', channel.name, tokens, true, requestLogOptions(logContext, requestId));
+          logRequest(modelName || 'unknown', channel.name, tokens, true, requestLogOptions(logContext, requestId, null, responseDetails));
           writeGatewayLog('request_complete', responseLogFields(logContext, {
             requestId,
             model: modelName || 'unknown',
@@ -1046,6 +1092,8 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
     let streamFinishReason = 'stop';
     let streamInputTokens = 0;
     let streamOutputTokens = 0;
+    let streamCacheCreationInputTokens = 0;
+    let streamCacheReadInputTokens = 0;
     let streamOutputContent = '';
     let proxyResRef = null;
     let clientAborted = false;
@@ -1149,7 +1197,10 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
           try {
             const eventData = JSON.parse(payload);
             if (eventData.type === 'message_start') {
-              streamInputTokens = eventData.message?.usage?.input_tokens || 0;
+              const usage = extractTokenUsageDetails(eventData.message);
+              streamInputTokens = usage.inputTokens || 0;
+              streamCacheCreationInputTokens = usage.cacheCreationInputTokens || 0;
+              streamCacheReadInputTokens = usage.cacheReadInputTokens || 0;
               writeOpenAIStreamChunk('');
             } else if (eventData.type === 'content_block_delta') {
               const text = eventData.delta?.text || '';
@@ -1185,8 +1236,9 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
               writeOpenAIStreamChunk('', openAIData.choices?.[0]?.finish_reason || streamFinishReason);
               res.write('data: [DONE]\n\n');
               res.end();
-              const tokens = extractTokenUsage(openAIData);
-              logRequest(upstreamModel || requestedModel || 'unknown', channel.name, tokens, true, requestLogOptions(logContext, requestId));
+              const usageDetails = extractTokenUsageDetails(openAIData);
+              const tokens = usageDetails.totalTokens;
+              logRequest(upstreamModel || requestedModel || 'unknown', channel.name, tokens, true, requestLogOptions(logContext, requestId, null, usageDetails));
               writeGatewayLog('request_complete', responseLogFields(logContext, {
                 requestId,
                 model: upstreamModel || 'unknown',
@@ -1195,7 +1247,7 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
                 statusCode: proxyRes.statusCode,
                 durationMs: Date.now() - startedAt,
                 tokens,
-                ...extractTokenUsageDetails(openAIData),
+                ...usageDetails,
                 outputContent: truncateText(content),
                 format: 'anthropic_stream_json_fallback',
               }));
@@ -1224,7 +1276,10 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
           res.write('data: [DONE]\n\n');
           res.end();
           const tokens = streamInputTokens + streamOutputTokens;
-          logRequest(upstreamModel || requestedModel || 'unknown', channel.name, tokens, true, requestLogOptions(logContext, requestId));
+          logRequest(upstreamModel || requestedModel || 'unknown', channel.name, tokens, true, requestLogOptions(logContext, requestId, null, {
+            cacheCreationInputTokens: streamCacheCreationInputTokens,
+            cacheReadInputTokens: streamCacheReadInputTokens,
+          }));
           writeGatewayLog('request_complete', responseLogFields(logContext, {
             requestId,
             model: upstreamModel || 'unknown',
@@ -1235,6 +1290,8 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
             tokens,
             inputTokens: streamInputTokens,
             outputTokens: streamOutputTokens,
+            cacheCreationInputTokens: streamCacheCreationInputTokens,
+            cacheReadInputTokens: streamCacheReadInputTokens,
             totalTokens: tokens,
             outputContent: truncateText(streamOutputContent),
             format: 'anthropic_stream',
@@ -1271,8 +1328,9 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
         try {
           const anthropicData = JSON.parse(responseData);
           const openAIData = convertAnthropicResponseToOpenAI(anthropicData, requestedModel || upstreamModel);
-          const tokens = extractTokenUsage(openAIData);
-          logRequest(upstreamModel || requestedModel || 'unknown', channel.name, tokens, true, requestLogOptions(logContext, requestId));
+          const usageDetails = extractTokenUsageDetails(openAIData);
+          const tokens = usageDetails.totalTokens;
+          logRequest(upstreamModel || requestedModel || 'unknown', channel.name, tokens, true, requestLogOptions(logContext, requestId, null, usageDetails));
           writeGatewayLog('request_complete', responseLogFields(logContext, {
             requestId,
             model: upstreamModel || 'unknown',
@@ -1281,7 +1339,7 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
             statusCode: proxyRes.statusCode,
             durationMs: Date.now() - startedAt,
             tokens,
-            ...extractTokenUsageDetails(openAIData),
+            ...usageDetails,
             outputContent: truncateText(openAIData.choices?.[0]?.message?.content || ''),
             format: 'anthropic',
           }));

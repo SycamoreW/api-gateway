@@ -70,6 +70,8 @@ For OpenAI-compatible Claude proxy channels, leave the format as OpenAI compatib
 
 The WebUI defaults this option to `1h` for longer conversations. Use `5m` for short-lived cache if the provider charges less for 5-minute writes. The 1-hour cache can reduce repeated context processing after longer pauses, but cache writes cost more than the default 5-minute cache on Anthropic.
 
+The WebUI stats header shows cache hit count, cache read tokens, and cache creation tokens. Usage tables also show per-model, per-channel, and per-IP cache hits; recent requests show whether a request hit cache.
+
 ## Anthropic Thinking
 
 Anthropic-format channels can optionally inject thinking controls in the request body. The WebUI supports two modes:
