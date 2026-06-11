@@ -1,6 +1,6 @@
 # API Gateway
 
-OpenAI-compatible aggregate API gateway with a WebUI for channels, models, logs, stats, and Pioneer billing status.
+OpenAI-compatible aggregate API gateway with a WebUI for channels, models, logs, stats, key rotation, and Pioneer billing status.
 
 ## Three Steps
 
@@ -48,10 +48,27 @@ On Termux, `start.sh` will try to open the WebUI automatically. If it does not o
 - OpenAI-compatible `/v1/models` and `/v1/chat/completions`
 - Route models to multiple upstream channels
 - WebUI channel and model management
-- Request logs and usage stats
+- Multiple upstream keys per channel with round-robin rotation
+- Generated client API keys for `/v1` access
+- Request logs and usage stats, including per-IP usage
 - Pioneer billing status in the WebUI header
 - Prompt Cache controls for Anthropic Messages API and compatible Claude proxy channels
 - Anthropic thinking controls for compatible Claude models and providers
+
+## Key Management
+
+Each channel can use either a single upstream key or a key pool. Keep `key` for backward compatibility, and add more keys in `keys`; the gateway deduplicates them and rotates one key per request for that channel:
+
+```json
+{
+  "key": "provider-key-1",
+  "keys": ["provider-key-1", "provider-key-2", "provider-key-3"]
+}
+```
+
+The WebUI channel editor exposes this as the upstream key pool. The selected upstream key is logged only as a short fingerprint.
+
+The management key `api_key` can access both the WebUI and `/v1`. You can also generate extra client keys from the WebUI; generated keys are stored in `api_keys` and can call `/v1/*` but cannot access `/api/*` management routes.
 
 ## Pioneer Billing Status
 
@@ -117,6 +134,7 @@ Important fields:
 {
   "port": 8300,
   "api_key": "123456",
+  "api_keys": ["client-key-1"],
   "channels": {
     "anthropic": {
       "name": "anthropic",
@@ -134,6 +152,7 @@ Important fields:
       "name": "pio",
       "base_url": "https://api.pioneer.ai/v1",
       "key": "pio_sk_...",
+      "keys": ["pio_sk_...", "pio_sk_second..."],
       "prompt_cache_enabled": true,
       "prompt_cache_ttl": "1h",
       "models": ["pio/claude-opus-4-7"]

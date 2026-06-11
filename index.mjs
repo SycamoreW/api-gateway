@@ -2,11 +2,14 @@ import http from 'node:http';
 import https from 'node:https';
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 
 const config = JSON.parse(fs.readFileSync(path.resolve(process.argv[2] || 'config.json'), 'utf-8'));
+if (!Array.isArray(config.api_keys)) config.api_keys = [];
 const LOG_DIR = path.resolve('logs');
 const LOG_MAX_BODY_CHARS = 2000;
 const HIDDEN_UI_LOG_EVENTS = new Set(['http_request', 'model_params', 'model_routed']);
+const channelKeyCursors = new Map();
 
 function ensureLogDir() {
   if (!fs.existsSync(LOG_DIR)) {
@@ -94,6 +97,11 @@ function readVisibleGatewayLogs(limit = 100) {
 
 function newRequestId() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function fingerprintKey(key = '') {
+  if (!key) return '';
+  return crypto.createHash('sha256').update(key).digest('hex').slice(0, 12);
 }
 
 function toTokenNumber(value) {
@@ -265,6 +273,9 @@ function buildLogContext(req, data = {}) {
     requestedModel: data.model || '',
     inputContent: extractInputContent(data),
     stream: Boolean(data.stream),
+    clientKey: req.clientApiKey || '',
+    clientKeyFingerprint: req.clientApiKeyFingerprint || '',
+    clientKeyType: req.clientApiKeyType || '',
   };
 }
 
@@ -274,8 +285,74 @@ function responseLogFields(context = {}, extra = {}) {
   if (context.requestedModel && context.requestedModel !== extra.model) fields.requestedModel = context.requestedModel;
   if (context.inputContent) fields.inputContent = context.inputContent;
   if (context.stream != null) fields.stream = context.stream;
+  if (context.clientKeyFingerprint) fields.clientKeyFingerprint = context.clientKeyFingerprint;
+  if (context.clientKeyType) fields.clientKeyType = context.clientKeyType;
   if (fields.totalTokens == null && fields.tokens != null) fields.totalTokens = fields.tokens;
   return fields;
+}
+
+function requestLogOptions(context = {}, requestId = '', error = null, extra = {}) {
+  return {
+    error,
+    requestId,
+    clientIp: context.clientIp || '',
+    clientKey: context.clientKey || '',
+    clientKeyFingerprint: context.clientKeyFingerprint || '',
+    clientKeyType: context.clientKeyType || '',
+    ...extra,
+  };
+}
+
+function normalizeKeyList(keys = []) {
+  const seen = new Set();
+  const result = [];
+  for (const key of keys) {
+    const normalized = String(key || '').trim();
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    result.push(normalized);
+  }
+  return result;
+}
+
+function getChannelKeys(channel = {}) {
+  return normalizeKeyList([
+    channel.key,
+    ...(Array.isArray(channel.keys) ? channel.keys : []),
+  ]);
+}
+
+function getChannelKeyCount(channel = {}) {
+  return getChannelKeys(channel).length;
+}
+
+function selectChannelKey(channel = {}, channelKey = '') {
+  const keys = getChannelKeys(channel);
+  if (keys.length === 0) return { key: '', index: -1, count: 0, fingerprint: '' };
+  const cursorKey = channelKey || channel.name || channel.base_url || 'default';
+  const cursor = channelKeyCursors.get(cursorKey) || 0;
+  const index = cursor % keys.length;
+  channelKeyCursors.set(cursorKey, (index + 1) % keys.length);
+  return {
+    key: keys[index],
+    index,
+    count: keys.length,
+    fingerprint: fingerprintKey(keys[index]),
+  };
+}
+
+function normalizeChannelForSave(channel = {}) {
+  const keys = getChannelKeys(channel);
+  const next = { ...channel };
+  if (keys.length > 0) {
+    next.key = keys[0];
+    if (keys.length > 1) next.keys = keys;
+    else delete next.keys;
+  } else {
+    next.key = '';
+    delete next.keys;
+  }
+  return next;
 }
 
 function writeAccessLog(req, res, event, fields = {}) {
@@ -299,6 +376,7 @@ if (fs.existsSync(STATS_FILE)) {
     totalRequests: 0,
     modelUsage: {},
     channelUsage: {},
+    ipUsage: {},
     dailyStats: {},
     recentLogs: []
   };
@@ -346,6 +424,9 @@ function backfillUsageCacheFromRecentLogs() {
   for (const [channel, bucket] of Object.entries(stats.channelUsage || {})) {
     changed = applyUsageCacheFromLogs(bucket, recentLogs.filter(entry => entry.channel === channel)) || changed;
   }
+  for (const [ip, bucket] of Object.entries(stats.ipUsage || {})) {
+    changed = applyUsageCacheFromLogs(bucket, recentLogs.filter(entry => entry.clientIp === ip)) || changed;
+  }
   for (const [date, day] of Object.entries(stats.dailyStats || {})) {
     const dayLogs = recentLogs.filter(entry => {
       if (!entry.timestamp) return false;
@@ -356,6 +437,9 @@ function backfillUsageCacheFromRecentLogs() {
     }
     for (const [channel, bucket] of Object.entries(day.channels || {})) {
       changed = applyUsageCacheFromLogs(bucket, dayLogs.filter(entry => entry.channel === channel)) || changed;
+    }
+    for (const [ip, bucket] of Object.entries(day.ips || {})) {
+      changed = applyUsageCacheFromLogs(bucket, dayLogs.filter(entry => entry.clientIp === ip)) || changed;
     }
   }
 
@@ -392,13 +476,22 @@ function logRequest(model, channel, tokens = 0, success = true, error = null) {
     stats.channelUsage[channel] = makeUsageBucket();
   }
   addUsageRequest(stats.channelUsage[channel], tokens, { cacheReadInputTokens, cacheCreationInputTokens });
+
+  // 更新 IP 使用统计
+  const clientIp = options.clientIp || 'unknown';
+  if (!stats.ipUsage) stats.ipUsage = {};
+  if (!stats.ipUsage[clientIp]) {
+    stats.ipUsage[clientIp] = makeUsageBucket();
+  }
+  addUsageRequest(stats.ipUsage[clientIp], tokens, { cacheReadInputTokens, cacheCreationInputTokens });
   
   // 更新每日统计
   if (!stats.dailyStats[date]) {
-    stats.dailyStats[date] = { requests: 0, tokens: 0, models: {}, channels: {} };
+    stats.dailyStats[date] = { requests: 0, tokens: 0, models: {}, channels: {}, ips: {} };
   }
   if (!stats.dailyStats[date].models) stats.dailyStats[date].models = {};
   if (!stats.dailyStats[date].channels) stats.dailyStats[date].channels = {};
+  if (!stats.dailyStats[date].ips) stats.dailyStats[date].ips = {};
   stats.dailyStats[date].requests++;
   stats.dailyStats[date].tokens += tokens;
   if (!stats.dailyStats[date].models[model]) {
@@ -409,6 +502,10 @@ function logRequest(model, channel, tokens = 0, success = true, error = null) {
     stats.dailyStats[date].channels[channel] = makeUsageBucket();
   }
   addUsageRequest(stats.dailyStats[date].channels[channel], tokens, { cacheReadInputTokens, cacheCreationInputTokens });
+  if (!stats.dailyStats[date].ips[clientIp]) {
+    stats.dailyStats[date].ips[clientIp] = makeUsageBucket();
+  }
+  addUsageRequest(stats.dailyStats[date].ips[clientIp], tokens, { cacheReadInputTokens, cacheCreationInputTokens });
   
   // 添加到最近日志（保留最近100条）
   const logEntry = {
@@ -419,9 +516,12 @@ function logRequest(model, channel, tokens = 0, success = true, error = null) {
     tokens: tokens,
     success: success,
     error: error,
+    clientIp,
     cacheHit,
     cacheReadInputTokens,
     cacheCreationInputTokens,
+    ...(options.clientKeyFingerprint ? { clientKeyFingerprint: options.clientKeyFingerprint } : {}),
+    ...(options.clientKeyType ? { clientKeyType: options.clientKeyType } : {}),
   };
   
   stats.recentLogs.unshift(logEntry);
@@ -453,9 +553,12 @@ function rebuildModelMap() {
 }
 rebuildModelMap();
 
-function auth(req, res) {
-  const authHeader = req.headers['authorization'] || '';
-  if (authHeader !== `Bearer ${config.api_key}`) {
+function getBearerToken(req) {
+  const authHeader = String(req.headers['authorization'] || '');
+  return authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+}
+
+function rejectAuth(req, res) {
     res.writeHead(401, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { message: 'Invalid API key', type: 'auth_error' } }));
     writeGatewayLog('request_complete', {
@@ -470,7 +573,28 @@ function auth(req, res) {
       errorMessage: 'Invalid API key',
     });
     return false;
+}
+
+function adminAuth(req, res) {
+  if (getBearerToken(req) !== config.api_key) {
+    return rejectAuth(req, res);
   }
+  req.clientApiKey = config.api_key;
+  req.clientApiKeyFingerprint = fingerprintKey(config.api_key);
+  req.clientApiKeyType = 'admin';
+  return true;
+}
+
+function clientAuth(req, res) {
+  const token = getBearerToken(req);
+  const clientKeys = Array.isArray(config.api_keys) ? config.api_keys : [];
+  const acceptedKeys = [config.api_key, ...clientKeys].filter(Boolean);
+  if (!acceptedKeys.includes(token)) {
+    return rejectAuth(req, res);
+  }
+  req.clientApiKey = token;
+  req.clientApiKeyFingerprint = fingerprintKey(token);
+  req.clientApiKeyType = token === config.api_key ? 'admin' : 'generated';
   return true;
 }
 
@@ -678,7 +802,7 @@ function sanitizePayloadForUpstream(data, upstreamModel) {
   return { data: next, removedParams };
 }
 
-async function proxyRequest(channel, req, res, body, modelName = '', requestId = '', logContext = {}) {
+async function proxyRequest(channel, req, res, body, modelName = '', requestId = '', logContext = {}, channelKey = '') {
   const targetUrl = new URL(channel.base_url);
   // Append the request path (strip /v1 prefix if base_url already has it)
   const reqPath = req.url.startsWith('/v1/') ? req.url.slice(3) : req.url;
@@ -688,7 +812,8 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
   // Forward only necessary headers
   if (req.headers['content-type']) headers['content-type'] = req.headers['content-type'];
   if (req.headers['accept']) headers['accept'] = req.headers['accept'];
-  headers['authorization'] = `Bearer ${channel.key}`;
+  const selectedKey = selectChannelKey(channel, channelKey);
+  headers['authorization'] = `Bearer ${selectedKey.key}`;
   headers['content-length'] = body ? Buffer.byteLength(body) : 0;
   
   return new Promise((resolve, reject) => {
@@ -716,6 +841,9 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
       method: req.method,
       requestBytes: Buffer.byteLength(body || ''),
       inputContent: logContext.inputContent,
+      upstreamKeyIndex: selectedKey.index,
+      upstreamKeyCount: selectedKey.count,
+      upstreamKeyFingerprint: selectedKey.fingerprint,
     });
     
     const proxy = transport.request(options, (proxyRes) => {
@@ -738,7 +866,7 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
         
         // 记录成功的请求
         if (proxyRes.statusCode < 400 && !errorMessage) {
-          logRequest(modelName || 'unknown', channel.name, tokens, true, responseDetails);
+          logRequest(modelName || 'unknown', channel.name, tokens, true, requestLogOptions(logContext, requestId, null, responseDetails));
           writeGatewayLog('request_complete', responseLogFields(logContext, {
             requestId,
             model: modelName || 'unknown',
@@ -751,11 +879,14 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
             totalTokens: responseDetails.totalTokens,
             cacheCreationInputTokens: responseDetails.cacheCreationInputTokens,
             cacheReadInputTokens: responseDetails.cacheReadInputTokens,
+            upstreamKeyIndex: selectedKey.index,
+            upstreamKeyCount: selectedKey.count,
+            upstreamKeyFingerprint: selectedKey.fingerprint,
             outputContent: responseDetails.outputContent,
           }));
         } else {
           const finalErrorMessage = errorMessage || `HTTP ${proxyRes.statusCode}`;
-          logRequest(modelName || 'unknown', channel.name, 0, false, finalErrorMessage);
+          logRequest(modelName || 'unknown', channel.name, 0, false, requestLogOptions(logContext, requestId, finalErrorMessage));
           writeGatewayLog('request_complete', responseLogFields(logContext, {
             requestId,
             model: modelName || 'unknown',
@@ -768,6 +899,9 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
             totalTokens: responseDetails.totalTokens,
             cacheCreationInputTokens: responseDetails.cacheCreationInputTokens,
             cacheReadInputTokens: responseDetails.cacheReadInputTokens,
+            upstreamKeyIndex: selectedKey.index,
+            upstreamKeyCount: selectedKey.count,
+            upstreamKeyFingerprint: selectedKey.fingerprint,
             outputContent: responseDetails.outputContent,
             errorMessage: finalErrorMessage,
             responseBody: truncateText(responseData),
@@ -781,7 +915,7 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
     });
     
     proxy.on('error', (err) => {
-      logRequest(modelName || 'unknown', channel.name, 0, false, err.message);
+      logRequest(modelName || 'unknown', channel.name, 0, false, requestLogOptions(logContext, requestId, err.message));
       writeGatewayLog('request_complete', responseLogFields(logContext, {
         requestId,
         model: modelName || 'unknown',
@@ -797,7 +931,7 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
     });
     
     proxy.on('timeout', () => {
-      logRequest(modelName || 'unknown', channel.name, 0, false, 'timeout');
+      logRequest(modelName || 'unknown', channel.name, 0, false, requestLogOptions(logContext, requestId, 'timeout'));
       writeGatewayLog('request_complete', responseLogFields(logContext, {
         requestId,
         model: modelName || 'unknown',
@@ -818,7 +952,7 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
   });
 }
 
-async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel = '', requestedModel = '', requestId = '', logContext = {}) {
+async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel = '', requestedModel = '', requestId = '', logContext = {}, channelKey = '') {
   const parsedBase = new URL(channel.base_url);
   const fullUrl = `${channel.base_url.replace(/\/$/, '')}/messages`;
   const parsed = new URL(fullUrl);
@@ -827,11 +961,12 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
   if (wantsStream) anthropicPayload.stream = true;
   const body = JSON.stringify(anthropicPayload);
   const startedAt = Date.now();
+  const selectedKey = selectChannelKey(channel, channelKey);
 
   const headers = {
     'content-type': 'application/json',
     'accept': 'application/json',
-    'x-api-key': channel.key,
+    'x-api-key': selectedKey.key,
     'anthropic-version': channel.anthropic_version || '2023-06-01',
     'content-length': Buffer.byteLength(body),
   };
@@ -887,6 +1022,9 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
       requestBytes: Buffer.byteLength(body),
       inputContent: logContext.inputContent,
       format: 'anthropic',
+      upstreamKeyIndex: selectedKey.index,
+      upstreamKeyCount: selectedKey.count,
+      upstreamKeyFingerprint: selectedKey.fingerprint,
     });
 
     const proxy = transport.request(options, (proxyRes) => {
@@ -959,7 +1097,7 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
               res.end();
               const usageDetails = extractTokenUsageDetails(openAIData);
               const tokens = usageDetails.totalTokens;
-              logRequest(upstreamModel || requestedModel || 'unknown', channel.name, tokens, true, usageDetails);
+              logRequest(upstreamModel || requestedModel || 'unknown', channel.name, tokens, true, requestLogOptions(logContext, requestId, null, usageDetails));
               writeGatewayLog('request_complete', responseLogFields(logContext, {
                 requestId,
                 model: upstreamModel || 'unknown',
@@ -969,12 +1107,15 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
                 durationMs: Date.now() - startedAt,
                 tokens,
                 ...usageDetails,
+                upstreamKeyIndex: selectedKey.index,
+                upstreamKeyCount: selectedKey.count,
+                upstreamKeyFingerprint: selectedKey.fingerprint,
                 outputContent: truncateText(content),
                 format: 'anthropic_stream_json_fallback',
               }));
               resolve();
             } catch (err) {
-              logRequest(upstreamModel || requestedModel || 'unknown', channel.name, 0, false, err.message);
+              logRequest(upstreamModel || requestedModel || 'unknown', channel.name, 0, false, requestLogOptions(logContext, requestId, err.message));
               writeGatewayLog('request_complete', responseLogFields(logContext, {
                 requestId,
                 model: upstreamModel || 'unknown',
@@ -997,10 +1138,10 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
           res.write('data: [DONE]\n\n');
           res.end();
           const tokens = streamInputTokens + streamOutputTokens;
-          logRequest(upstreamModel || requestedModel || 'unknown', channel.name, tokens, true, {
+          logRequest(upstreamModel || requestedModel || 'unknown', channel.name, tokens, true, requestLogOptions(logContext, requestId, null, {
             cacheCreationInputTokens: streamCacheCreationInputTokens,
             cacheReadInputTokens: streamCacheReadInputTokens,
-          });
+          }));
           writeGatewayLog('request_complete', responseLogFields(logContext, {
             requestId,
             model: upstreamModel || 'unknown',
@@ -1014,6 +1155,9 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
             totalTokens: tokens,
             cacheCreationInputTokens: streamCacheCreationInputTokens,
             cacheReadInputTokens: streamCacheReadInputTokens,
+            upstreamKeyIndex: selectedKey.index,
+            upstreamKeyCount: selectedKey.count,
+            upstreamKeyFingerprint: selectedKey.fingerprint,
             outputContent: truncateText(streamOutputContent),
             format: 'anthropic_stream',
           }));
@@ -1024,7 +1168,7 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
         if (proxyRes.statusCode >= 400) {
           const responseDetails = extractResponseLogDetails(responseData);
           const errorMessage = responseDetails.errorMessage || `HTTP ${proxyRes.statusCode}`;
-          logRequest(upstreamModel || requestedModel || 'unknown', channel.name, 0, false, errorMessage);
+          logRequest(upstreamModel || requestedModel || 'unknown', channel.name, 0, false, requestLogOptions(logContext, requestId, errorMessage));
           writeGatewayLog('request_complete', responseLogFields(logContext, {
             requestId,
             model: upstreamModel || 'unknown',
@@ -1051,7 +1195,7 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
           const openAIData = convertAnthropicResponseToOpenAI(anthropicData, requestedModel || upstreamModel);
           const usageDetails = extractTokenUsageDetails(openAIData);
           const tokens = usageDetails.totalTokens;
-          logRequest(upstreamModel || requestedModel || 'unknown', channel.name, tokens, true, usageDetails);
+          logRequest(upstreamModel || requestedModel || 'unknown', channel.name, tokens, true, requestLogOptions(logContext, requestId, null, usageDetails));
           writeGatewayLog('request_complete', responseLogFields(logContext, {
             requestId,
             model: upstreamModel || 'unknown',
@@ -1061,6 +1205,9 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
             durationMs: Date.now() - startedAt,
             tokens,
             ...usageDetails,
+            upstreamKeyIndex: selectedKey.index,
+            upstreamKeyCount: selectedKey.count,
+            upstreamKeyFingerprint: selectedKey.fingerprint,
             outputContent: truncateText(openAIData.choices?.[0]?.message?.content || ''),
             format: 'anthropic',
           }));
@@ -1068,7 +1215,7 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
           res.end(JSON.stringify(openAIData));
           resolve();
         } catch (err) {
-          logRequest(upstreamModel || requestedModel || 'unknown', channel.name, 0, false, err.message);
+          logRequest(upstreamModel || requestedModel || 'unknown', channel.name, 0, false, requestLogOptions(logContext, requestId, err.message));
           writeGatewayLog('request_complete', responseLogFields(logContext, {
             requestId,
             model: upstreamModel || 'unknown',
@@ -1090,7 +1237,7 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
     });
 
     proxy.on('error', (err) => {
-      logRequest(upstreamModel || requestedModel || 'unknown', channel.name, 0, false, err.message);
+      logRequest(upstreamModel || requestedModel || 'unknown', channel.name, 0, false, requestLogOptions(logContext, requestId, err.message));
       writeGatewayLog('request_complete', responseLogFields(logContext, {
         requestId,
         model: upstreamModel || 'unknown',
@@ -1107,7 +1254,7 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
     });
 
     proxy.on('timeout', () => {
-      logRequest(upstreamModel || requestedModel || 'unknown', channel.name, 0, false, 'timeout');
+      logRequest(upstreamModel || requestedModel || 'unknown', channel.name, 0, false, requestLogOptions(logContext, requestId, 'timeout'));
       writeGatewayLog('request_complete', responseLogFields(logContext, {
         requestId,
         model: upstreamModel || 'unknown',
@@ -1254,9 +1401,9 @@ async function handleChatCompletions(req, res, body, requestId) {
   
   try {
     if (channel.format === 'anthropic') {
-      await proxyAnthropicChatRequest(channel, req, res, data, upstreamModel, modelName, requestId, logContext);
+      await proxyAnthropicChatRequest(channel, req, res, data, upstreamModel, modelName, requestId, logContext, entry.channelKey);
     } else {
-      await proxyRequest(channel, req, res, body, upstreamModel, requestId, logContext);
+      await proxyRequest(channel, req, res, body, upstreamModel, requestId, logContext, entry.channelKey);
     }
   } catch (err) {
     console.error(`[${entry.channelKey}] proxy error:`, err.message);
@@ -1318,9 +1465,13 @@ function normalizeImportedConfig(input) {
     ...nextConfig,
     port: Number(nextConfig.port) || config.port || 8300,
     api_key: String(nextConfig.api_key || config.api_key || '').trim(),
+    api_keys: Array.isArray(nextConfig.api_keys) ? nextConfig.api_keys.map(k => String(k).trim()).filter(Boolean) : [],
     channels: nextConfig.channels,
     models: Array.isArray(nextConfig.models) ? nextConfig.models : [],
   };
+  for (const [key, channel] of Object.entries(normalized.channels || {})) {
+    normalized.channels[key] = normalizeChannelForSave(channel);
+  }
   if (normalized.api_key.length < 4) {
     throw new Error('管理 Key 至少 4 位');
   }
@@ -1330,7 +1481,10 @@ function normalizeImportedConfig(input) {
 async function handleConfigAPI(req, res, url, body) {
   if (url === '/api/config' && req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ channels: config.channels }));
+    res.end(JSON.stringify({
+      channels: config.channels,
+      api_keys: config.api_keys || [],
+    }));
     return true;
   }
 
@@ -1356,6 +1510,46 @@ async function handleConfigAPI(req, res, url, body) {
     saveConfig();
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true }));
+    return true;
+  }
+
+  if (url === '/api/config/client-keys/generate' && req.method === 'POST') {
+    const d = JSON.parse(body || '{}');
+    const count = Math.min(Math.max(parseInt(d.count || '1', 10) || 1, 1), 100);
+    const prefix = String(d.prefix || 'key').trim().replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24) || 'key';
+    if (!Array.isArray(config.api_keys)) config.api_keys = [];
+    const existing = new Set(config.api_keys);
+    const created = [];
+    while (created.length < count) {
+      const key = `${prefix}-${crypto.randomBytes(18).toString('base64url')}`;
+      if (!existing.has(key)) {
+        existing.add(key);
+        created.push(key);
+      }
+    }
+    config.api_keys.push(...created);
+    saveConfig();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      ok: true,
+      keys: created,
+      api_keys: config.api_keys,
+    }));
+    return true;
+  }
+
+  if (url === '/api/config/client-keys/delete' && req.method === 'POST') {
+    const d = JSON.parse(body || '{}');
+    const key = String(d.key || '').trim();
+    if (!key || !Array.isArray(config.api_keys) || !config.api_keys.includes(key)) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: '调用 Key 不存在' }));
+      return true;
+    }
+    config.api_keys = config.api_keys.filter(item => item !== key);
+    saveConfig();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, api_keys: config.api_keys }));
     return true;
   }
 
@@ -1404,7 +1598,8 @@ async function handleConfigAPI(req, res, url, body) {
         break;
       }
     }
-    if (!pioneerChannel || !pioneerChannel.key) {
+    const pioneerKeys = getChannelKeys(pioneerChannel || {});
+    if (!pioneerChannel || pioneerKeys.length === 0) {
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: false, error: '未配置 Pioneer 渠道' }));
       return true;
@@ -1413,7 +1608,7 @@ async function handleConfigAPI(req, res, url, body) {
       const billingRes = await new Promise((resolve, reject) => {
         const billingReq = https.request('https://api.pioneer.ai/billing/billing-status', {
           method: 'GET',
-          headers: { 'X-API-Key': pioneerChannel.key },
+          headers: { 'X-API-Key': pioneerKeys[0] },
         }, (r) => {
           let data = '';
           r.on('data', c => data += c);
@@ -1453,6 +1648,7 @@ async function handleConfigAPI(req, res, url, body) {
       totalRequests: 0,
       modelUsage: {},
       channelUsage: {},
+      ipUsage: {},
       dailyStats: {},
       recentLogs: []
     };
@@ -1469,6 +1665,7 @@ async function handleConfigAPI(req, res, url, body) {
       name,
       base_url,
       key,
+      keys,
       models,
       format,
       anthropic_version,
@@ -1494,10 +1691,15 @@ async function handleConfigAPI(req, res, url, body) {
     }
     
     const existingChannel = config.channels[channelKey] || {};
-    config.channels[channelKey] = {
+    const configuredKeys = normalizeKeyList([
+      key || existingChannel.key || '',
+      ...(Array.isArray(keys) ? keys : []),
+    ]);
+    config.channels[channelKey] = normalizeChannelForSave({
       name: name || existingChannel.name || channelKey,
       base_url: base_url || existingChannel.base_url || '',
-      key: key || existingChannel.key || '',
+      key: configuredKeys[0] || '',
+      keys: configuredKeys,
       ...(format || existingChannel.format ? { format: format || existingChannel.format } : {}),
       ...(anthropic_version || existingChannel.anthropic_version ? { anthropic_version: anthropic_version || existingChannel.anthropic_version } : {}),
       ...(prompt_cache_enabled ? { prompt_cache_enabled: true } : {}),
@@ -1507,7 +1709,7 @@ async function handleConfigAPI(req, res, url, body) {
       ...(anthropic_thinking_type === 'adaptive' && anthropic_output_effort ? { anthropic_output_effort } : {}),
       ...(anthropic_thinking_type === 'adaptive' && anthropic_thinking_display ? { anthropic_thinking_display } : {}),
       models: models || [],
-    };
+    });
     
     rebuildModelMap();
     
@@ -1615,9 +1817,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   
-  // API routes - need auth
-  if (!auth(req, res)) return;
-  
   // Collect body for POST
   let body = '';
   if (req.method === 'POST') {
@@ -1630,12 +1829,17 @@ const server = http.createServer(async (req, res) => {
   
   // Route
   if (url.startsWith('/api/')) {
+    if (!adminAuth(req, res)) return;
     const handled = await handleConfigAPI(req, res, url, req.method === 'POST' ? body : '');
     if (!handled) {
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: { message: 'API not found' } }));
     }
     return;
+  }
+
+  if (url.startsWith('/v1/')) {
+    if (!clientAuth(req, res)) return;
   }
   
   if (url === '/v1/models' && req.method === 'GET') {

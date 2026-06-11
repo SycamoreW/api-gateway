@@ -212,6 +212,10 @@
           <div id="channelUsage"><div class="empty">暂无统计</div></div>
         </div>
         <div class="usage-card">
+          <h3>热门 IP</h3>
+          <div id="ipUsage"><div class="empty">暂无统计</div></div>
+        </div>
+        <div class="usage-card">
           <h3>最近请求</h3>
           <div class="recent-list" id="recentUsage"><div class="empty">暂无请求</div></div>
         </div>
@@ -245,7 +249,8 @@ let gatewayLogs = [];
 let logFile = '';
 let gatewayStats = null;
 let billingData = null;
-let statsView = { label: '全部时间', totalRequests: 0, totalTokens: 0, cacheHitCount: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, modelUsage: {}, channelUsage: {}, recentLogs: [] };
+let clientKeys = [];
+let statsView = { label: '全部时间', totalRequests: 0, totalTokens: 0, cacheHitCount: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, modelUsage: {}, channelUsage: {}, ipUsage: {}, recentLogs: [] };
 const HIDDEN_LOG_EVENTS = new Set(['http_request', 'model_params', 'model_routed']);
 
 function toast(msg, ok=true) {
@@ -390,6 +395,7 @@ async function load() {
   try {
     const d = await api('/api/config');
     channels = d.channels || {};
+    clientKeys = d.api_keys || [];
   } catch(e) {
     if (e.status === 401) {
       localStorage.removeItem(KEY_STORAGE);
@@ -524,6 +530,92 @@ function renderLogs() {
   }).join('');
 }
 
+async function copyText(value) {
+  try {
+    await navigator.clipboard.writeText(value);
+    toast('已复制');
+    return;
+  } catch {}
+
+  const textarea = document.createElement('textarea');
+  textarea.value = value;
+  textarea.setAttribute('readonly', '');
+  textarea.style.position = 'fixed';
+  textarea.style.left = '-9999px';
+  textarea.style.top = '0';
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+  textarea.setSelectionRange(0, textarea.value.length);
+  try {
+    const ok = document.execCommand('copy');
+    toast(ok ? '已复制' : '复制失败，请手动复制', ok);
+  } catch {
+    toast('复制失败，请手动复制', false);
+  } finally {
+    document.body.removeChild(textarea);
+  }
+}
+
+function showClientKeysModal() {
+  const rows = clientKeys.length ? clientKeys.map(key => `
+    <div style="display:flex;gap:8px;align-items:center;margin:8px 0">
+      <code style="flex:1;word-break:break-all;background:#0d1117;padding:7px 9px;border-radius:6px">${escapeHtml(key)}</code>
+      <button class="btn btn-outline btn-sm" onclick="copyText(${jsArg(key)})">复制</button>
+      <button class="btn btn-danger btn-sm" onclick="deleteClientKey(${jsArg(key)})">删除</button>
+    </div>
+  `).join('') : '<div class="empty" style="padding:18px">还没有调用 Key</div>';
+  document.getElementById('modalContent').innerHTML = `
+    <h3>调用 Key</h3>
+    <div class="hint">调用 Key 给别人接入 /v1 使用；管理后台仍然使用管理 Key。</div>
+    <label>批量生成数量</label>
+    <input id="clientKeyCount" type="number" min="1" max="100" value="10">
+    <label>前缀</label>
+    <input id="clientKeyPrefix" value="key" placeholder="例如 user">
+    <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+      <button class="btn btn-primary" onclick="generateClientKeys()">批量生成</button>
+      <button class="btn btn-outline" onclick="copyText(clientKeys.join('\\n'))">复制全部</button>
+    </div>
+    <div style="margin-top:14px">${rows}</div>
+    <div class="actions">
+      <button class="btn btn-outline" onclick="closeModal()">关闭</button>
+    </div>`;
+  document.getElementById('modal').classList.add('active');
+}
+
+async function generateClientKeys() {
+  const count = document.getElementById('clientKeyCount').value;
+  const prefix = document.getElementById('clientKeyPrefix').value;
+  try {
+    const res = await api('/api/config/client-keys/generate', {
+      method: 'POST',
+      body: JSON.stringify({ count, prefix })
+    });
+    clientKeys = res.api_keys || [];
+    toast(`已生成 ${res.keys?.length || 0} 个调用 Key`);
+    showClientKeysModal();
+    renderHeaderStats();
+  } catch(e) {
+    toast('生成失败: ' + e.message, false);
+  }
+}
+
+async function deleteClientKey(key) {
+  if (!confirm('确定删除这个调用 Key？')) return;
+  try {
+    const res = await api('/api/config/client-keys/delete', {
+      method: 'POST',
+      body: JSON.stringify({ key })
+    });
+    clientKeys = res.api_keys || [];
+    toast('调用 Key 已删除');
+    showClientKeysModal();
+    renderHeaderStats();
+  } catch(e) {
+    toast('删除失败: ' + e.message, false);
+  }
+}
+
 function getChModels() {
   // Get all models from all channels for the picker
   const all = [];
@@ -537,6 +629,23 @@ function getChModels() {
 
 function formatNumber(value) {
   return Number(value || 0).toLocaleString('zh-CN');
+}
+
+function parseKeyList(value = '') {
+  const seen = new Set();
+  return String(value || '')
+    .split(/\n|,/)
+    .map(item => item.trim())
+    .filter(Boolean)
+    .filter(item => {
+      if (seen.has(item)) return false;
+      seen.add(item);
+      return true;
+    });
+}
+
+function getChannelKeys(ch = {}) {
+  return parseKeyList([ch.key, ...(Array.isArray(ch.keys) ? ch.keys : [])].filter(Boolean).join('\n'));
 }
 
 function addUsage(target, name, item = {}) {
@@ -604,7 +713,7 @@ function getStatsDateRange() {
 function getFilteredStats() {
   const range = getStatsDateRange();
   if (!gatewayStats) {
-    return { label: range.label, totalRequests: 0, totalTokens: 0, cacheHitCount: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, modelUsage: {}, channelUsage: {}, recentLogs: [] };
+    return { label: range.label, totalRequests: 0, totalTokens: 0, cacheHitCount: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, modelUsage: {}, channelUsage: {}, ipUsage: {}, recentLogs: [] };
   }
   if (!range.keys) {
     const modelUsage = gatewayStats.modelUsage || {};
@@ -616,12 +725,13 @@ function getFilteredStats() {
       ...cache,
       modelUsage,
       channelUsage: gatewayStats.channelUsage || {},
+      ipUsage: gatewayStats.ipUsage || {},
       recentLogs: gatewayStats.recentLogs || []
     };
   }
 
   const keySet = new Set(range.keys);
-  const view = { label: range.label, totalRequests: 0, totalTokens: 0, cacheHitCount: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, modelUsage: {}, channelUsage: {}, recentLogs: [] };
+  const view = { label: range.label, totalRequests: 0, totalTokens: 0, cacheHitCount: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, modelUsage: {}, channelUsage: {}, ipUsage: {}, recentLogs: [] };
   for (const key of range.keys) {
     const day = gatewayStats.dailyStats?.[key];
     if (!day) continue;
@@ -629,6 +739,7 @@ function getFilteredStats() {
     view.totalTokens += day.tokens || 0;
     for (const [name, item] of Object.entries(day.models || {})) addUsage(view.modelUsage, name, item);
     for (const [name, item] of Object.entries(day.channels || {})) addUsage(view.channelUsage, name, item);
+    for (const [name, item] of Object.entries(day.ips || {})) addUsage(view.ipUsage, name, item);
   }
   view.recentLogs = (gatewayStats.recentLogs || []).filter(entry => {
     const key = entry.timestamp ? new Date(entry.timestamp).toISOString().slice(0, 10) : '';
@@ -704,6 +815,7 @@ function renderHeaderStats() {
   document.getElementById('stats').innerHTML = `
     <div class="stat"><div class="num">${keys.length}</div><div class="label">渠道</div></div>
     <div class="stat"><div class="num">${totalModels}</div><div class="label">模型</div></div>
+    <div class="stat" style="cursor:pointer" onclick="showClientKeysModal()" title="点击管理调用 Key"><div class="num">${clientKeys.length}</div><div class="label">调用 Key</div></div>
     <div class="stat"><div class="num">${formatNumber(statsView.totalRequests)}</div><div class="label">请求</div><div class="sub">${escapeHtml(statsView.label)}</div></div>
     <div class="stat"><div class="num">${formatNumber(statsView.totalTokens)}</div><div class="label">Token</div><div class="sub">${escapeHtml(statsView.label)}</div></div>
     <div class="stat"><div class="num" style="color:#3fb950">${formatNumber(statsView.cacheHitCount)}</div><div class="label">缓存命中</div><div class="sub">读 ${formatNumber(statsView.cacheReadInputTokens)} tok</div></div>
@@ -717,6 +829,7 @@ function renderUsageStats() {
   document.getElementById('statsUpdated').textContent = gatewayStats ? statsView.label : '未加载';
   document.getElementById('modelUsage').innerHTML = formatUsageRows(statsView.modelUsage);
   document.getElementById('channelUsage').innerHTML = formatUsageRows(statsView.channelUsage);
+  document.getElementById('ipUsage').innerHTML = formatUsageRows(statsView.ipUsage);
   const recent = statsView.recentLogs || [];
   document.getElementById('recentUsage').innerHTML = recent.length ? recent.slice(0, 20).map(entry => `
     <div class="recent-entry ${entry.success ? '' : 'fail'}">
@@ -727,6 +840,7 @@ function renderUsageStats() {
       <div class="recent-meta">
         <span>${entry.success ? '成功' : '失败'}</span>
         <span>${escapeHtml(entry.channel)}</span>
+        ${entry.clientIp ? `<span>${escapeHtml(entry.clientIp)}</span>` : ''}
         <span>${formatNumber(entry.tokens)} tok</span>
         ${entry.cacheHit ? `<span style="color:#3fb950">缓存命中</span>` : ''}
         ${entry.cacheReadInputTokens ? `<span>读缓存 ${formatNumber(entry.cacheReadInputTokens)} tok</span>` : ''}
@@ -752,6 +866,7 @@ function render() {
         <div>
           <span class="channel-name">${escapeHtml(ch.name)}</span>
           <span class="channel-info"> · ${escapeHtml(ch.base_url)}</span>
+          <span class="channel-info"> · ${getChannelKeys(ch).length || 0} keys</span>
         </div>
         <div style="display:flex;gap:6px">
           <button class="btn btn-outline btn-sm" onclick="testChannel(${jsArg(ckey)})">测试</button>
@@ -792,6 +907,9 @@ async function showAddChannel() {
     <input id="chUrl" placeholder="https://api.example.com/v1">
     <label>API Key</label>
     <input id="chKey" type="password" placeholder="上游 API Key">
+    <label>上游 Key 池</label>
+    <textarea id="chKeys" placeholder="一行一个；会按请求轮询。可把主 Key 也写在这里。"></textarea>
+    <div class="hint">保存后会把 API Key 和这里的所有 Key 去重；同一渠道按请求轮询使用。</div>
     <label>上游格式</label>
     <select id="chFormat" onchange="toggleAnthropicFields()">
       <option value="">OpenAI 兼容</option>
@@ -857,7 +975,7 @@ async function showAddChannel() {
 
 async function probeModels() {
   const url = document.getElementById('chUrl').value.trim();
-  const key = document.getElementById('chKey').value.trim();
+  const key = document.getElementById('chKey').value.trim() || parseKeyList(document.getElementById('chKeys')?.value || '')[0] || '';
   const result = document.getElementById('probeResult');
   const picker = document.getElementById('modelPicker');
   
@@ -894,6 +1012,9 @@ function editChannel(ckey) {
     <input id="chUrl" value="${ch.base_url || ''}">
     <label>API Key</label>
     <input id="chKey" type="password" value="${ch.key || ''}" placeholder="留空保持不变">
+    <label>上游 Key 池</label>
+    <textarea id="chKeys" placeholder="一行一个；会按请求轮询。">${escapeHtml(getChannelKeys(ch).join('\n'))}</textarea>
+    <div class="hint">保存后会把 API Key 和这里的所有 Key 去重；同一渠道按请求轮询使用。</div>
     <label>上游格式</label>
     <select id="chFormat" onchange="toggleAnthropicFields()">
       <option value="" ${ch.format !== 'anthropic' ? 'selected' : ''}>OpenAI 兼容</option>
@@ -995,11 +1116,12 @@ async function saveChannel() {
   const prefix = document.getElementById('chPrefix')?.value.trim() || '';
   const url = document.getElementById('chUrl').value.trim();
   const key = document.getElementById('chKey').value.trim();
+  const upstreamKeys = parseKeyList([key, document.getElementById('chKeys')?.value || ''].filter(Boolean).join('\n'));
   const models = document.getElementById('chModels').value.split(',').map(m => m.trim()).filter(Boolean);
   const channelOptions = collectChannelOptions();
   
   if (!name || !url) { toast('名称和地址必填', false); return; }
-  if (!editingKey && !key) { toast('新渠道必须填写 API Key', false); return; }
+  if (!editingKey && upstreamKeys.length === 0) { toast('新渠道必须填写至少一个 API Key', false); return; }
   if (models.length === 0) { toast('至少填一个模型', false); return; }
   
   // Determine channel key
@@ -1018,7 +1140,8 @@ async function saveChannel() {
         body: JSON.stringify({
           channelKey: ckey,
           name, base_url: url,
-          key,
+          key: upstreamKeys[0] || key,
+          keys: upstreamKeys,
           models: finalModels,
           ...channelOptions,
           isNew: true,
@@ -1036,7 +1159,8 @@ async function saveChannel() {
       body: JSON.stringify({
         channelKey: ckey,
         name, base_url: url,
-        key: key || channels[editingKey]?.key,
+        key: upstreamKeys[0] || key || channels[editingKey]?.key,
+        keys: upstreamKeys.length ? upstreamKeys : getChannelKeys(channels[editingKey]),
         models,
         ...channelOptions,
         isNew: false,
