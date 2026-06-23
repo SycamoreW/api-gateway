@@ -4,7 +4,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
-const config = JSON.parse(fs.readFileSync(path.resolve(process.argv[2] || 'config.json'), 'utf-8'));
+const CONFIG_FILE = path.resolve(process.argv[2] || 'config.json');
+const config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
 if (!Array.isArray(config.api_keys)) config.api_keys = [];
 const LOG_DIR = path.resolve('logs');
 const LOG_MAX_BODY_CHARS = 2000;
@@ -2218,7 +2219,7 @@ async function handleModels(req, res) {
 
 // Config management helpers
 function saveConfig() {
-  fs.writeFileSync(path.resolve('config.json'), JSON.stringify(config, null, 2));
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
 }
 
 function normalizeImportedConfig(input) {
@@ -2496,6 +2497,7 @@ async function handleConfigAPI(req, res, url, body) {
       anthropic_output_effort,
       anthropic_thinking_display,
       isNew,
+      previousChannelKey,
     } = d;
     
     if (!channelKey) {
@@ -2510,7 +2512,22 @@ async function handleConfigAPI(req, res, url, body) {
       return true;
     }
     
-    const existingChannel = config.channels[channelKey] || {};
+    const oldChannelKey = !isNew && previousChannelKey ? String(previousChannelKey) : channelKey;
+    const isRename = !isNew && oldChannelKey !== channelKey;
+
+    if (!isNew && oldChannelKey && !config.channels[oldChannelKey]) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: '原渠道不存在' }));
+      return true;
+    }
+
+    if (isRename && config.channels[channelKey]) {
+      res.writeHead(409, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: '新前缀已存在' }));
+      return true;
+    }
+
+    const existingChannel = config.channels[oldChannelKey] || config.channels[channelKey] || {};
     const configuredKeys = normalizeKeyList([
       key || existingChannel.key || '',
       ...(Array.isArray(keys) ? keys : []),
@@ -2530,6 +2547,15 @@ async function handleConfigAPI(req, res, url, body) {
       models: models || [],
     });
     
+    if (isRename) {
+      delete config.channels[oldChannelKey];
+      channelKeyCursors.delete(oldChannelKey);
+      saveClientKeyEntries(getClientKeyEntries().map(entry => ({
+        ...entry,
+        allowed_channels: normalizeStringArray(entry.allowed_channels.map(key => key === oldChannelKey ? channelKey : key)),
+      })));
+    }
+
     rebuildModelMap();
     
     saveConfig();

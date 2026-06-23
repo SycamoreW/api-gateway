@@ -307,7 +307,8 @@ function stripOwnModelPrefix(model = '', prefix = '') {
 }
 
 function getCurrentModelPrefix() {
-  return document.getElementById('chPrefix')?.value.trim() || editingKey || '';
+  const input = document.getElementById('chPrefix');
+  return input ? input.value.trim() : (editingKey || '');
 }
 
 function applyModelPrefix(models = [], prefix = '') {
@@ -317,6 +318,11 @@ function applyModelPrefix(models = [], prefix = '') {
     const bare = stripOwnModelPrefix(model, ownPrefix);
     return `[${ownPrefix}]${bare}`;
   });
+}
+
+function normalizeModelsForPrefix(models = [], nextPrefix = '', previousPrefix = '') {
+  const cleaned = models.map(model => stripOwnModelPrefix(stripOwnModelPrefix(model, previousPrefix), nextPrefix));
+  return applyModelPrefix(cleaned, nextPrefix);
 }
 
 function makeChannelKey(name = '', baseUrl = '') {
@@ -1281,12 +1287,12 @@ function editChannel(ckey) {
   document.getElementById('modalContent').innerHTML = `
     <h3>编辑渠道</h3>
     <label>渠道名称</label>
-    <input id="chName" value="${ch.name}">
-    <label>前缀</label>
-    <input id="chPrefix" placeholder="当前前缀: ${ckey} (不可改)" readonly>
-    <div class="hint">前缀在添加时就固定了，要改前缀请删除后重新添加</div>
+    <input id="chName" value="${escapeHtml(ch.name)}">
+    <label>前缀 (模型名显示前缀)</label>
+    <input id="chPrefix" value="${escapeHtml(ckey)}" placeholder="例如: ds (留空=不添加前缀)">
+    <div class="hint">保存后会同步更新渠道 key 和模型名前缀。</div>
     <label>API 地址</label>
-    <input id="chUrl" value="${ch.base_url || ''}">
+    <input id="chUrl" value="${escapeHtml(ch.base_url || '')}">
     <label>API Key</label>
     <input id="chKey" type="password" value="${ch.key || ''}" placeholder="留空保持不变">
     <label>上游 Key 池</label>
@@ -1404,12 +1410,10 @@ async function saveChannel() {
   
   // Determine channel key
   let ckey;
-  if (editingKey) {
-    ckey = editingKey;
-  } else {
+  if (!editingKey) {
     ckey = prefix || makeChannelKey(name, url);
     // Re-apply only this gateway's wrapper; keep upstream provider tags.
-    const finalModels = applyModelPrefix(models, prefix);
+    const finalModels = normalizeModelsForPrefix(models, prefix);
     document.getElementById('chModels').value = finalModels.join(', ');
     // Save with raw key
     try {
@@ -1431,13 +1435,15 @@ async function saveChannel() {
     return;
   }
   
-  const finalModels = applyModelPrefix(models, ckey);
+  ckey = prefix || makeChannelKey(name, url);
+  const finalModels = normalizeModelsForPrefix(models, prefix, editingKey);
   document.getElementById('chModels').value = finalModels.join(', ');
 
   try {
     const res = await api('/api/config/save', {
       method: 'POST',
       body: JSON.stringify({
+        previousChannelKey: editingKey,
         channelKey: ckey,
         name, base_url: url,
         key: upstreamKeys[0] || key || channels[editingKey]?.key,
