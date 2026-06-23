@@ -367,6 +367,73 @@ function summarizePioneerBilling(items = []) {
   };
 }
 
+function findPioneerChannelEntry() {
+  for (const [channelKey, channel] of Object.entries(config.channels || {})) {
+    if (channel?.base_url && String(channel.base_url).includes('api.pioneer.ai')) {
+      return { channelKey, channel };
+    }
+  }
+  return null;
+}
+
+async function fetchPioneerBillingItem(key, index) {
+  const item = {
+    index,
+    fingerprint: fingerprintKey(key),
+    ok: false,
+    billing: null,
+    error: '',
+  };
+  try {
+    item.billing = await fetchPioneerBilling(key);
+    item.ok = true;
+  } catch (err) {
+    item.error = err.message || '查询失败';
+  }
+  return item;
+}
+
+async function getPioneerBillingSummary() {
+  const entry = findPioneerChannelEntry();
+  const pioneerKeys = getChannelKeys(entry?.channel || {});
+  if (!entry || pioneerKeys.length === 0) {
+    const err = new Error('未配置 Pioneer 渠道');
+    err.statusCode = 404;
+    throw err;
+  }
+  const items = await Promise.all(pioneerKeys.map(fetchPioneerBillingItem));
+  const billing = summarizePioneerBilling(items);
+  if (billing.successful_key_count === 0) {
+    throw new Error(items.map(item => `#${item.index + 1}: ${item.error}`).join('; ') || 'Pioneer 额度查询失败');
+  }
+  return { ...entry, billing };
+}
+
+const PIONEER_BILLING_MODEL_PREFIX = 'pio-';
+const LEGACY_PIONEER_BILLING_MODEL_PREFIX = 'pio-billing/';
+const PIONEER_BILLING_DISPLAY_MODEL_RE = /^pio-\d+(?:\.\d+)?$/;
+
+function isPioneerBillingDisplayModel(model = '') {
+  const value = String(model || '');
+  return value.startsWith(LEGACY_PIONEER_BILLING_MODEL_PREFIX) || PIONEER_BILLING_DISPLAY_MODEL_RE.test(value) || value.startsWith('pio-error-');
+}
+
+function moneySlug(value) {
+  return toMoneyNumber(value).toFixed(2);
+}
+
+function makePioneerBillingModelId(billing) {
+  return `${PIONEER_BILLING_MODEL_PREFIX}${moneySlug(billing?.free_tier_remaining)}`;
+}
+
+function makePioneerBillingErrorModelId(error) {
+  const reason = String(error?.message || error || 'query-failed')
+    .replace(/[^a-z0-9]+/gi, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48) || 'query-failed';
+  return `${PIONEER_BILLING_MODEL_PREFIX}error-${reason}`;
+}
+
 function normalizeChannelForSave(channel = {}) {
   const keys = getChannelKeys(channel);
   const next = { ...channel };
@@ -413,9 +480,11 @@ if (fs.existsSync(STATS_FILE)) {
     channelUsage: {},
     ipUsage: {},
     dailyStats: {},
+    hourlyStats: {},
     recentLogs: []
   };
 }
+if (!stats.hourlyStats || typeof stats.hourlyStats !== 'object') stats.hourlyStats = {};
 
 // 保存统计数据
 function saveStats() {
@@ -439,6 +508,27 @@ function addUsageRequest(bucket, tokens, options = {}) {
   bucket.cacheCreationInputTokens += cacheCreationInputTokens;
 }
 
+function ensureUsageScope(parent, key) {
+  if (!parent[key]) parent[key] = { requests: 0, tokens: 0, models: {}, channels: {}, ips: {} };
+  if (!parent[key].models) parent[key].models = {};
+  if (!parent[key].channels) parent[key].channels = {};
+  if (!parent[key].ips) parent[key].ips = {};
+  return parent[key];
+}
+
+function addUsageToMap(map, key, tokens, options = {}) {
+  if (!map[key]) map[key] = makeUsageBucket();
+  addUsageRequest(map[key], tokens, options);
+}
+
+function addUsageToScope(scope, model, channel, clientIp, tokens, options = {}) {
+  scope.requests++;
+  scope.tokens += tokens;
+  addUsageToMap(scope.models, model, tokens, options);
+  addUsageToMap(scope.channels, channel, tokens, options);
+  addUsageToMap(scope.ips, clientIp, tokens, options);
+}
+
 function applyUsageCacheFromLogs(bucket, logs) {
   if (!bucket || !Array.isArray(logs)) return false;
   if (bucket.cacheReadInputTokens != null && bucket.cacheCreationInputTokens != null && bucket.cacheHitCount != null) return false;
@@ -449,38 +539,67 @@ function applyUsageCacheFromLogs(bucket, logs) {
   return true;
 }
 
+function backfillUsageGroupCache(group = {}, logs = [], field) {
+  let changed = false;
+  for (const [key, bucket] of Object.entries(group || {})) {
+    changed = applyUsageCacheFromLogs(bucket, logs.filter(entry => entry[field] === key)) || changed;
+  }
+  return changed;
+}
+
+function backfillUsageScopeCache(scope = {}, logs = []) {
+  return [
+    backfillUsageGroupCache(scope.models, logs, 'model'),
+    backfillUsageGroupCache(scope.channels, logs, 'channel'),
+    backfillUsageGroupCache(scope.ips, logs, 'clientIp'),
+  ].some(Boolean);
+}
+
 function backfillUsageCacheFromRecentLogs() {
   const recentLogs = Array.isArray(stats.recentLogs) ? stats.recentLogs : [];
   let changed = false;
 
-  for (const [model, bucket] of Object.entries(stats.modelUsage || {})) {
-    changed = applyUsageCacheFromLogs(bucket, recentLogs.filter(entry => entry.model === model)) || changed;
-  }
-  for (const [channel, bucket] of Object.entries(stats.channelUsage || {})) {
-    changed = applyUsageCacheFromLogs(bucket, recentLogs.filter(entry => entry.channel === channel)) || changed;
-  }
-  for (const [ip, bucket] of Object.entries(stats.ipUsage || {})) {
-    changed = applyUsageCacheFromLogs(bucket, recentLogs.filter(entry => entry.clientIp === ip)) || changed;
-  }
+  changed = backfillUsageGroupCache(stats.modelUsage, recentLogs, 'model') || changed;
+  changed = backfillUsageGroupCache(stats.channelUsage, recentLogs, 'channel') || changed;
+  changed = backfillUsageGroupCache(stats.ipUsage, recentLogs, 'clientIp') || changed;
   for (const [date, day] of Object.entries(stats.dailyStats || {})) {
     const dayLogs = recentLogs.filter(entry => {
       if (!entry.timestamp) return false;
       return new Date(entry.timestamp).toISOString().slice(0, 10) === date;
     });
-    for (const [model, bucket] of Object.entries(day.models || {})) {
-      changed = applyUsageCacheFromLogs(bucket, dayLogs.filter(entry => entry.model === model)) || changed;
-    }
-    for (const [channel, bucket] of Object.entries(day.channels || {})) {
-      changed = applyUsageCacheFromLogs(bucket, dayLogs.filter(entry => entry.channel === channel)) || changed;
-    }
-    for (const [ip, bucket] of Object.entries(day.ips || {})) {
-      changed = applyUsageCacheFromLogs(bucket, dayLogs.filter(entry => entry.clientIp === ip)) || changed;
-    }
+    changed = backfillUsageScopeCache(day, dayLogs) || changed;
+  }
+
+  for (const [hour, bucket] of Object.entries(stats.hourlyStats || {})) {
+    const hourLogs = recentLogs.filter(entry => {
+      if (!entry.timestamp) return false;
+      return new Date(entry.timestamp).toISOString().slice(0, 13) === hour;
+    });
+    changed = backfillUsageScopeCache(bucket, hourLogs) || changed;
   }
 
   if (changed) saveStats();
 }
 
+function backfillHourlyStatsFromRecentLogs() {
+  if (Object.keys(stats.hourlyStats || {}).length > 0) return;
+  const recentLogs = Array.isArray(stats.recentLogs) ? stats.recentLogs : [];
+  for (const entry of recentLogs) {
+    if (!entry.timestamp) continue;
+    const hour = new Date(entry.timestamp).toISOString().slice(0, 13);
+    const model = entry.model || 'unknown';
+    const channel = entry.channel || 'unknown';
+    const clientIp = entry.clientIp || 'unknown';
+    const tokens = toTokenNumber(entry.tokens);
+    addUsageToScope(ensureUsageScope(stats.hourlyStats, hour), model, channel, clientIp, tokens, {
+      cacheReadInputTokens: entry.cacheReadInputTokens,
+      cacheCreationInputTokens: entry.cacheCreationInputTokens,
+    });
+  }
+  if (recentLogs.length) saveStats();
+}
+
+backfillHourlyStatsFromRecentLogs();
 backfillUsageCacheFromRecentLogs();
 
 // 记录访问日志
@@ -494,7 +613,9 @@ function logRequest(model, channel, tokens = 0, success = true, error = null) {
   const cacheCreationInputTokens = toTokenNumber(options.cacheCreationInputTokens);
   const cacheHit = cacheReadInputTokens > 0;
   const now = new Date();
-  const date = now.toISOString().split('T')[0];
+  const isoTime = now.toISOString();
+  const date = isoTime.slice(0, 10);
+  const hour = isoTime.slice(0, 13);
   const time = now.toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai' });
   
   // 更新总计数
@@ -520,27 +641,9 @@ function logRequest(model, channel, tokens = 0, success = true, error = null) {
   }
   addUsageRequest(stats.ipUsage[clientIp], tokens, { cacheReadInputTokens, cacheCreationInputTokens });
   
-  // 更新每日统计
-  if (!stats.dailyStats[date]) {
-    stats.dailyStats[date] = { requests: 0, tokens: 0, models: {}, channels: {}, ips: {} };
-  }
-  if (!stats.dailyStats[date].models) stats.dailyStats[date].models = {};
-  if (!stats.dailyStats[date].channels) stats.dailyStats[date].channels = {};
-  if (!stats.dailyStats[date].ips) stats.dailyStats[date].ips = {};
-  stats.dailyStats[date].requests++;
-  stats.dailyStats[date].tokens += tokens;
-  if (!stats.dailyStats[date].models[model]) {
-    stats.dailyStats[date].models[model] = makeUsageBucket();
-  }
-  addUsageRequest(stats.dailyStats[date].models[model], tokens, { cacheReadInputTokens, cacheCreationInputTokens });
-  if (!stats.dailyStats[date].channels[channel]) {
-    stats.dailyStats[date].channels[channel] = makeUsageBucket();
-  }
-  addUsageRequest(stats.dailyStats[date].channels[channel], tokens, { cacheReadInputTokens, cacheCreationInputTokens });
-  if (!stats.dailyStats[date].ips[clientIp]) {
-    stats.dailyStats[date].ips[clientIp] = makeUsageBucket();
-  }
-  addUsageRequest(stats.dailyStats[date].ips[clientIp], tokens, { cacheReadInputTokens, cacheCreationInputTokens });
+  // 更新每日和每小时统计
+  addUsageToScope(ensureUsageScope(stats.dailyStats, date), model, channel, clientIp, tokens, { cacheReadInputTokens, cacheCreationInputTokens });
+  addUsageToScope(ensureUsageScope(stats.hourlyStats, hour), model, channel, clientIp, tokens, { cacheReadInputTokens, cacheCreationInputTokens });
   
   // 添加到最近日志（保留最近100条）
   const logEntry = {
@@ -2037,6 +2140,23 @@ async function handleChatCompletions(req, res, body, requestId) {
     });
     return;
   }
+
+  if (isPioneerBillingDisplayModel(modelName)) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'Pioneer 额度展示模型不能用于对话', type: 'display_model_not_callable' } }));
+    logRequest(modelName, 'none', 0, false, requestLogOptions(logContext, requestId, 'display_model_not_callable'));
+    writeGatewayLog('request_complete', responseLogFields(logContext, {
+      requestId,
+      model: modelName,
+      channel: 'none',
+      statusCode: 400,
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+      errorMessage: 'display_model_not_callable',
+    }));
+    return;
+  }
   
   let entry = modelMap.get(modelName);
   if (entry && !clientCanUseModel(req, modelName, entry.channelKey)) {
@@ -2209,6 +2329,26 @@ async function handleModels(req, res) {
         object: 'model',
         created: 0,
         owned_by: ch.name,
+      });
+    }
+  }
+
+  const pioneerEntry = findPioneerChannelEntry();
+  if (pioneerEntry && clientCanUseChannel(req, pioneerEntry.channelKey)) {
+    try {
+      const { billing } = await getPioneerBillingSummary();
+      models.push({
+        id: makePioneerBillingModelId(billing),
+        object: 'model',
+        created: 0,
+        owned_by: 'Pioneer 额度',
+      });
+    } catch (err) {
+      models.push({
+        id: makePioneerBillingErrorModelId(err),
+        object: 'model',
+        created: 0,
+        owned_by: 'Pioneer 额度',
       });
     }
   }
@@ -2413,46 +2553,13 @@ async function handleConfigAPI(req, res, url, body) {
   // 统计数据 API
   // Pioneer 额度查询 API
   if (url === '/api/billing' && req.method === 'GET') {
-    // 查找 base_url 为 Pioneer 官方的渠道
-    let pioneerChannel = null;
-    for (const ch of Object.values(config.channels)) {
-      if (ch.base_url && ch.base_url.includes('api.pioneer.ai')) {
-        pioneerChannel = ch;
-        break;
-      }
-    }
-    const pioneerKeys = getChannelKeys(pioneerChannel || {});
-    if (!pioneerChannel || pioneerKeys.length === 0) {
-      res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: false, error: '未配置 Pioneer 渠道' }));
-      return true;
-    }
     try {
-      const items = await Promise.all(pioneerKeys.map(async (key, index) => {
-        const item = {
-          index,
-          fingerprint: fingerprintKey(key),
-          ok: false,
-          billing: null,
-          error: '',
-        };
-        try {
-          item.billing = await fetchPioneerBilling(key);
-          item.ok = true;
-        } catch (err) {
-          item.error = err.message || '查询失败';
-        }
-        return item;
-      }));
-      const billingRes = summarizePioneerBilling(items);
-      if (billingRes.successful_key_count === 0) {
-        throw new Error(items.map(item => `#${item.index + 1}: ${item.error}`).join('; ') || 'Pioneer 额度查询失败');
-      }
+      const { billing } = await getPioneerBillingSummary();
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, billing: billingRes }));
+      res.end(JSON.stringify({ ok: true, billing }));
       return true;
     } catch (err) {
-      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.writeHead(err.statusCode || 502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: false, error: err.message }));
       return true;
     }
@@ -2471,6 +2578,7 @@ async function handleConfigAPI(req, res, url, body) {
       channelUsage: {},
       ipUsage: {},
       dailyStats: {},
+      hourlyStats: {},
       recentLogs: []
     };
     saveStats();
