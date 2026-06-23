@@ -55,23 +55,6 @@ function writeGatewayLog(event, fields = {}) {
   }
 }
 
-function readGatewayLogs(limit = 100) {
-  try {
-    const file = currentLogFile();
-    if (!fs.existsSync(file)) return [];
-    const lines = fs.readFileSync(file, 'utf-8').trim().split('\n').filter(Boolean);
-    return lines.slice(-limit).reverse().map((line) => {
-      try {
-        return JSON.parse(line);
-      } catch {
-        return { timestamp: null, event: 'parse_error', raw: truncateText(line) };
-      }
-    });
-  } catch (err) {
-    return [{ timestamp: new Date().toISOString(), event: 'read_error', error: err.message }];
-  }
-}
-
 function readVisibleGatewayLogs(limit = 100) {
   try {
     const file = currentLogFile();
@@ -107,10 +90,6 @@ function fingerprintKey(key = '') {
 function toTokenNumber(value) {
   const number = Number(value);
   return Number.isFinite(number) && number > 0 ? number : 0;
-}
-
-function extractTokenUsage(data) {
-  return extractTokenUsageDetails(data).totalTokens;
 }
 
 function extractTokenUsageDetails(data) {
@@ -390,6 +369,11 @@ function summarizePioneerBilling(items = []) {
 function normalizeChannelForSave(channel = {}) {
   const keys = getChannelKeys(channel);
   const next = { ...channel };
+  if (next.prompt_cache_enabled) {
+    next.prompt_cache_ttl = normalizePromptCacheTtl(next.prompt_cache_ttl);
+  } else {
+    delete next.prompt_cache_ttl;
+  }
   if (keys.length > 0) {
     next.key = keys[0];
     if (keys.length > 1) next.keys = keys;
@@ -399,6 +383,10 @@ function normalizeChannelForSave(channel = {}) {
     delete next.keys;
   }
   return next;
+}
+
+function normalizePromptCacheTtl(ttl = '') {
+  return String(ttl || '').trim() === '1h' ? '1h' : '5m';
 }
 
 function writeAccessLog(req, res, event, fields = {}) {
@@ -591,22 +579,161 @@ const modelMap = new Map(); // modelName -> { channelKey, upstreamModel }
 function rebuildModelMap() {
   modelMap.clear();
   for (const [ckey, ch] of Object.entries(config.channels)) {
+    const overrides = (ch && typeof ch.model_overrides === 'object' && ch.model_overrides) || {};
     for (const m of ch.models) {
-      modelMap.set(m, { channelKey: ckey, upstreamModel: m });
+      // Allow per-channel model_overrides to rewrite the upstream model id.
+      // Example: { "pioneer/auto": "pio/claude-opus-4-7" } makes inbound
+      // `pioneer/auto` resolve to the same channel but forward `claude-opus-4-7`
+      // (after stripModelPrefix) to the upstream provider.
+      const override = Object.prototype.hasOwnProperty.call(overrides, m) ? overrides[m] : null;
+      const upstreamModel = (typeof override === 'string' && override.trim()) ? override.trim() : m;
+      modelMap.set(m, { channelKey: ckey, upstreamModel });
     }
   }
 
 }
 rebuildModelMap();
 
+function normalizeStringArray(value) {
+  const items = Array.isArray(value) ? value : [];
+  return [...new Set(items.map(item => String(item || '').trim()).filter(Boolean))];
+}
+
+function normalizeExpiresAt(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const time = Date.parse(raw);
+  if (!Number.isFinite(time)) return '';
+  return new Date(time).toISOString();
+}
+
+function normalizeClientKeyEntry(entry) {
+  if (typeof entry === 'string') {
+    const key = entry.trim();
+    return key ? {
+      key,
+      name: '',
+      allowed_channels: [],
+      allowed_models: [],
+      quota_limit: 0,
+      quota_used: 0,
+      expires_at: '',
+      enabled: true,
+    } : null;
+  }
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
+  const key = String(entry.key || '').trim();
+  if (!key) return null;
+  const quotaLimit = Math.max(0, Math.floor(Number(entry.quota_limit) || 0));
+  const quotaUsed = Math.max(0, Math.floor(Number(entry.quota_used) || 0));
+  return {
+    key,
+    name: String(entry.name || '').trim(),
+    allowed_channels: normalizeStringArray(entry.allowed_channels),
+    allowed_models: normalizeStringArray(entry.allowed_models),
+    quota_limit: quotaLimit,
+    quota_used: quotaUsed,
+    expires_at: normalizeExpiresAt(entry.expires_at),
+    enabled: entry.enabled !== false,
+  };
+}
+
+function getClientKeyEntries() {
+  return (Array.isArray(config.api_keys) ? config.api_keys : [])
+    .map(normalizeClientKeyEntry)
+    .filter(Boolean);
+}
+
+function saveClientKeyEntries(entries) {
+  config.api_keys = entries.map(entry => ({
+    key: entry.key,
+    ...(entry.name ? { name: entry.name } : {}),
+    ...(entry.allowed_channels?.length ? { allowed_channels: entry.allowed_channels } : {}),
+    ...(entry.allowed_models?.length ? { allowed_models: entry.allowed_models } : {}),
+    ...(entry.quota_limit > 0 ? { quota_limit: entry.quota_limit } : {}),
+    ...(entry.quota_used > 0 ? { quota_used: entry.quota_used } : {}),
+    ...(entry.expires_at ? { expires_at: entry.expires_at } : {}),
+    ...(entry.enabled === false ? { enabled: false } : {}),
+  }));
+}
+
+function findClientKeyEntry(token) {
+  return getClientKeyEntries().find(entry => entry.key === token) || null;
+}
+
+function isClientKeyExpired(entry = {}) {
+  if (!entry.expires_at) return false;
+  const time = Date.parse(entry.expires_at);
+  return Number.isFinite(time) && time <= Date.now();
+}
+
+function clientCanUseChannel(req, channelKey = '') {
+  if (req.clientApiKeyType === 'admin') return true;
+  const allowedChannels = req.clientAllowedChannels || [];
+  if (allowedChannels.length === 0) return true;
+  return allowedChannels.includes(channelKey);
+}
+
+function clientCanUseModel(req, modelName = '', channelKey = '') {
+  if (!clientCanUseChannel(req, channelKey)) return false;
+  if (req.clientApiKeyType === 'admin') return true;
+  const allowedModels = req.clientAllowedModels || [];
+  if (allowedModels.length === 0) return true;
+  return allowedModels.includes(modelName);
+}
+
+function getAccessibleModelEntries(req) {
+  return [...modelMap.entries()].filter(([model, entry]) => clientCanUseModel(req, model, entry.channelKey));
+}
+
+function getModelQuotaCost(modelName = '') {
+  return 1;
+}
+
+function consumeClientQuota(req, modelName = '') {
+  if (req.clientApiKeyType === 'admin') return { ok: true, cost: 0, remaining: Infinity };
+  const entries = getClientKeyEntries();
+  const index = entries.findIndex(entry => entry.key === req.clientApiKey);
+  if (index < 0) return { ok: false, statusCode: 401, message: 'Invalid API key' };
+
+  const entry = entries[index];
+  const cost = getModelQuotaCost(modelName);
+  const limit = Math.max(0, Math.floor(Number(entry.quota_limit) || 0));
+  const used = Math.max(0, Math.floor(Number(entry.quota_used) || 0));
+  if (limit > 0 && used + cost > limit) {
+    return {
+      ok: false,
+      statusCode: 429,
+      message: `Quota exceeded: need ${cost}, remaining ${Math.max(0, limit - used)}`,
+      cost,
+      limit,
+      used,
+      remaining: Math.max(0, limit - used),
+    };
+  }
+
+  if (limit > 0) {
+    entries[index] = { ...entry, quota_used: used + cost };
+    saveClientKeyEntries(entries);
+    saveConfig();
+  }
+  return {
+    ok: true,
+    cost,
+    limit,
+    used: limit > 0 ? used + cost : used,
+    remaining: limit > 0 ? Math.max(0, limit - used - cost) : Infinity,
+  };
+}
+
 function getBearerToken(req) {
   const authHeader = String(req.headers['authorization'] || '');
   return authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
 }
 
-function rejectAuth(req, res) {
+function rejectAuth(req, res, message = 'Invalid API key', type = 'auth_error') {
     res.writeHead(401, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: { message: 'Invalid API key', type: 'auth_error' } }));
+    res.end(JSON.stringify({ error: { message, type } }));
     writeGatewayLog('request_complete', {
       requestId: res.getHeader('X-Request-Id') || '',
       method: req.method,
@@ -616,7 +743,7 @@ function rejectAuth(req, res) {
       inputTokens: 0,
       outputTokens: 0,
       totalTokens: 0,
-      errorMessage: 'Invalid API key',
+      errorMessage: message,
     });
     return false;
 }
@@ -628,40 +755,160 @@ function adminAuth(req, res) {
   req.clientApiKey = config.api_key;
   req.clientApiKeyFingerprint = fingerprintKey(config.api_key);
   req.clientApiKeyType = 'admin';
+  req.clientAllowedChannels = [];
+  req.clientAllowedModels = [];
   return true;
 }
 
 function clientAuth(req, res) {
   const token = getBearerToken(req);
-  const clientKeys = Array.isArray(config.api_keys) ? config.api_keys : [];
-  const acceptedKeys = [config.api_key, ...clientKeys].filter(Boolean);
-  if (!acceptedKeys.includes(token)) {
+  if (token === config.api_key) {
+    req.clientApiKey = token;
+    req.clientApiKeyFingerprint = fingerprintKey(token);
+    req.clientApiKeyType = 'admin';
+    req.clientAllowedChannels = [];
+    req.clientAllowedModels = [];
+    return true;
+  }
+  const clientKeyEntry = findClientKeyEntry(token);
+  if (!clientKeyEntry) {
     return rejectAuth(req, res);
+  }
+  if (clientKeyEntry.enabled === false) {
+    return rejectAuth(req, res, 'API key disabled', 'auth_error');
+  }
+  if (isClientKeyExpired(clientKeyEntry)) {
+    return rejectAuth(req, res, 'API key expired', 'auth_error');
   }
   req.clientApiKey = token;
   req.clientApiKeyFingerprint = fingerprintKey(token);
-  req.clientApiKeyType = token === config.api_key ? 'admin' : 'generated';
+  req.clientApiKeyType = 'generated';
+  req.clientKeyName = clientKeyEntry.name;
+  req.clientAllowedChannels = clientKeyEntry.allowed_channels || [];
+  req.clientAllowedModels = clientKeyEntry.allowed_models || [];
   return true;
 }
 
-function stripModelPrefix(modelName = '') {
-  return modelName.replace(/^[a-z0-9_]+\//i, '');
+function escapeRegExp(value = '') {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function stripModelPrefix(modelName = '', channelKey = '') {
+  const model = String(modelName || '');
+  const prefix = String(channelKey || '').trim();
+  if (!prefix) return model;
+  const escapedPrefix = escapeRegExp(prefix);
+  // Only remove this gateway's own wrapper. Upstream model names may already
+  // start with provider tags such as [云愿] or [max], and those must be kept.
+  return model
+    .replace(new RegExp(`^\\[${escapedPrefix}\\]`), '')
+    .replace(new RegExp(`^${escapedPrefix}/`, 'i'), '');
 }
 
 function convertOpenAIContentToAnthropic(content) {
+  if (content == null) return '';
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return content;
   return content.map((part) => {
     if (typeof part === 'string') return { type: 'text', text: part };
-    if (part?.type === 'text') return { type: 'text', text: part.text || '' };
+    if (part?.type === 'text') return { ...part, text: part.text || '' };
     return part;
   });
+}
+
+function normalizeOpenAIFinishReason(reason) {
+  if (!reason) return 'stop';
+  const value = String(reason);
+  if (value === 'end_turn' || value === 'stop_sequence') return 'stop';
+  if (value === 'max_tokens') return 'length';
+  if (value === 'tool_use') return 'tool_calls';
+  return value;
+}
+
+function convertOpenAIToolsToAnthropic(tools) {
+  if (!Array.isArray(tools)) return undefined;
+  const converted = [];
+  for (const tool of tools) {
+    const fn = tool?.type === 'function' ? tool.function : tool;
+    const name = fn?.name;
+    if (!name) continue;
+    converted.push({
+      name,
+      description: fn.description || '',
+      input_schema: fn.parameters && typeof fn.parameters === 'object'
+        ? fn.parameters
+        : { type: 'object', properties: {} },
+    });
+  }
+  return converted.length > 0 ? converted : undefined;
+}
+
+function convertOpenAIToolChoiceToAnthropic(toolChoice) {
+  if (!toolChoice || toolChoice === 'auto') return { type: 'auto' };
+  if (toolChoice === 'none') return { type: 'none' };
+  if (toolChoice === 'required') return { type: 'any' };
+  const name = toolChoice?.function?.name || toolChoice?.name;
+  if (name) return { type: 'tool', name };
+  return undefined;
+}
+
+function stringifyToolResultContent(content) {
+  if (content == null) return '';
+  if (typeof content === 'string') return content;
+  return JSON.stringify(content);
+}
+
+function convertOpenAIMessageToAnthropicContent(message) {
+  const content = [];
+  const convertedContent = convertOpenAIContentToAnthropic(message.content);
+  if (Array.isArray(convertedContent)) {
+    content.push(...convertedContent);
+  } else if (convertedContent) {
+    content.push({ type: 'text', text: String(convertedContent) });
+  }
+
+  if (Array.isArray(message.tool_calls)) {
+    for (const call of message.tool_calls) {
+      if (call?.type && call.type !== 'function') continue;
+      const name = call?.function?.name || call?.name;
+      if (!name) continue;
+      let input = {};
+      const rawArgs = call?.function?.arguments ?? call?.input;
+      if (typeof rawArgs === 'string' && rawArgs.trim()) {
+        try { input = JSON.parse(rawArgs); } catch { input = { _raw: rawArgs }; }
+      } else if (rawArgs && typeof rawArgs === 'object') {
+        input = rawArgs;
+      }
+      content.push({
+        type: 'tool_use',
+        id: call.id || `toolu_${newRequestId()}`,
+        name,
+        input,
+      });
+    }
+  }
+
+  return content.length > 0 ? content : '';
 }
 
 function buildPromptCacheControl(ttl = '') {
   const cacheControl = { type: 'ephemeral' };
   if (ttl === '1h') cacheControl.ttl = '1h';
   return cacheControl;
+}
+
+function getPromptCacheControl(data = {}, channel = {}) {
+  return data.cache_control && typeof data.cache_control === 'object'
+    ? data.cache_control
+    : buildPromptCacheControl(channel.prompt_cache_ttl);
+}
+
+function getAnthropicBetaHeader(channel = {}) {
+  if (channel.anthropic_beta) return String(channel.anthropic_beta);
+  if (channel.prompt_cache_enabled && channel.prompt_cache_ttl === '1h') {
+    return 'extended-cache-ttl-2025-04-11';
+  }
+  return '';
 }
 
 function contentPartHasPromptCache(part) {
@@ -697,13 +944,22 @@ function withPromptCacheOnContent(content, cacheControl) {
   return content;
 }
 
+function systemHasPromptCache(system) {
+  if (Array.isArray(system)) return system.some(contentPartHasPromptCache);
+  return false;
+}
+
+function withPromptCacheOnSystem(system, cacheControl) {
+  if (Array.isArray(system)) return withPromptCacheOnContent(system, cacheControl);
+  if (typeof system === 'string') return [{ type: 'text', text: system, cache_control: cacheControl }];
+  return system;
+}
+
 function applyOpenAICompatiblePromptCache(data, channel = {}) {
   if (!data || typeof data !== 'object') return data;
   if (!channel.prompt_cache_enabled || !Array.isArray(data.messages)) return data;
   if (data.messages.some(messageHasPromptCache)) return data;
-  const cacheControl = data.cache_control && typeof data.cache_control === 'object'
-    ? data.cache_control
-    : buildPromptCacheControl(channel.prompt_cache_ttl);
+  const cacheControl = getPromptCacheControl(data, channel);
   const messages = [...data.messages];
   let targetIndex = -1;
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -725,6 +981,41 @@ function applyOpenAICompatiblePromptCache(data, channel = {}) {
     ...rest,
     messages,
   };
+}
+
+function applyAnthropicPromptCache(payload, data, channel = {}) {
+  if (!channel.prompt_cache_enabled) return payload;
+  if (systemHasPromptCache(payload.system) || payload.messages?.some(messageHasPromptCache)) return payload;
+
+  const cacheControl = getPromptCacheControl(data, channel);
+  let next = { ...payload };
+
+  // 断点1：system 是最稳定的前缀，永远优先缓存（修复：之前大 system 场景常常完全不缓存）
+  if (next.system) {
+    next = { ...next, system: withPromptCacheOnSystem(next.system, cacheControl) };
+  }
+
+  // 断点2：在最后一条消息上再打一个，让滚动的对话历史也能命中
+  // （Anthropic 允许最多 4 个 cache breakpoint，system + 末条消息合规）
+  const messages = Array.isArray(next.messages) ? [...next.messages] : [];
+  let targetIndex = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (!message || typeof message !== 'object') continue;
+    if (typeof message.content === 'string' || Array.isArray(message.content)) {
+      targetIndex = i;
+      break;
+    }
+  }
+  if (targetIndex >= 0) {
+    messages[targetIndex] = {
+      ...messages[targetIndex],
+      content: withPromptCacheOnContent(messages[targetIndex].content, cacheControl),
+    };
+    next = { ...next, messages };
+  }
+
+  return next;
 }
 
 function toPositiveInteger(value, fallback = 0) {
@@ -769,9 +1060,23 @@ function convertOpenAIChatToAnthropic(data, realModel, channel = {}) {
       continue;
     }
 
+    if (message.role === 'tool') {
+      messages.push({
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: message.tool_call_id || message.id || '',
+          content: stringifyToolResultContent(message.content),
+        }],
+      });
+      continue;
+    }
+
     messages.push({
       role: message.role === 'assistant' ? 'assistant' : 'user',
-      content: convertOpenAIContentToAnthropic(message.content),
+      content: message.role === 'assistant'
+        ? convertOpenAIMessageToAnthropicContent(message)
+        : convertOpenAIContentToAnthropic(message.content),
     });
   }
 
@@ -780,25 +1085,40 @@ function convertOpenAIChatToAnthropic(data, realModel, channel = {}) {
     messages,
     max_tokens: data.max_tokens || data.max_completion_tokens || 4096,
   };
+  if (channel.name === 'pio' || String(channel.base_url || '').includes('api.pioneer.ai')) {
+    payload.max_tokens = Math.max(Number(payload.max_tokens) || 0, 32768);
+  }
+
+  if (channel.prompt_cache_enabled) {
+    payload.cache_control = getPromptCacheControl(data, channel);
+  }
 
   if (system.length > 0) payload.system = system.join('\n\n');
   if (typeof data.temperature === 'number') payload.temperature = data.temperature;
   if (typeof data.top_p === 'number') payload.top_p = data.top_p;
   if (typeof data.stop === 'string' || Array.isArray(data.stop)) payload.stop_sequences = Array.isArray(data.stop) ? data.stop : [data.stop];
-  if (data.cache_control && typeof data.cache_control === 'object') {
-    payload.cache_control = data.cache_control;
-  } else if (channel.prompt_cache_enabled) {
-    payload.cache_control = buildPromptCacheControl(channel.prompt_cache_ttl);
-  }
+  const tools = convertOpenAIToolsToAnthropic(data.tools);
+  if (tools) payload.tools = tools;
+  const toolChoice = convertOpenAIToolChoiceToAnthropic(data.tool_choice);
+  if (toolChoice) payload.tool_choice = toolChoice;
   applyAnthropicThinking(payload, data, channel);
 
-  return payload;
+  return applyAnthropicPromptCache(payload, data, channel);
 }
 
 function convertAnthropicResponseToOpenAI(data, requestedModel) {
-  const text = Array.isArray(data.content)
-    ? data.content.map((part) => part?.text || '').join('')
-    : '';
+  const content = Array.isArray(data.content) ? data.content : [];
+  const text = content.map((part) => part?.type === 'text' ? (part.text || '') : '').join('');
+  const toolCalls = content
+    .filter((part) => part?.type === 'tool_use' && part.name)
+    .map((part) => ({
+      id: part.id || `call_${newRequestId()}`,
+      type: 'function',
+      function: {
+        name: part.name,
+        arguments: JSON.stringify(part.input || {}),
+      },
+    }));
   const usage = data.usage || {};
   const inputTokens = usage.input_tokens || 0;
   const outputTokens = usage.output_tokens || 0;
@@ -815,9 +1135,10 @@ function convertAnthropicResponseToOpenAI(data, requestedModel) {
         index: 0,
         message: {
           role: 'assistant',
-          content: text,
+          content: text || null,
+          ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
         },
-        finish_reason: data.stop_reason || 'stop',
+        finish_reason: normalizeOpenAIFinishReason(data.stop_reason),
       },
     ],
     usage: {
@@ -828,6 +1149,316 @@ function convertAnthropicResponseToOpenAI(data, requestedModel) {
       total_tokens: inputTokens + cacheCreationTokens + cacheReadTokens + outputTokens,
     },
   };
+}
+
+function flattenTextContent(content) {
+  if (content == null) return '';
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return JSON.stringify(content);
+  return content.map((part) => {
+    if (typeof part === 'string') return part;
+    if (part?.type === 'text') return part.text || '';
+    if (typeof part?.text === 'string') return part.text;
+    if (typeof part?.content === 'string') return part.content;
+    return JSON.stringify(part);
+  }).filter(Boolean).join('\n');
+}
+
+function convertOpenAIChatToPrompt(data = {}) {
+  if (typeof data.prompt === 'string') return data.prompt;
+  if (!Array.isArray(data.messages)) return '';
+  return data.messages.map((message) => {
+    const role = message?.role || 'user';
+    const content = flattenTextContent(message?.content);
+    if (!content) return '';
+    if (role === 'system') return `System:\n${content}`;
+    if (role === 'assistant') return `Assistant:\n${content}`;
+    if (role === 'tool') return `Tool result:\n${content}`;
+    return `User:\n${content}`;
+  }).filter(Boolean).join('\n\n');
+}
+
+function buildUnlimitedChatPayload(data, realModel) {
+  const payload = {
+    model: realModel,
+    prompt: convertOpenAIChatToPrompt(data),
+  };
+  for (const key of ['temperature', 'top_p', 'max_tokens', 'max_completion_tokens', 'stop']) {
+    if (Object.prototype.hasOwnProperty.call(data, key)) payload[key] = data[key];
+  }
+  if (payload.max_completion_tokens != null && payload.max_tokens == null) {
+    payload.max_tokens = payload.max_completion_tokens;
+  }
+  delete payload.max_completion_tokens;
+  return payload;
+}
+
+function buildOpenAIChatCompletion(content, requestedModel, finishReason = 'stop') {
+  return {
+    id: `chatcmpl-${newRequestId()}`,
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model: requestedModel,
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: 'assistant',
+          content,
+        },
+        finish_reason: normalizeOpenAIFinishReason(finishReason),
+      },
+    ],
+    usage: {
+      prompt_tokens: 0,
+      completion_tokens: 0,
+      total_tokens: 0,
+    },
+  };
+}
+
+async function proxyUnlimitedChatRequest(channel, req, res, data, upstreamModel = '', requestedModel = '', requestId = '', logContext = {}, channelKey = '') {
+  const fullUrl = `${channel.base_url.replace(/\/$/, '')}/api/chat`;
+  const parsed = new URL(fullUrl);
+  const realModel = stripModelPrefix(upstreamModel, channelKey);
+  const unlimitedPayload = buildUnlimitedChatPayload(data, realModel);
+  const body = JSON.stringify(unlimitedPayload);
+  const wantsStream = data.stream === true;
+  const startedAt = Date.now();
+  const selectedKey = selectChannelKey(channel, channelKey);
+  const streamId = `chatcmpl-${requestId || newRequestId()}`;
+  const streamCreated = Math.floor(Date.now() / 1000);
+
+  const headers = {
+    'content-type': 'application/json',
+    'accept': 'text/event-stream, application/json',
+    'authorization': `Bearer ${selectedKey.key}`,
+    'content-length': Buffer.byteLength(body),
+  };
+
+  function writeOpenAIStreamChunk(content = '', finishReason = null) {
+    const chunk = {
+      id: streamId,
+      object: 'chat.completion.chunk',
+      created: streamCreated,
+      model: requestedModel || upstreamModel,
+      choices: [
+        {
+          index: 0,
+          delta: content ? { content } : {},
+          finish_reason: finishReason ? normalizeOpenAIFinishReason(finishReason) : null,
+        },
+      ],
+    };
+    res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+  }
+
+  writeGatewayLog('upstream_request', {
+    requestId,
+    model: upstreamModel || 'unknown',
+    channel: channel.name,
+    clientIp: logContext.clientIp,
+    requestedModel: logContext.requestedModel || requestedModel,
+    upstreamHost: parsed.host,
+    upstreamPath: parsed.pathname,
+    method: 'POST',
+    requestBytes: Buffer.byteLength(body),
+    inputContent: logContext.inputContent,
+    format: 'unlimited_api_chat',
+    upstreamKeyIndex: selectedKey.index,
+    upstreamKeyCount: selectedKey.count,
+    upstreamKeyFingerprint: selectedKey.fingerprint,
+  });
+
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: parsed.hostname,
+      port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+      path: parsed.pathname + parsed.search,
+      method: 'POST',
+      headers,
+      timeout: 120000,
+    };
+    const transport = parsed.protocol === 'https:' ? https : http;
+    let rawResponse = '';
+    let lineBuffer = '';
+    let outputContent = '';
+    let finishReason = 'stop';
+    let upstreamError = '';
+    let streamStarted = false;
+    let completed = false;
+
+    function inferUnlimitedErrorStatus(errorMessage = '', fallback = 424) {
+      const match = String(errorMessage).match(/\bstatus code\s+(\d{3})\b/i)
+        || String(errorMessage).match(/\bHTTP\s+(\d{3})\b/i);
+      if (match) {
+        const status = Number(match[1]);
+        if (status >= 400 && status < 600) return status;
+      }
+      return fallback;
+    }
+
+    function finishWithUpstreamError(statusCode, errorMessage, extra = {}) {
+      if (completed) return;
+      completed = true;
+      const safeStatusCode = statusCode || inferUnlimitedErrorStatus(errorMessage);
+      logRequest(upstreamModel || requestedModel || 'unknown', channel.name, 0, false, requestLogOptions(logContext, requestId, errorMessage));
+      writeGatewayLog('request_complete', responseLogFields(logContext, {
+        requestId,
+        model: upstreamModel || 'unknown',
+        channel: channel.name,
+        requestedModel,
+        statusCode: safeStatusCode,
+        durationMs: Date.now() - startedAt,
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        upstreamKeyIndex: selectedKey.index,
+        upstreamKeyCount: selectedKey.count,
+        upstreamKeyFingerprint: selectedKey.fingerprint,
+        outputContent: truncateText(outputContent),
+        errorMessage,
+        responseBody: truncateText(rawResponse),
+        format: 'unlimited_api_chat',
+        ...extra,
+      }));
+      if (res.writableEnded) return;
+      if (wantsStream) {
+        if (!res.headersSent) {
+          res.writeHead(safeStatusCode, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: errorMessage, type: 'upstream_error' } }));
+          return;
+        }
+        if (streamStarted) {
+          writeOpenAIStreamChunk('', 'stop');
+          res.write('data: [DONE]\n\n');
+          res.end();
+        }
+        return;
+      }
+      if (!res.headersSent) {
+        res.writeHead(safeStatusCode, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: errorMessage, type: 'upstream_error' } }));
+      }
+    }
+
+    function handleEvent(payload) {
+      let eventData;
+      try {
+        eventData = JSON.parse(payload);
+      } catch {
+        return;
+      }
+      if (typeof eventData.delta === 'string') {
+        outputContent += eventData.delta;
+        if (wantsStream) {
+          if (!streamStarted) {
+            res.writeHead(200, {
+              'Content-Type': 'text/event-stream; charset=utf-8',
+              'Cache-Control': 'no-cache',
+              'Connection': 'keep-alive',
+            });
+            streamStarted = true;
+          }
+          writeOpenAIStreamChunk(eventData.delta);
+        }
+      }
+      if (eventData.finish) finishReason = eventData.reason || finishReason;
+      if (eventData.error) upstreamError = String(eventData.error);
+    }
+
+    const proxy = transport.request(options, (proxyRes) => {
+      proxyRes.on('data', (chunk) => {
+        const chunkStr = chunk.toString();
+        rawResponse += chunkStr;
+        lineBuffer += chunkStr;
+        const lines = lineBuffer.split('\n');
+        lineBuffer = lines.pop() || '';
+        for (const rawLine of lines) {
+          const line = rawLine.trim();
+          if (!line.startsWith('data: ')) continue;
+          const payload = line.slice(6);
+          if (!payload || payload === '[DONE]') continue;
+          handleEvent(payload);
+        }
+      });
+
+      proxyRes.on('end', () => {
+        if (completed) return;
+        const trailing = lineBuffer.trim();
+        if (trailing.startsWith('data: ')) {
+          const payload = trailing.slice(6);
+          if (payload && payload !== '[DONE]') handleEvent(payload);
+        }
+
+        if (proxyRes.statusCode >= 400 || upstreamError) {
+          const errorMessage = upstreamError || `HTTP ${proxyRes.statusCode}`;
+          finishWithUpstreamError(proxyRes.statusCode >= 400 ? proxyRes.statusCode : inferUnlimitedErrorStatus(errorMessage), errorMessage);
+          resolve();
+          return;
+        }
+
+        completed = true;
+        logRequest(upstreamModel || requestedModel || 'unknown', channel.name, 0, true, requestLogOptions(logContext, requestId, null));
+        writeGatewayLog('request_complete', responseLogFields(logContext, {
+          requestId,
+          model: upstreamModel || 'unknown',
+          channel: channel.name,
+          requestedModel,
+          statusCode: proxyRes.statusCode,
+          durationMs: Date.now() - startedAt,
+          inputTokens: 0,
+          outputTokens: 0,
+          totalTokens: 0,
+          upstreamKeyIndex: selectedKey.index,
+          upstreamKeyCount: selectedKey.count,
+          upstreamKeyFingerprint: selectedKey.fingerprint,
+          outputContent: truncateText(outputContent),
+          format: wantsStream ? 'unlimited_api_chat_stream' : 'unlimited_api_chat',
+        }));
+
+        if (wantsStream) {
+          if (!streamStarted) {
+            res.writeHead(200, {
+              'Content-Type': 'text/event-stream; charset=utf-8',
+              'Cache-Control': 'no-cache',
+              'Connection': 'keep-alive',
+            });
+          }
+          writeOpenAIStreamChunk('', finishReason);
+          res.write('data: [DONE]\n\n');
+          res.end();
+        } else {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(buildOpenAIChatCompletion(outputContent, requestedModel || upstreamModel, finishReason)));
+        }
+        resolve();
+      });
+
+      proxyRes.on('error', (err) => {
+        finishWithUpstreamError(424, err.message || 'upstream aborted', { upstreamEvent: 'response_error' });
+        resolve();
+      });
+      proxyRes.on('aborted', () => {
+        finishWithUpstreamError(424, 'upstream aborted', { upstreamEvent: 'response_aborted' });
+        resolve();
+      });
+    });
+
+    proxy.on('error', (err) => {
+      finishWithUpstreamError(inferUnlimitedErrorStatus(err.message), err.message || 'upstream error', { upstreamEvent: 'request_error' });
+      resolve();
+    });
+
+    proxy.on('timeout', () => {
+      finishWithUpstreamError(408, 'timeout', { upstreamEvent: 'request_timeout' });
+      proxy.destroy();
+      resolve();
+    });
+
+    proxy.write(body);
+    proxy.end();
+  });
 }
 
 function sanitizePayloadForUpstream(data, upstreamModel) {
@@ -1002,7 +1633,7 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
   const parsedBase = new URL(channel.base_url);
   const fullUrl = `${channel.base_url.replace(/\/$/, '')}/messages`;
   const parsed = new URL(fullUrl);
-  const anthropicPayload = convertOpenAIChatToAnthropic(data, stripModelPrefix(upstreamModel), channel);
+  const anthropicPayload = convertOpenAIChatToAnthropic(data, stripModelPrefix(upstreamModel, channelKey), channel);
   const wantsStream = data.stream === true;
   if (wantsStream) anthropicPayload.stream = true;
   const body = JSON.stringify(anthropicPayload);
@@ -1016,6 +1647,8 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
     'anthropic-version': channel.anthropic_version || '2023-06-01',
     'content-length': Buffer.byteLength(body),
   };
+  const anthropicBeta = getAnthropicBetaHeader(channel);
+  if (anthropicBeta) headers['anthropic-beta'] = anthropicBeta;
 
   return new Promise((resolve, reject) => {
     const options = {
@@ -1036,10 +1669,12 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
     let streamCacheCreationInputTokens = 0;
     let streamCacheReadInputTokens = 0;
     let streamOutputContent = '';
+    const streamToolBlocks = new Map();
     const streamId = `chatcmpl-${requestId || newRequestId()}`;
     const streamCreated = Math.floor(Date.now() / 1000);
 
-    function writeOpenAIStreamChunk(content = '', finishReason = null) {
+    function writeOpenAIStreamChunk(content = '', finishReason = null, extraDelta = null) {
+      const delta = extraDelta || (content ? { content } : {});
       const chunk = {
         id: streamId,
         object: 'chat.completion.chunk',
@@ -1048,8 +1683,8 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
         choices: [
           {
             index: 0,
-            delta: content ? { content } : {},
-            finish_reason: finishReason,
+            delta,
+            finish_reason: finishReason ? normalizeOpenAIFinishReason(finishReason) : null,
           },
         ],
       };
@@ -1108,11 +1743,40 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
               streamCacheCreationInputTokens = usage.cacheCreationInputTokens || 0;
               streamCacheReadInputTokens = usage.cacheReadInputTokens || 0;
               writeOpenAIStreamChunk('');
+            } else if (eventData.type === 'content_block_start') {
+              const block = eventData.content_block || {};
+              if (block.type === 'tool_use' && block.name) {
+                const index = Number.isInteger(eventData.index) ? eventData.index : streamToolBlocks.size;
+                streamToolBlocks.set(eventData.index, index);
+                writeOpenAIStreamChunk('', null, {
+                  tool_calls: [{
+                    index,
+                    id: block.id || `call_${newRequestId()}`,
+                    type: 'function',
+                    function: {
+                      name: block.name,
+                      arguments: '',
+                    },
+                  }],
+                });
+              }
             } else if (eventData.type === 'content_block_delta') {
               const text = eventData.delta?.text || '';
               if (text) {
                 streamOutputContent += text;
                 writeOpenAIStreamChunk(text);
+              }
+              const partialJson = eventData.delta?.partial_json || '';
+              if (partialJson) {
+                const index = streamToolBlocks.get(eventData.index) ?? (Number.isInteger(eventData.index) ? eventData.index : 0);
+                writeOpenAIStreamChunk('', null, {
+                  tool_calls: [{
+                    index,
+                    function: {
+                      arguments: partialJson,
+                    },
+                  }],
+                });
               }
             } else if (eventData.type === 'message_delta') {
               streamFinishReason = eventData.delta?.stop_reason || streamFinishReason;
@@ -1374,13 +2038,16 @@ async function handleChatCompletions(req, res, body, requestId) {
   }
   
   let entry = modelMap.get(modelName);
+  if (entry && !clientCanUseModel(req, modelName, entry.channelKey)) {
+    entry = null;
+  }
   if (!entry) {
     // Try partial match: any channel model that ends with the requested name
-    const candidates = [...modelMap.entries()].filter(([k]) => k.endsWith(modelName));
+    const candidates = getAccessibleModelEntries(req).filter(([k]) => k.endsWith(modelName));
     if (candidates.length === 0) {
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: { message: `Model not found: ${modelName}`, type: 'model_not_found' } }));
-      logRequest(modelName, 'none', 0, false, 'model_not_found');
+      logRequest(modelName, 'none', 0, false, requestLogOptions(logContext, requestId, 'model_not_found'));
       writeGatewayLog('request_complete', responseLogFields(logContext, {
         requestId,
         model: modelName,
@@ -1391,6 +2058,7 @@ async function handleChatCompletions(req, res, body, requestId) {
         totalTokens: 0,
         errorMessage: `Model not found: ${modelName}`,
         availableModelCount: modelMap.size,
+        accessibleModelCount: getAccessibleModelEntries(req).length,
       }));
       return;
     }
@@ -1406,6 +2074,23 @@ async function handleChatCompletions(req, res, body, requestId) {
   }
   
   const channel = config.channels[entry.channelKey];
+  if (!clientCanUseChannel(req, entry.channelKey)) {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: `Model not found: ${modelName}`, type: 'model_not_found' } }));
+    logRequest(modelName, 'none', 0, false, requestLogOptions(logContext, requestId, 'channel_not_allowed'));
+    writeGatewayLog('request_complete', responseLogFields(logContext, {
+      requestId,
+      model: modelName,
+      channel: 'none',
+      statusCode: 404,
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+      errorMessage: 'channel_not_allowed',
+      channelKey: entry.channelKey,
+    }));
+    return;
+  }
   if (!channel) {
     res.writeHead(500, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { message: 'Channel not found', type: 'config_error' } }));
@@ -1423,12 +2108,45 @@ async function handleChatCompletions(req, res, body, requestId) {
     }));
     return;
   }
+
+  const quota = consumeClientQuota(req, modelName);
+  if (!quota.ok) {
+    const statusCode = quota.statusCode || 429;
+    res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      error: {
+        message: quota.message || 'Quota exceeded',
+        type: statusCode === 401 ? 'auth_error' : 'quota_exceeded',
+        quota_cost: quota.cost || getModelQuotaCost(modelName),
+        quota_limit: quota.limit || 0,
+        quota_used: quota.used || 0,
+        quota_remaining: quota.remaining || 0,
+      },
+    }));
+    logRequest(modelName, channel.name, 0, false, requestLogOptions(logContext, requestId, 'quota_exceeded'));
+    writeGatewayLog('request_complete', responseLogFields(logContext, {
+      requestId,
+      model: modelName,
+      channel: channel.name,
+      channelKey: entry.channelKey,
+      statusCode,
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+      errorMessage: quota.message || 'quota_exceeded',
+      quotaCost: quota.cost || getModelQuotaCost(modelName),
+      quotaLimit: quota.limit || 0,
+      quotaUsed: quota.used || 0,
+      quotaRemaining: quota.remaining || 0,
+    }));
+    return;
+  }
   
   // Strip prefix from model name for upstream
   const upstreamModel = entry.upstreamModel;
   // Remove provider prefixes like "local/" before passing upstream.
-  const realModel = stripModelPrefix(upstreamModel);
-  const channelInput = channel.format === 'anthropic'
+  const realModel = stripModelPrefix(upstreamModel, entry.channelKey);
+  const channelInput = channel.format === 'anthropic' || channel.format === 'unlimited_api_chat'
     ? { ...data, model: realModel }
     : applyOpenAICompatiblePromptCache({ ...data, model: realModel }, channel);
   const sanitized = sanitizePayloadForUpstream(channelInput, upstreamModel);
@@ -1441,6 +2159,12 @@ async function handleChatCompletions(req, res, body, requestId) {
     upstreamPayloadModel: realModel,
     channelKey: entry.channelKey,
     channel: channel.name,
+    ...(quota.cost ? {
+      quotaCost: quota.cost,
+      quotaLimit: quota.limit || 0,
+      quotaUsed: quota.used || 0,
+      quotaRemaining: Number.isFinite(quota.remaining) ? quota.remaining : null,
+    } : {}),
     finalParams: Object.keys(data).filter(k => !['model', 'messages', 'stream'].includes(k)),
     ...(sanitized.removedParams.length ? { removedParams: sanitized.removedParams } : {}),
   });
@@ -1448,6 +2172,8 @@ async function handleChatCompletions(req, res, body, requestId) {
   try {
     if (channel.format === 'anthropic') {
       await proxyAnthropicChatRequest(channel, req, res, data, upstreamModel, modelName, requestId, logContext, entry.channelKey);
+    } else if (channel.format === 'unlimited_api_chat') {
+      await proxyUnlimitedChatRequest(channel, req, res, data, upstreamModel, modelName, requestId, logContext, entry.channelKey);
     } else {
       await proxyRequest(channel, req, res, body, upstreamModel, requestId, logContext, entry.channelKey);
     }
@@ -1476,6 +2202,7 @@ async function handleModels(req, res) {
   const models = [];
   for (const [ckey, ch] of Object.entries(config.channels)) {
     for (const m of ch.models) {
+      if (!clientCanUseModel(req, m, ckey)) continue;
       models.push({
         id: m,
         object: 'model',
@@ -1511,7 +2238,9 @@ function normalizeImportedConfig(input) {
     ...nextConfig,
     port: Number(nextConfig.port) || config.port || 8300,
     api_key: String(nextConfig.api_key || config.api_key || '').trim(),
-    api_keys: Array.isArray(nextConfig.api_keys) ? nextConfig.api_keys.map(k => String(k).trim()).filter(Boolean) : [],
+    api_keys: Array.isArray(nextConfig.api_keys)
+      ? nextConfig.api_keys.map(normalizeClientKeyEntry).filter(Boolean)
+      : [],
     channels: nextConfig.channels,
     models: Array.isArray(nextConfig.models) ? nextConfig.models : [],
   };
@@ -1529,7 +2258,7 @@ async function handleConfigAPI(req, res, url, body) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       channels: config.channels,
-      api_keys: config.api_keys || [],
+      api_keys: getClientKeyEntries(),
     }));
     return true;
   }
@@ -1563,39 +2292,86 @@ async function handleConfigAPI(req, res, url, body) {
     const d = JSON.parse(body || '{}');
     const count = Math.min(Math.max(parseInt(d.count || '1', 10) || 1, 1), 100);
     const prefix = String(d.prefix || 'key').trim().replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24) || 'key';
-    if (!Array.isArray(config.api_keys)) config.api_keys = [];
-    const existing = new Set(config.api_keys);
+    const allowedChannels = normalizeStringArray(d.allowed_channels);
+    const quotaLimit = Math.max(0, Math.floor(Number(d.quota_limit) || 0));
+    const expiresAt = normalizeExpiresAt(d.expires_at);
+    const existingEntries = getClientKeyEntries();
+    const existing = new Set(existingEntries.map(entry => entry.key));
     const created = [];
     while (created.length < count) {
       const key = `${prefix}-${crypto.randomBytes(18).toString('base64url')}`;
       if (!existing.has(key)) {
         existing.add(key);
-        created.push(key);
+        created.push({
+          key,
+          name: count === 1 ? prefix : `${prefix}-${created.length + 1}`,
+          allowed_channels: allowedChannels,
+          allowed_models: [],
+          quota_limit: quotaLimit,
+          quota_used: 0,
+          expires_at: expiresAt,
+          enabled: true,
+        });
       }
     }
-    config.api_keys.push(...created);
+    saveClientKeyEntries([...existingEntries, ...created]);
     saveConfig();
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       ok: true,
-      keys: created,
-      api_keys: config.api_keys,
+      keys: created.map(entry => entry.key),
+      api_keys: getClientKeyEntries(),
     }));
+    return true;
+  }
+
+  if (url === '/api/config/client-keys/save' && req.method === 'POST') {
+    const d = JSON.parse(body || '{}');
+    const key = String(d.key || '').trim();
+    if (!key) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: '调用 Key 不能为空' }));
+      return true;
+    }
+    if (key === config.api_key) {
+      res.writeHead(409, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: '调用 Key 不能和管理 Key 相同' }));
+      return true;
+    }
+    const entries = getClientKeyEntries();
+    const index = entries.findIndex(entry => entry.key === key);
+    const nextEntry = {
+      key,
+      name: String(d.name || '').trim(),
+      allowed_channels: normalizeStringArray(d.allowed_channels).filter(channelKey => Boolean(config.channels[channelKey])),
+      allowed_models: normalizeStringArray(d.allowed_models),
+      quota_limit: Math.max(0, Math.floor(Number(d.quota_limit) || 0)),
+      quota_used: Math.max(0, Math.floor(Number(d.quota_used) || 0)),
+      expires_at: normalizeExpiresAt(d.expires_at),
+      enabled: d.enabled !== false,
+    };
+    if (index >= 0) entries[index] = nextEntry;
+    else entries.push(nextEntry);
+    saveClientKeyEntries(entries);
+    saveConfig();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, api_keys: getClientKeyEntries() }));
     return true;
   }
 
   if (url === '/api/config/client-keys/delete' && req.method === 'POST') {
     const d = JSON.parse(body || '{}');
     const key = String(d.key || '').trim();
-    if (!key || !Array.isArray(config.api_keys) || !config.api_keys.includes(key)) {
+    const entries = getClientKeyEntries();
+    if (!key || !entries.some(entry => entry.key === key)) {
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: false, error: '调用 Key 不存在' }));
       return true;
     }
-    config.api_keys = config.api_keys.filter(item => item !== key);
+    saveClientKeyEntries(entries.filter(entry => entry.key !== key));
     saveConfig();
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, api_keys: config.api_keys }));
+    res.end(JSON.stringify({ ok: true, api_keys: getClientKeyEntries() }));
     return true;
   }
 
@@ -1746,8 +2522,7 @@ async function handleConfigAPI(req, res, url, body) {
       keys: configuredKeys,
       ...(format || existingChannel.format ? { format: format || existingChannel.format } : {}),
       ...(anthropic_version || existingChannel.anthropic_version ? { anthropic_version: anthropic_version || existingChannel.anthropic_version } : {}),
-      ...(prompt_cache_enabled ? { prompt_cache_enabled: true } : {}),
-      ...(prompt_cache_enabled && prompt_cache_ttl === '1h' ? { prompt_cache_ttl: '1h' } : {}),
+      ...(prompt_cache_enabled ? { prompt_cache_enabled: true, prompt_cache_ttl } : {}),
       ...(anthropic_thinking_type && anthropic_thinking_type !== 'off' ? { anthropic_thinking_type } : {}),
       ...(anthropic_thinking_type === 'enabled' ? { anthropic_thinking_budget_tokens: toPositiveInteger(anthropic_thinking_budget_tokens, 32000) } : {}),
       ...(anthropic_thinking_type === 'adaptive' && anthropic_output_effort ? { anthropic_output_effort } : {}),
@@ -1815,6 +2590,88 @@ async function handleConfigAPI(req, res, url, body) {
     return true;
   }
   
+  // Backend proxy: probe upstream models (avoids browser CORS)
+  if (url === '/api/probe-models' && req.method === 'POST') {
+    try {
+      const d = JSON.parse(body);
+      const { base_url, key, channelKey } = d;
+      const format = d.format || (channelKey && config.channels[channelKey]?.format) || '';
+      if (!base_url || !key) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: '缺少 base_url 或 key' }));
+        return true;
+      }
+      const rootUrl = base_url.replace(/\/+$/, '');
+      const modelsPath = format === 'unlimited_api_chat' || /(^|\.)unlimited\.surf$/i.test(new URL(rootUrl).hostname)
+        ? '/api/models'
+        : '/models';
+      const modelsUrl = rootUrl + modelsPath;
+      const upstream = await fetch(modelsUrl, {
+        headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
+        signal: AbortSignal.timeout(10000),
+      });
+      const text = await upstream.text();
+      let json;
+      try {
+        json = JSON.parse(text);
+      } catch {
+        throw new Error(`上游返回非 JSON (${upstream.status})，URL: ${modelsPath}`);
+      }
+      if (!upstream.ok) {
+        throw new Error(json?.error?.message || json?.message || `上游 HTTP ${upstream.status}`);
+      }
+      const models = (json.data || []).map(m => m.id || m).filter(Boolean);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, models }));
+    } catch (e) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: e.message }));
+    }
+    return true;
+  }
+
+  // Backend proxy: test channel by sending a minimal chat request
+  if (url === '/api/test-channel' && req.method === 'POST') {
+    try {
+      const d = JSON.parse(body);
+      const { channelKey } = d;
+      const ch = config.channels[channelKey];
+      if (!ch) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: '渠道不存在' }));
+        return true;
+      }
+      const model = ch.models[0];
+      if (!model) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: '渠道没有模型' }));
+        return true;
+      }
+      const keys = getChannelKeys(ch);
+      const upstreamKey = keys[0] || '';
+      const chatUrl = ch.base_url.replace(/\/+$/, '') + '/chat/completions';
+      const realModel = stripModelPrefix(model, channelKey);
+      const upResp = await fetch(chatUrl, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${upstreamKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: realModel, messages: [{ role: 'user', content: 'hi' }], max_tokens: 5 }),
+        signal: AbortSignal.timeout(15000),
+      });
+      const upJson = await upResp.json();
+      if (upJson.choices && upJson.choices[0]) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, reply: upJson.choices[0].message?.content || '(ok)' }));
+      } else {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: upJson.error?.message || JSON.stringify(upJson) }));
+      }
+    } catch (e) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: e.message }));
+    }
+    return true;
+  }
+
   return false;
 }
 

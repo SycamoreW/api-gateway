@@ -77,7 +77,7 @@
   .stats-filters select,.stats-filters input{background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;font-size:14px;padding:5px 8px}
   .stats-custom{display:none;gap:8px;align-items:center;flex-wrap:wrap}
   .stats-custom.active{display:flex}
-  .stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+  .stats-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
   .usage-card{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:12px}
   .usage-card h3{font-size:15px;color:#f0f6fc;margin-bottom:10px}
   .usage-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto auto;gap:10px;align-items:center;padding:7px 0;border-bottom:1px solid #21262d;font-size:14px}
@@ -121,6 +121,9 @@
   
   .empty{text-align:center;padding:40px;color:#484f58;font-size:16px}
   .empty .btn{margin-top:12px}
+  @media (max-width: 720px){
+    .stats-grid{grid-template-columns:1fr}
+  }
 </style>
 </head>
 <body>
@@ -235,12 +238,31 @@
 <script>
 const KEY_STORAGE = 'apiGatewayKey';
 let KEY = localStorage.getItem(KEY_STORAGE) || '';
-if (!KEY) {
-  KEY = prompt('聚合渠道管理 Key（初始默认 123456）') || '';
-  if (KEY) localStorage.setItem(KEY_STORAGE, KEY);
+function isSafeHeaderValue(value = '') {
+  return /^[\x21-\x7E]+$/.test(String(value));
 }
+
+function promptForAdminKey(message = '聚合渠道管理 Key（初始默认 123456）') {
+  const nextKey = prompt(message) || '';
+  KEY = nextKey.trim();
+  if (KEY && !isSafeHeaderValue(KEY)) {
+    KEY = '';
+    localStorage.removeItem(KEY_STORAGE);
+    alert('管理 Key 只能包含英文、数字和常见英文符号，请不要粘贴中文、空格或 emoji。');
+  } else if (KEY) {
+    localStorage.setItem(KEY_STORAGE, KEY);
+  }
+  document.getElementById('apiKeyLabel').textContent = KEY ? '已保存在本浏览器' : '未设置';
+  return KEY;
+}
+if (!KEY) promptForAdminKey();
 const HOST = location.hostname || '170.106.64.129';
-document.getElementById('apiUrl').textContent = `http://${HOST}:8300/v1`;
+function getApiDisplayUrl() {
+  if (location.protocol === 'https:') return `${location.origin}/v1`;
+  const port = location.port || '8300';
+  return `http://${HOST}:${port}/v1`;
+}
+document.getElementById('apiUrl').textContent = getApiDisplayUrl();
 document.getElementById('apiKeyLabel').textContent = KEY ? '已保存在本浏览器' : '未设置';
 
 let channels = {};
@@ -268,6 +290,49 @@ function escapeHtml(value) {
 
 function jsArg(value) {
   return escapeHtml(JSON.stringify(String(value ?? '')));
+}
+
+function escapeRegExp(value = '') {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function stripOwnModelPrefix(model = '', prefix = '') {
+  const value = String(model || '');
+  const ownPrefix = String(prefix || '').trim();
+  if (!ownPrefix) return value;
+  const escapedPrefix = escapeRegExp(ownPrefix);
+  return value
+    .replace(new RegExp(`^\\[${escapedPrefix}\\]`), '')
+	    .replace(new RegExp(`^${escapedPrefix}/`, 'i'), '');
+}
+
+function getCurrentModelPrefix() {
+  return document.getElementById('chPrefix')?.value.trim() || editingKey || '';
+}
+
+function applyModelPrefix(models = [], prefix = '') {
+  const ownPrefix = String(prefix || '').trim();
+  if (!ownPrefix) return models;
+  return models.map(model => {
+    const bare = stripOwnModelPrefix(model, ownPrefix);
+    return `[${ownPrefix}]${bare}`;
+  });
+}
+
+function makeChannelKey(name = '', baseUrl = '') {
+  let key = String(name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (!key) {
+    try {
+      key = new URL(baseUrl).hostname.split('.').filter(Boolean)[0]?.replace(/[^a-z0-9]/gi, '').toLowerCase() || '';
+    } catch (_) {}
+  }
+  if (!key) key = `ch${Date.now().toString(36)}`;
+  let candidate = key;
+  let suffix = 2;
+  while (channels[candidate]) {
+    candidate = `${key}${suffix++}`;
+  }
+  return candidate;
 }
 
 function showApiKeyModal() {
@@ -316,10 +381,18 @@ function switchTab(tab) {
 }
 
 async function api(path, opts={}) {
+  KEY = String(KEY || '').trim();
+  if (KEY && !isSafeHeaderValue(KEY)) {
+    localStorage.removeItem(KEY_STORAGE);
+    const err = new Error('管理 Key 包含非法字符，请重新输入');
+    err.status = 401;
+    throw err;
+  }
+  if (KEY) localStorage.setItem(KEY_STORAGE, KEY);
   const res = await fetch(path, { headers: { 'Authorization': `Bearer ${KEY}`, 'Content-Type': 'application/json' }, ...opts });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    const err = new Error(data.error?.message || `HTTP ${res.status}`);
+    const err = new Error(data.error?.message || data.error || `HTTP ${res.status}`);
     err.status = res.status;
     throw err;
   }
@@ -399,16 +472,19 @@ async function load() {
   } catch(e) {
     if (e.status === 401) {
       localStorage.removeItem(KEY_STORAGE);
-      document.getElementById('apiKeyLabel').textContent = 'Key 错误，请刷新后重输';
+      document.getElementById('apiKeyLabel').textContent = 'Key 错误';
+      if (promptForAdminKey('管理 Key 不正确，请重新输入')) {
+        return load();
+      }
       document.getElementById('stats').innerHTML = `
         <div class="stat"><div class="num" style="color:#f85149">!</div><div class="label">认证失败</div></div>
       `;
       document.getElementById('chCount').textContent = '认证失败';
-      document.getElementById('channels').innerHTML = '<div class="empty">聚合渠道 API Key 不正确<br><button class="btn btn-primary" onclick="location.reload()" style="margin-top:12px">重新输入 Key</button></div>';
-      toast('聚合渠道 API Key 不正确，已清除本地保存值', false);
+      document.getElementById('channels').innerHTML = '<div class="empty">管理 Key 不正确<br><button class="btn btn-primary" onclick="promptForAdminKey() && load()" style="margin-top:12px">重新输入 Key</button></div>';
+      toast('管理 Key 不正确，已清除本地保存值', false);
       return;
     }
-    toast('加载配置失败', false);
+    toast(`加载配置失败: ${e.message || '未知错误'}`, false);
     return;
   }
   render();
@@ -558,23 +634,54 @@ async function copyText(value) {
 }
 
 function showClientKeysModal() {
-  const rows = clientKeys.length ? clientKeys.map(key => `
-    <div style="display:flex;gap:8px;align-items:center;margin:8px 0">
-      <code style="flex:1;word-break:break-all;background:#0d1117;padding:7px 9px;border-radius:6px">${escapeHtml(key)}</code>
-      <button class="btn btn-outline btn-sm" onclick="copyText(${jsArg(key)})">复制</button>
-      <button class="btn btn-danger btn-sm" onclick="deleteClientKey(${jsArg(key)})">删除</button>
+  const rows = clientKeys.length ? clientKeys.map(raw => {
+    const item = normalizeClientKey(raw);
+    const allowed = item.allowed_channels?.length
+      ? item.allowed_channels.map(key => channels[key]?.name || key).join(', ')
+      : '全部渠道';
+    const quotaText = item.quota_limit > 0
+      ? `${item.quota_used || 0}/${item.quota_limit}`
+      : '不限';
+    const expiresText = formatClientKeyExpiry(item.expires_at);
+    const expired = isClientKeyExpired(item);
+    return `
+    <div style="background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:9px 10px;margin:8px 0">
+      <div style="display:flex;gap:8px;align-items:center">
+        <div style="flex:1;min-width:0">
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+            <strong style="color:#f0f6fc">${escapeHtml(item.name || '未命名 Key')}</strong>
+            ${item.enabled === false ? '<span style="color:#f85149;font-size:12px">已禁用</span>' : ''}
+            ${expired ? '<span style="color:#f85149;font-size:12px">已到期</span>' : ''}
+          </div>
+          <code style="display:block;word-break:break-all;color:#79c0ff;margin-top:4px">${escapeHtml(item.key)}</code>
+          <div class="hint">可用渠道：${escapeHtml(allowed)}</div>
+          <div class="hint">额度：${escapeHtml(quotaText)} · 每次请求扣 1</div>
+          <div class="hint">截止时间：${escapeHtml(expiresText)}</div>
+        </div>
+        <button class="btn btn-outline btn-sm" onclick="copyText(${jsArg(item.key)})">复制</button>
+        <button class="btn btn-outline btn-sm" onclick="editClientKey(${jsArg(item.key)})">编辑</button>
+        <button class="btn btn-danger btn-sm" onclick="deleteClientKey(${jsArg(item.key)})">删除</button>
+      </div>
     </div>
-  `).join('') : '<div class="empty" style="padding:18px">还没有调用 Key</div>';
+  `}).join('') : '<div class="empty" style="padding:18px">还没有调用 Key</div>';
   document.getElementById('modalContent').innerHTML = `
     <h3>调用 Key</h3>
-    <div class="hint">调用 Key 给别人接入 /v1 使用；管理后台仍然使用管理 Key。</div>
+    <div class="hint">调用 Key 给别人接入 /v1 使用；不同 Key 可限制不同渠道，/v1/models 只显示它能用的模型。</div>
     <label>批量生成数量</label>
     <input id="clientKeyCount" type="number" min="1" max="100" value="10">
     <label>前缀</label>
     <input id="clientKeyPrefix" value="key" placeholder="例如 user">
+    <label>总额度</label>
+    <input id="clientKeyQuotaLimit" type="number" min="0" step="1" value="0">
+    <div class="hint">0 = 不限额度。所有模型每次请求扣 1。</div>
+    <label>截止时间</label>
+    <input id="clientKeyExpiresAt" type="datetime-local">
+    <div class="hint">留空 = 永久有效。到期后这个 Key 不能调用 /v1。</div>
+    ${renderClientKeyChannelPicker('newClientKeyChannels', [])}
     <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
       <button class="btn btn-primary" onclick="generateClientKeys()">批量生成</button>
-      <button class="btn btn-outline" onclick="copyText(clientKeys.join('\\n'))">复制全部</button>
+      <button class="btn btn-outline" onclick="showManualClientKeyModal()">手动添加</button>
+      <button class="btn btn-outline" onclick="copyText(clientKeys.map(k => normalizeClientKey(k).key).join('\\n'))">复制全部</button>
     </div>
     <div style="margin-top:14px">${rows}</div>
     <div class="actions">
@@ -583,13 +690,154 @@ function showClientKeysModal() {
   document.getElementById('modal').classList.add('active');
 }
 
+function normalizeClientKey(raw) {
+  if (typeof raw === 'string') {
+    return { key: raw, name: '', allowed_channels: [], allowed_models: [], quota_limit: 0, quota_used: 0, expires_at: '', enabled: true };
+  }
+  return {
+    key: String(raw?.key || ''),
+    name: String(raw?.name || ''),
+    allowed_channels: Array.isArray(raw?.allowed_channels) ? raw.allowed_channels : [],
+    allowed_models: Array.isArray(raw?.allowed_models) ? raw.allowed_models : [],
+    quota_limit: Math.max(0, Math.floor(Number(raw?.quota_limit) || 0)),
+    quota_used: Math.max(0, Math.floor(Number(raw?.quota_used) || 0)),
+    expires_at: String(raw?.expires_at || ''),
+    enabled: raw?.enabled !== false,
+  };
+}
+
+function isClientKeyExpired(item = {}) {
+  if (!item.expires_at) return false;
+  const time = Date.parse(item.expires_at);
+  return Number.isFinite(time) && time <= Date.now();
+}
+
+function formatClientKeyExpiry(value) {
+  if (!value) return '永久有效';
+  const time = Date.parse(value);
+  if (!Number.isFinite(time)) return '永久有效';
+  const text = new Date(time).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+  return `${text}${time <= Date.now() ? '（已到期）' : ''}`;
+}
+
+function toDatetimeLocalValue(value) {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  const offsetMs = date.getTimezoneOffset() * 60000;
+  return new Date(date.getTime() - offsetMs).toISOString().slice(0, 16);
+}
+
+function datetimeLocalToIso(id) {
+  const value = document.getElementById(id)?.value || '';
+  if (!value) return '';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '' : date.toISOString();
+}
+
+function getClientKeyEntry(key) {
+  return clientKeys.map(normalizeClientKey).find(item => item.key === key) || null;
+}
+
+function renderClientKeyChannelPicker(id, selected = []) {
+  const selectedSet = new Set(selected || []);
+  const channelRows = Object.entries(channels).map(([ckey, ch]) => `
+    <label>
+      <input type="checkbox" value="${escapeHtml(ckey)}" ${selectedSet.has(ckey) ? 'checked' : ''}>
+      ${escapeHtml(ch.name || ckey)}
+      <span class="count">${escapeHtml(ckey)} · ${(ch.models || []).length}</span>
+    </label>
+  `).join('');
+  return `
+    <label>可用渠道</label>
+    <div class="model-picker" id="${escapeHtml(id)}">
+      ${channelRows || '<div class="empty" style="padding:12px">还没有渠道</div>'}
+    </div>
+    <div class="hint">不勾选任何渠道 = 全部渠道可用。</div>`;
+}
+
+function getCheckedChannelKeys(id) {
+  return [...document.querySelectorAll(`#${CSS.escape(id)} input:checked`)].map(input => input.value);
+}
+
+function showManualClientKeyModal() {
+  showClientKeyEditor({ key: '', name: '', allowed_channels: [], quota_limit: 0, quota_used: 0, expires_at: '', enabled: true }, true);
+}
+
+function editClientKey(key) {
+  const item = getClientKeyEntry(key);
+  if (!item) { toast('调用 Key 不存在', false); return; }
+  showClientKeyEditor(item, false);
+}
+
+function showClientKeyEditor(item, isNew) {
+  document.getElementById('modalContent').innerHTML = `
+    <h3>${isNew ? '添加调用 Key' : '编辑调用 Key'}</h3>
+    <label>名称</label>
+    <input id="clientKeyName" value="${escapeHtml(item.name || '')}" placeholder="例如 SillyTavern / 朋友A">
+    <label>Key</label>
+    <input id="clientKeyValue" value="${escapeHtml(item.key || '')}" ${isNew ? '' : 'readonly'} placeholder="留空可自动生成">
+    <label class="checkbox-label">
+      <input id="clientKeyEnabled" type="checkbox" ${item.enabled === false ? '' : 'checked'}>
+      启用
+    </label>
+    <label>总额度</label>
+    <input id="clientKeyEditQuotaLimit" type="number" min="0" step="1" value="${Number(item.quota_limit || 0)}">
+    <div class="hint">0 = 不限额度。所有模型每次请求扣 1。</div>
+    <label>已用额度</label>
+    <input id="clientKeyEditQuotaUsed" type="number" min="0" step="1" value="${Number(item.quota_used || 0)}">
+    <div class="hint">要重置额度就把这里改成 0 后保存。</div>
+    <label>截止时间</label>
+    <input id="clientKeyEditExpiresAt" type="datetime-local" value="${escapeHtml(toDatetimeLocalValue(item.expires_at || ''))}">
+    <div class="hint">留空 = 永久有效。可以自由选择任意截止时间。</div>
+    ${renderClientKeyChannelPicker('editClientKeyChannels', item.allowed_channels || [])}
+    <div class="actions">
+      <button class="btn btn-outline" onclick="showClientKeysModal()">返回</button>
+      <button class="btn btn-primary" onclick="saveClientKey(${isNew ? 'true' : 'false'})">保存</button>
+    </div>`;
+}
+
+async function saveClientKey(isNew) {
+  let key = document.getElementById('clientKeyValue').value.trim();
+  const name = document.getElementById('clientKeyName').value.trim();
+  if (!key) key = `key-${cryptoRandomString()}`;
+  try {
+    const res = await api('/api/config/client-keys/save', {
+      method: 'POST',
+      body: JSON.stringify({
+        key,
+        name,
+        enabled: Boolean(document.getElementById('clientKeyEnabled')?.checked),
+        quota_limit: Number(document.getElementById('clientKeyEditQuotaLimit')?.value || 0),
+        quota_used: Number(document.getElementById('clientKeyEditQuotaUsed')?.value || 0),
+        expires_at: datetimeLocalToIso('clientKeyEditExpiresAt'),
+        allowed_channels: getCheckedChannelKeys('editClientKeyChannels'),
+      })
+    });
+    clientKeys = res.api_keys || [];
+    toast(isNew ? '调用 Key 已添加' : '调用 Key 已保存');
+    showClientKeysModal();
+    renderHeaderStats();
+  } catch(e) {
+    toast('保存失败: ' + e.message, false);
+  }
+}
+
+function cryptoRandomString() {
+  const bytes = new Uint8Array(18);
+  crypto.getRandomValues(bytes);
+  return btoa(String.fromCharCode(...bytes)).replace(/[+/=]/g, '').slice(0, 24);
+}
+
 async function generateClientKeys() {
   const count = document.getElementById('clientKeyCount').value;
   const prefix = document.getElementById('clientKeyPrefix').value;
+  const quotaLimit = Number(document.getElementById('clientKeyQuotaLimit')?.value || 0);
+  const expiresAt = datetimeLocalToIso('clientKeyExpiresAt');
   try {
     const res = await api('/api/config/client-keys/generate', {
       method: 'POST',
-      body: JSON.stringify({ count, prefix })
+      body: JSON.stringify({ count, prefix, quota_limit: quotaLimit, expires_at: expiresAt, allowed_channels: getCheckedChannelKeys('newClientKeyChannels') })
     });
     clientKeys = res.api_keys || [];
     toast(`已生成 ${res.keys?.length || 0} 个调用 Key`);
@@ -614,17 +862,6 @@ async function deleteClientKey(key) {
   } catch(e) {
     toast('删除失败: ' + e.message, false);
   }
-}
-
-function getChModels() {
-  // Get all models from all channels for the picker
-  const all = [];
-  for (const [ckey, ch] of Object.entries(channels)) {
-    for (const m of ch.models) {
-      all.push({ channel: ckey, name: m, url: ch.base_url });
-    }
-  }
-  return all;
 }
 
 function formatNumber(value) {
@@ -804,6 +1041,31 @@ function formatBillingTitle(data) {
   }).join('\n');
 }
 
+function showBillingDetail(data) {
+  const items = Array.isArray(data?.items) ? data.items : [];
+  if (!items.length) { toast('暂无数据'); return; }
+  const rows = items.map(item => {
+    const label = `#${Number(item.index || 0) + 1} <code>${escapeHtml(item.fingerprint || '')}</code>`;
+    if (!item.ok || !item.billing) {
+      return `<tr><td>${label}</td><td colspan="2" style="color:#f85149">${escapeHtml(item.error || '查询失败')}</td></tr>`;
+    }
+    const remaining = Number(item.billing.free_tier_remaining || 0).toFixed(2);
+    const used = Number(item.billing.total_usage || 0).toFixed(2);
+    const color = item.billing.exceeds_free_tier ? '#f85149' : '#3fb950';
+    return `<tr><td>${label}</td><td style="color:${color}">$${remaining}</td><td style="color:#8b949e">$${used}</td></tr>`;
+  }).join('');
+  document.getElementById('modalContent').innerHTML = `
+    <h3>Pioneer Key 余额详情</h3>
+    <table style="width:100%;border-collapse:collapse;font-size:13px">
+      <thead><tr style="color:#8b949e"><th style="text-align:left;padding:4px 8px">Key</th><th style="padding:4px 8px">剩余</th><th style="padding:4px 8px">已用</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <div style="margin-top:12px;color:#8b949e;font-size:12px">合计：剩余 $${Number(data.free_tier_remaining||0).toFixed(2)}，已用 $${Number(data.total_usage||0).toFixed(2)}</div>
+    <button class="btn" onclick="closeModal()" style="margin-top:12px">关闭</button>
+  `;
+  document.getElementById('modal').classList.add('active');
+}
+
 function renderHeaderStats() {
   const keys = Object.keys(channels);
   const totalModels = Object.values(channels).reduce((s,c)=>s+c.models.length,0);
@@ -812,11 +1074,11 @@ function renderHeaderStats() {
     ? `${Number(billingData.successful_key_count || 0)}/${Number(billingData.key_count || 1)} keys · 已用 $${Number(billingData.total_usage || 0).toFixed(2)}${failedBillingCount ? ` · 失败 ${failedBillingCount}` : ''}`
     : '';
   const billingHtml = billingData ? `
-    <div class="stat" style="cursor:pointer" onclick="loadBilling()" title="${escapeHtml(formatBillingTitle(billingData))}">
+    <div class="stat" style="cursor:pointer" onclick="showBillingDetail(billingData)" title="${escapeHtml(formatBillingTitle(billingData))}">
       <div class="num" style="color:${billingData.exceeds_free_tier || failedBillingCount ? '#f85149' : '#3fb950'}">
         $${Number(billingData.free_tier_remaining || 0).toFixed(0)}
       </div>
-      <div class="label">Pioneer 剩余</div>
+      <div class="label">Pioneer 剩余 <span style="font-size:11px;opacity:.6" onclick="event.stopPropagation();loadBilling()">↻</span></div>
       <div class="sub">${escapeHtml(billingSub)}</div>
     </div>
   ` : `
@@ -897,17 +1159,6 @@ function render() {
   document.getElementById('channels').innerHTML = html;
 }
 
-async function fetchUpstreamModels(baseUrl, key) {
-  try {
-    const url = baseUrl.replace(/\/$/,'') + '/v1/models';
-    const resp = await fetch(url, { headers: { 'Authorization': `Bearer ${key}` } });
-    const d = await resp.json();
-    return (d.data || []).map(m => m.id);
-  } catch(e) {
-    return null;
-  }
-}
-
 async function showAddChannel() {
   editingKey = null;
   document.getElementById('modalContent').innerHTML = `
@@ -916,7 +1167,7 @@ async function showAddChannel() {
     <input id="chName" placeholder="例如: provider">
     <label>前缀 (模型名显示前缀)</label>
     <input id="chPrefix" placeholder="例如: ds (留空=不添加前缀)">
-    <div class="hint">模型会显示为 ds/model-name</div>
+    <div class="hint">模型会显示为 [ds]model-name</div>
     <label>API 地址</label>
     <input id="chUrl" placeholder="https://api.example.com/v1">
     <label>API Key</label>
@@ -924,11 +1175,12 @@ async function showAddChannel() {
     <label>上游 Key 池</label>
     <textarea id="chKeys" placeholder="一行一个；会按请求轮询。可把主 Key 也写在这里。"></textarea>
     <div class="hint">保存后会把 API Key 和这里的所有 Key 去重；同一渠道按请求轮询使用。</div>
-    <label>上游格式</label>
-    <select id="chFormat" onchange="toggleAnthropicFields()">
-      <option value="">OpenAI 兼容</option>
-      <option value="anthropic">Anthropic Messages API</option>
-    </select>
+	    <label>上游格式</label>
+	    <select id="chFormat" onchange="toggleAnthropicFields()">
+	      <option value="">OpenAI 兼容</option>
+	      <option value="anthropic">Anthropic Messages API</option>
+	      <option value="unlimited_api_chat">Unlimited /api/chat</option>
+	    </select>
     <label class="checkbox-label">
       <input id="chPromptCacheEnabled" type="checkbox">
       开启 Prompt Cache
@@ -990,25 +1242,36 @@ async function showAddChannel() {
 async function probeModels() {
   const url = document.getElementById('chUrl').value.trim();
   const key = document.getElementById('chKey').value.trim() || parseKeyList(document.getElementById('chKeys')?.value || '')[0] || '';
+  const format = document.getElementById('chFormat')?.value || channels[editingKey]?.format || '';
   const result = document.getElementById('probeResult');
   const picker = document.getElementById('modelPicker');
   
   if (!url || !key) { result.textContent = '请先填地址和Key'; return; }
   result.textContent = '探测中...';
   
-  const models = await fetchUpstreamModels(url, key);
-  if (!models) { result.textContent = '❌ 探测失败'; picker.style.display='none'; return; }
-  if (models.length === 0) { result.textContent = '⚠️ 上游无模型'; picker.style.display='none'; return; }
-  
-  result.textContent = `✅ 发现 ${models.length} 个模型`;
-  picker.style.display = 'block';
-  picker.innerHTML = models.map(m => `
-    <label><input type="checkbox" value="${m}" onchange="updateModelInput()"> ${m}</label>
-  `).join('');
+  try {
+    const resp = await fetch('/api/probe-models', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ base_url: url, key, format, channelKey: editingKey || '' })
+    });
+    const d = await resp.json();
+    if (!d.ok || !d.models) { result.textContent = '❌ 探测失败: ' + (d.error || ''); picker.style.display='none'; return; }
+    if (d.models.length === 0) { result.textContent = '⚠️ 上游无模型'; picker.style.display='none'; return; }
+    result.textContent = `✅ 发现 ${d.models.length} 个模型`;
+    picker.style.display = 'block';
+    picker.innerHTML = d.models.map(m => `
+      <label><input type="checkbox" value="${m}" onchange="updateModelInput()"> ${m}</label>
+    `).join('');
+  } catch(e) { result.textContent = '❌ 探测失败: ' + e.message; picker.style.display='none'; }
 }
 
 function updateModelInput() {
-  const checked = [...document.querySelectorAll('#modelPicker input:checked')].map(c => c.value);
+  const prefix = getCurrentModelPrefix();
+  const checked = [...document.querySelectorAll('#modelPicker input:checked')].map(c => {
+    const bare = stripOwnModelPrefix(c.value, prefix);
+    return prefix ? `[${prefix}]${bare}` : c.value;
+  });
   document.getElementById('chModels').value = checked.join(', ');
 }
 
@@ -1029,11 +1292,12 @@ function editChannel(ckey) {
     <label>上游 Key 池</label>
     <textarea id="chKeys" placeholder="一行一个；会按请求轮询。">${escapeHtml(getChannelKeys(ch).join('\n'))}</textarea>
     <div class="hint">保存后会把 API Key 和这里的所有 Key 去重；同一渠道按请求轮询使用。</div>
-    <label>上游格式</label>
-    <select id="chFormat" onchange="toggleAnthropicFields()">
-      <option value="" ${ch.format !== 'anthropic' ? 'selected' : ''}>OpenAI 兼容</option>
-      <option value="anthropic" ${ch.format === 'anthropic' ? 'selected' : ''}>Anthropic Messages API</option>
-    </select>
+	    <label>上游格式</label>
+	    <select id="chFormat" onchange="toggleAnthropicFields()">
+	      <option value="" ${!ch.format ? 'selected' : ''}>OpenAI 兼容</option>
+	      <option value="anthropic" ${ch.format === 'anthropic' ? 'selected' : ''}>Anthropic Messages API</option>
+	      <option value="unlimited_api_chat" ${ch.format === 'unlimited_api_chat' ? 'selected' : ''}>Unlimited /api/chat</option>
+	    </select>
     <label class="checkbox-label">
       <input id="chPromptCacheEnabled" type="checkbox" ${ch.prompt_cache_enabled ? 'checked' : ''}>
       开启 Prompt Cache
@@ -1143,9 +1407,9 @@ async function saveChannel() {
   if (editingKey) {
     ckey = editingKey;
   } else {
-    ckey = prefix || name.toLowerCase().replace(/[^a-z0-9]/g,'');
-    // Prefix models
-    const finalModels = prefix ? models.map(m => prefix + '/' + m.replace(new RegExp(`^${prefix}/`), '')) : models;
+    ckey = prefix || makeChannelKey(name, url);
+    // Re-apply only this gateway's wrapper; keep upstream provider tags.
+    const finalModels = applyModelPrefix(models, prefix);
     document.getElementById('chModels').value = finalModels.join(', ');
     // Save with raw key
     try {
@@ -1167,6 +1431,9 @@ async function saveChannel() {
     return;
   }
   
+  const finalModels = applyModelPrefix(models, ckey);
+  document.getElementById('chModels').value = finalModels.join(', ');
+
   try {
     const res = await api('/api/config/save', {
       method: 'POST',
@@ -1175,7 +1442,7 @@ async function saveChannel() {
         name, base_url: url,
         key: upstreamKeys[0] || key || channels[editingKey]?.key,
         keys: upstreamKeys.length ? upstreamKeys : getChannelKeys(channels[editingKey]),
-        models,
+        models: finalModels,
         ...channelOptions,
         isNew: false,
       })
@@ -1185,7 +1452,11 @@ async function saveChannel() {
   } catch(e) { toast('保存失败: '+e.message, false); }
 }
 
-function closeModal() { document.getElementById('modal').classList.remove('active'); }
+function closeModal() {
+  const modal = document.getElementById('modal');
+  modal.classList.remove('active');
+  modal.style.display = '';
+}
 
 async function deleteChannel(ckey) {
   if (!confirm(`确定删除渠道 "${channels[ckey].name}"？`)) return;
@@ -1224,27 +1495,30 @@ async function addModel(ckey) {
 }
 
 async function testChannel(ckey) {
-  const ch = channels[ckey];
-  const model = ch.models[0];
-  if (!model) { toast('该渠道没有模型', false); return; }
-  
   toast('测试中...');
   try {
-    // Strip prefix for upstream
-    const realModel = model.replace(/^[a-z]+\//, '');
-    const resp = await fetch(`http://localhost:8300/v1/chat/completions`, {
+    const resp = await fetch('/api/test-channel', {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, messages:[{role:'user',content:'hi'}], max_tokens:5 })
+      body: JSON.stringify({ channelKey: ckey })
     });
     const d = await resp.json();
-    if (d.choices) toast(`✅ ${ckey} 正常: ${d.choices[0].message.content}`);
-    else toast(`❌ ${ckey}: ${d.error?.message || '未知错误'}`, false);
+    if (d.ok) toast(`✅ ${ckey} 正常: ${d.reply}`);
+    else toast(`❌ ${ckey}: ${d.error || '未知错误'}`, false);
   } catch(e) { toast(`❌ ${ckey}: ${e.message}`, false); }
 }
 
-document.getElementById('modal').addEventListener('click', e => {
-  if (e.target === document.getElementById('modal')) closeModal();
+const modalOverlay = document.getElementById('modal');
+let modalPointerStartedOnOverlay = false;
+
+modalOverlay.addEventListener('pointerdown', e => {
+  modalPointerStartedOnOverlay = e.target === modalOverlay;
+});
+
+modalOverlay.addEventListener('pointerup', e => {
+  const selectedText = window.getSelection()?.toString() || '';
+  if (modalPointerStartedOnOverlay && e.target === modalOverlay && !selectedText) closeModal();
+  modalPointerStartedOnOverlay = false;
 });
 
 load();
