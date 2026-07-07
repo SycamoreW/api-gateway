@@ -7,6 +7,7 @@
       "name": "pio",
       "base_url": "https://api.pioneer.ai/v1",
       "key": "replace-with-pioneer-key",
+      "enabled": true,
       "keys": [
         "replace-with-pioneer-key",
         "replace-with-second-pioneer-key"
@@ -23,6 +24,7 @@
       "name": "anthropic",
       "base_url": "https://api.anthropic.com/v1",
       "key": "replace-with-anthropic-key",
+      "enabled": true,
       "format": "anthropic",
       "anthropic_version": "2023-06-01",
       "prompt_cache_enabled": true,

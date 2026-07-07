@@ -79,6 +79,11 @@ function readVisibleGatewayLogs(limit = 100) {
   }
 }
 
+function clearCurrentGatewayLog() {
+  ensureLogDir();
+  fs.writeFileSync(currentLogFile(), '');
+}
+
 function newRequestId() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -321,122 +326,14 @@ function selectChannelKey(channel = {}, channelKey = '') {
   };
 }
 
-async function fetchPioneerBilling(key) {
-  return new Promise((resolve, reject) => {
-    const billingReq = https.request('https://api.pioneer.ai/billing/billing-status', {
-      method: 'GET',
-      headers: { 'X-API-Key': key },
-    }, (r) => {
-      let data = '';
-      r.on('data', c => data += c);
-      r.on('end', () => {
-        if (r.statusCode >= 200 && r.statusCode < 300) {
-          try { resolve(JSON.parse(data)); } catch (e) { reject(new Error('Pioneer API 返回非 JSON')); }
-        } else {
-          reject(new Error(`Pioneer API error: ${r.statusCode} ${data}`));
-        }
-      });
-    });
-    billingReq.on('error', reject);
-    billingReq.setTimeout(10000, () => {
-      billingReq.destroy();
-      reject(new Error('Pioneer API timeout'));
-    });
-    billingReq.end();
-  });
-}
-
-function toMoneyNumber(value) {
-  const number = Number(value);
-  return Number.isFinite(number) ? number : 0;
-}
-
-function summarizePioneerBilling(items = []) {
-  const successful = items.filter(item => item.ok && item.billing);
-  const totalUsage = successful.reduce((sum, item) => sum + toMoneyNumber(item.billing.total_usage), 0);
-  const freeTierRemaining = successful.reduce((sum, item) => sum + toMoneyNumber(item.billing.free_tier_remaining), 0);
-  const exceedsFreeTier = successful.some(item => Boolean(item.billing.exceeds_free_tier));
-  return {
-    total_usage: totalUsage,
-    free_tier_remaining: freeTierRemaining,
-    exceeds_free_tier: exceedsFreeTier,
-    key_count: items.length,
-    successful_key_count: successful.length,
-    failed_key_count: items.length - successful.length,
-    items,
-  };
-}
-
-function findPioneerChannelEntry() {
-  for (const [channelKey, channel] of Object.entries(config.channels || {})) {
-    if (channel?.base_url && String(channel.base_url).includes('api.pioneer.ai')) {
-      return { channelKey, channel };
-    }
-  }
-  return null;
-}
-
-async function fetchPioneerBillingItem(key, index) {
-  const item = {
-    index,
-    fingerprint: fingerprintKey(key),
-    ok: false,
-    billing: null,
-    error: '',
-  };
-  try {
-    item.billing = await fetchPioneerBilling(key);
-    item.ok = true;
-  } catch (err) {
-    item.error = err.message || '查询失败';
-  }
-  return item;
-}
-
-async function getPioneerBillingSummary() {
-  const entry = findPioneerChannelEntry();
-  const pioneerKeys = getChannelKeys(entry?.channel || {});
-  if (!entry || pioneerKeys.length === 0) {
-    const err = new Error('未配置 Pioneer 渠道');
-    err.statusCode = 404;
-    throw err;
-  }
-  const items = await Promise.all(pioneerKeys.map(fetchPioneerBillingItem));
-  const billing = summarizePioneerBilling(items);
-  if (billing.successful_key_count === 0) {
-    throw new Error(items.map(item => `#${item.index + 1}: ${item.error}`).join('; ') || 'Pioneer 额度查询失败');
-  }
-  return { ...entry, billing };
-}
-
-const PIONEER_BILLING_MODEL_PREFIX = 'pio-';
-const LEGACY_PIONEER_BILLING_MODEL_PREFIX = 'pio-billing/';
-const PIONEER_BILLING_DISPLAY_MODEL_RE = /^pio-\d+(?:\.\d+)?$/;
-
-function isPioneerBillingDisplayModel(model = '') {
-  const value = String(model || '');
-  return value.startsWith(LEGACY_PIONEER_BILLING_MODEL_PREFIX) || PIONEER_BILLING_DISPLAY_MODEL_RE.test(value) || value.startsWith('pio-error-');
-}
-
-function moneySlug(value) {
-  return toMoneyNumber(value).toFixed(2);
-}
-
-function makePioneerBillingModelId(billing) {
-  return `${PIONEER_BILLING_MODEL_PREFIX}${moneySlug(billing?.free_tier_remaining)}`;
-}
-
-function makePioneerBillingErrorModelId(error) {
-  const reason = String(error?.message || error || 'query-failed')
-    .replace(/[^a-z0-9]+/gi, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 48) || 'query-failed';
-  return `${PIONEER_BILLING_MODEL_PREFIX}error-${reason}`;
-}
 
 function normalizeChannelForSave(channel = {}) {
   const keys = getChannelKeys(channel);
   const next = { ...channel };
+  next.enabled = channel.enabled !== false;
+  if (Object.prototype.hasOwnProperty.call(channel, 'model_prefix')) {
+    next.model_prefix = String(channel.model_prefix || '').trim();
+  }
   if (next.prompt_cache_enabled) {
     next.prompt_cache_ttl = normalizePromptCacheTtl(next.prompt_cache_ttl);
   } else {
@@ -451,6 +348,18 @@ function normalizeChannelForSave(channel = {}) {
     delete next.keys;
   }
   return next;
+}
+
+function isChannelEnabled(channel = {}) {
+  return channel?.enabled !== false;
+}
+
+function isYepApiChannel(channel = {}) {
+  try {
+    return channel.format === 'yepapi' || new URL(channel.base_url).hostname.toLowerCase() === 'api.yepapi.com';
+  } catch {
+    return channel.format === 'yepapi';
+  }
 }
 
 function normalizePromptCacheTtl(ttl = '') {
@@ -678,16 +587,20 @@ function logRequest(model, channel, tokens = 0, success = true, error = null) {
 
 const SERVE_UI = fs.existsSync(path.resolve('ui.html'));
 
+const LEGACY_MODEL_ALIASES = new Map([
+]);
+
 // Build model -> channel mapping
 const modelMap = new Map(); // modelName -> { channelKey, upstreamModel }
 function rebuildModelMap() {
   modelMap.clear();
   for (const [ckey, ch] of Object.entries(config.channels)) {
+    if (!isChannelEnabled(ch)) continue;
     const overrides = (ch && typeof ch.model_overrides === 'object' && ch.model_overrides) || {};
     for (const m of ch.models) {
       // Allow per-channel model_overrides to rewrite the upstream model id.
-      // Example: { "pioneer/auto": "pio/claude-opus-4-7" } makes inbound
-      // `pioneer/auto` resolve to the same channel but forward `claude-opus-4-7`
+      // Example: { "provider/auto": "provider/model-id" } makes inbound
+      // `provider/auto` resolve to the same channel but forward `model-id`
       // (after stripModelPrefix) to the upstream provider.
       const override = Object.prototype.hasOwnProperty.call(overrides, m) ? overrides[m] : null;
       const upstreamModel = (typeof override === 'string' && override.trim()) ? override.trim() : m;
@@ -772,6 +685,7 @@ function isClientKeyExpired(entry = {}) {
 }
 
 function clientCanUseChannel(req, channelKey = '') {
+  if (!isChannelEnabled(config.channels?.[channelKey])) return false;
   if (req.clientApiKeyType === 'admin') return true;
   const allowedChannels = req.clientAllowedChannels || [];
   if (allowedChannels.length === 0) return true;
@@ -1189,9 +1103,7 @@ function convertOpenAIChatToAnthropic(data, realModel, channel = {}) {
     messages,
     max_tokens: data.max_tokens || data.max_completion_tokens || 4096,
   };
-  if (channel.name === 'pio' || String(channel.base_url || '').includes('api.pioneer.ai')) {
-    payload.max_tokens = Math.max(Number(payload.max_tokens) || 0, 32768);
-  }
+
 
   if (channel.prompt_cache_enabled) {
     payload.cache_control = getPromptCacheControl(data, channel);
@@ -1565,6 +1477,39 @@ async function proxyUnlimitedChatRequest(channel, req, res, data, upstreamModel 
   });
 }
 
+function reorderYepApiMessages(data) {
+  if (!data || !Array.isArray(data.messages) || data.messages.length === 0) return data;
+  const messages = data.messages;
+  let firstUserIdx = -1;
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i].role === 'user') { firstUserIdx = i; break; }
+  }
+  if (firstUserIdx <= 0) return data; // no leading non-user messages or first is already user
+  // Collect system and assistant messages before the first user message
+  const leading = messages.slice(0, firstUserIdx);
+  const rest = messages.slice(firstUserIdx);
+  // Merge leading messages into the system prompt
+  const systemParts = [];
+  const assistantParts = [];
+  for (const msg of leading) {
+    if (msg.role === 'system') {
+      systemParts.push(typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content));
+    } else if (msg.role === 'assistant') {
+      assistantParts.push(typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content));
+    }
+  }
+  const newMessages = [];
+  const mergedSystem = [
+    ...systemParts,
+    ...(assistantParts.length ? ['[Character Introduction]\n' + assistantParts.join('\n\n')] : []),
+  ].join('\n\n');
+  if (mergedSystem) {
+    newMessages.push({ role: 'system', content: mergedSystem });
+  }
+  newMessages.push(...rest);
+  return { ...data, messages: newMessages };
+}
+
 function sanitizePayloadForUpstream(data, upstreamModel) {
   if (!data || typeof data !== 'object') return { data, removedParams: [] };
   const next = { ...data };
@@ -1583,18 +1528,45 @@ function sanitizePayloadForUpstream(data, upstreamModel) {
   return { data: next, removedParams };
 }
 
+function getConfiguredModelParams(channel = {}, requestedModel = '') {
+  const params = channel && typeof channel.model_params === 'object' && channel.model_params
+    ? channel.model_params
+    : {};
+  const value = Object.prototype.hasOwnProperty.call(params, requestedModel) ? params[requestedModel] : null;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  return { ...value };
+}
+
+function isForcedNonStreamModel(channelKey = '', modelName = '') {
+  if (channelKey !== '反重力') return false;
+  const name = String(modelName || '');
+  return name === '[反重力]gemini-3.1-pro-low'
+    || name === '[反重力]gemini-3.5-flash-extra-low'
+    || name === 'gemini-3.1-pro-low'
+    || name === 'gemini-3.5-flash-extra-low';
+}
+
+function shouldBufferNonStreamResponse(channelKey = '', modelName = '', body = '') {
+  return isForcedNonStreamModel(channelKey, modelName);
+}
+
 async function proxyRequest(channel, req, res, body, modelName = '', requestId = '', logContext = {}, channelKey = '') {
   const targetUrl = new URL(channel.base_url);
   // Append the request path (strip /v1 prefix if base_url already has it)
   const reqPath = req.url.startsWith('/v1/') ? req.url.slice(3) : req.url;
   const fullUrl = `${channel.base_url}${reqPath}`;
+  const bufferNonStream = shouldBufferNonStreamResponse(channelKey, modelName, body);
   
   const headers = {};
   // Forward only necessary headers
   if (req.headers['content-type']) headers['content-type'] = req.headers['content-type'];
   if (req.headers['accept']) headers['accept'] = req.headers['accept'];
   const selectedKey = selectChannelKey(channel, channelKey);
-  headers['authorization'] = `Bearer ${selectedKey.key}`;
+  if (isYepApiChannel(channel)) {
+    headers['x-api-key'] = selectedKey.key;
+  } else {
+    headers['authorization'] = `Bearer ${selectedKey.key}`;
+  }
   headers['content-length'] = body ? Buffer.byteLength(body) : 0;
   
   return new Promise((resolve, reject) => {
@@ -1622,21 +1594,32 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
       method: req.method,
       requestBytes: Buffer.byteLength(body || ''),
       inputContent: logContext.inputContent,
+      ...(bufferNonStream ? { bufferNonStream: true } : {}),
       upstreamKeyIndex: selectedKey.index,
       upstreamKeyCount: selectedKey.count,
       upstreamKeyFingerprint: selectedKey.fingerprint,
     });
     
     const proxy = transport.request(options, (proxyRes) => {
-      res.writeHead(proxyRes.statusCode, proxyRes.headers);
+      if (!bufferNonStream) {
+        res.writeHead(proxyRes.statusCode, proxyRes.headers);
+      }
       // 收集响应数据以提取 token 使用量
       proxyRes.on('data', chunk => {
         responseData += chunk.toString();
-        res.write(chunk);
+        if (!bufferNonStream) {
+          res.write(chunk);
+        }
       });
       
       proxyRes.on('end', () => {
-        if (!res.writableEnded) {
+        if (bufferNonStream && !res.headersSent) {
+          const responseHeaders = { ...proxyRes.headers };
+          delete responseHeaders['transfer-encoding'];
+          responseHeaders['content-length'] = Buffer.byteLength(responseData);
+          res.writeHead(proxyRes.statusCode, responseHeaders);
+          res.end(responseData);
+        } else if (!res.writableEnded) {
           res.end();
         }
         
@@ -2110,7 +2093,7 @@ async function handleChatCompletions(req, res, body, requestId) {
     return;
   }
   const logContext = buildLogContext(req, data);
-  const modelName = data.model;
+  let modelName = data.model;
   const messageCount = Array.isArray(data.messages) ? data.messages.length : 0;
   const paramKeys = Object.keys(data).filter(k => !['model', 'messages', 'stream'].includes(k));
   writeGatewayLog('chat_request', {
@@ -2141,21 +2124,15 @@ async function handleChatCompletions(req, res, body, requestId) {
     return;
   }
 
-  if (isPioneerBillingDisplayModel(modelName)) {
-    res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: { message: 'Pioneer 额度展示模型不能用于对话', type: 'display_model_not_callable' } }));
-    logRequest(modelName, 'none', 0, false, requestLogOptions(logContext, requestId, 'display_model_not_callable'));
-    writeGatewayLog('request_complete', responseLogFields(logContext, {
+  const aliasedModelName = LEGACY_MODEL_ALIASES.get(modelName);
+  if (aliasedModelName) {
+    writeGatewayLog('model_legacy_alias', {
       requestId,
-      model: modelName,
-      channel: 'none',
-      statusCode: 400,
-      inputTokens: 0,
-      outputTokens: 0,
-      totalTokens: 0,
-      errorMessage: 'display_model_not_callable',
-    }));
-    return;
+      requestedModel: modelName,
+      matchedModel: aliasedModelName,
+    });
+    data.model = aliasedModelName;
+    modelName = aliasedModelName;
   }
   
   let entry = modelMap.get(modelName);
@@ -2267,11 +2244,19 @@ async function handleChatCompletions(req, res, body, requestId) {
   const upstreamModel = entry.upstreamModel;
   // Remove provider prefixes like "local/" before passing upstream.
   const realModel = stripModelPrefix(upstreamModel, entry.channelKey);
+  const modelParams = getConfiguredModelParams(channel, modelName);
   const channelInput = channel.format === 'anthropic' || channel.format === 'unlimited_api_chat'
-    ? { ...data, model: realModel }
-    : applyOpenAICompatiblePromptCache({ ...data, model: realModel }, channel);
+    ? { ...data, ...modelParams, model: realModel }
+    : applyOpenAICompatiblePromptCache({ ...data, ...modelParams, model: realModel }, channel);
   const sanitized = sanitizePayloadForUpstream(channelInput, upstreamModel);
   data = sanitized.data;
+  // YepAPI: reorder messages to avoid assistant-before-user pattern that triggers broken Google routing
+  if (isYepApiChannel(channel) && Array.isArray(data.messages)) {
+    data = reorderYepApiMessages(data);
+  }
+  if (isForcedNonStreamModel(entry.channelKey, upstreamModel)) {
+    data.stream = false;
+  }
   body = JSON.stringify(data);  // 已经过滤过参数的 data
   writeGatewayLog('model_routed', {
     requestId,
@@ -2287,6 +2272,7 @@ async function handleChatCompletions(req, res, body, requestId) {
       quotaRemaining: Number.isFinite(quota.remaining) ? quota.remaining : null,
     } : {}),
     finalParams: Object.keys(data).filter(k => !['model', 'messages', 'stream'].includes(k)),
+    ...(Object.keys(modelParams).length ? { modelParams: Object.keys(modelParams) } : {}),
     ...(sanitized.removedParams.length ? { removedParams: sanitized.removedParams } : {}),
   });
   
@@ -2333,25 +2319,7 @@ async function handleModels(req, res) {
     }
   }
 
-  const pioneerEntry = findPioneerChannelEntry();
-  if (pioneerEntry && clientCanUseChannel(req, pioneerEntry.channelKey)) {
-    try {
-      const { billing } = await getPioneerBillingSummary();
-      models.push({
-        id: makePioneerBillingModelId(billing),
-        object: 'model',
-        created: 0,
-        owned_by: 'Pioneer 额度',
-      });
-    } catch (err) {
-      models.push({
-        id: makePioneerBillingErrorModelId(err),
-        object: 'model',
-        created: 0,
-        owned_by: 'Pioneer 额度',
-      });
-    }
-  }
+
 
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ object: 'list', data: models }));
@@ -2549,20 +2517,17 @@ async function handleConfigAPI(req, res, url, body) {
     }));
     return true;
   }
-  
-  // 统计数据 API
-  // Pioneer 额度查询 API
-  if (url === '/api/billing' && req.method === 'GET') {
+
+  if (url === '/api/logs/clear' && req.method === 'POST') {
     try {
-      const { billing } = await getPioneerBillingSummary();
+      clearCurrentGatewayLog();
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, billing }));
-      return true;
+      res.end(JSON.stringify({ ok: true, file: currentLogFile() }));
     } catch (err) {
-      res.writeHead(err.statusCode || 502, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: false, error: err.message }));
-      return true;
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: err.message || '清空日志失败' }));
     }
+    return true;
   }
 
   if (url === '/api/stats' && req.method === 'GET') {
@@ -2570,7 +2535,7 @@ async function handleConfigAPI(req, res, url, body) {
     res.end(JSON.stringify(stats));
     return true;
   }
-  
+
   if (url === '/api/stats/reset' && req.method === 'POST') {
     stats = {
       totalRequests: 0,
@@ -2579,14 +2544,14 @@ async function handleConfigAPI(req, res, url, body) {
       ipUsage: {},
       dailyStats: {},
       hourlyStats: {},
-      recentLogs: []
+      recentLogs: [],
     };
     saveStats();
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true }));
     return true;
   }
-  
+
   if (url === '/api/config/save' && req.method === 'POST') {
     const d = JSON.parse(body);
     const {
@@ -2604,22 +2569,24 @@ async function handleConfigAPI(req, res, url, body) {
       anthropic_thinking_budget_tokens,
       anthropic_output_effort,
       anthropic_thinking_display,
+      model_prefix,
+      enabled,
       isNew,
       previousChannelKey,
     } = d;
-    
+
     if (!channelKey) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: false, error: 'channelKey required' }));
       return true;
     }
-    
+
     if (isNew && config.channels[channelKey]) {
       res.writeHead(409, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: false, error: '渠道 key 已存在' }));
       return true;
     }
-    
+
     const oldChannelKey = !isNew && previousChannelKey ? String(previousChannelKey) : channelKey;
     const isRename = !isNew && oldChannelKey !== channelKey;
 
@@ -2652,9 +2619,11 @@ async function handleConfigAPI(req, res, url, body) {
       ...(anthropic_thinking_type === 'enabled' ? { anthropic_thinking_budget_tokens: toPositiveInteger(anthropic_thinking_budget_tokens, 32000) } : {}),
       ...(anthropic_thinking_type === 'adaptive' && anthropic_output_effort ? { anthropic_output_effort } : {}),
       ...(anthropic_thinking_type === 'adaptive' && anthropic_thinking_display ? { anthropic_thinking_display } : {}),
+      ...(Object.prototype.hasOwnProperty.call(d, 'model_prefix') ? { model_prefix } : {}),
+      enabled: enabled !== false,
       models: models || [],
     });
-    
+
     if (isRename) {
       delete config.channels[oldChannelKey];
       channelKeyCursors.delete(oldChannelKey);
@@ -2665,14 +2634,13 @@ async function handleConfigAPI(req, res, url, body) {
     }
 
     rebuildModelMap();
-    
     saveConfig();
     console.log(`[config] saved channel: ${channelKey}`);
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true }));
     return true;
   }
-  
+
   if (url === '/api/config/delete' && req.method === 'POST') {
     const d = JSON.parse(body);
     const { channelKey } = d;
@@ -2689,7 +2657,28 @@ async function handleConfigAPI(req, res, url, body) {
     res.end(JSON.stringify({ ok: true }));
     return true;
   }
-  
+
+  if (url === '/api/config/channel-enabled' && req.method === 'POST') {
+    const d = JSON.parse(body);
+    const { channelKey, enabled } = d;
+    if (!channelKey || !config.channels[channelKey]) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: '渠道不存在' }));
+      return true;
+    }
+    config.channels[channelKey] = normalizeChannelForSave({
+      ...config.channels[channelKey],
+      enabled: enabled !== false,
+    });
+    if (enabled === false) channelKeyCursors.delete(channelKey);
+    rebuildModelMap();
+    saveConfig();
+    console.log(`[config] ${enabled === false ? 'disabled' : 'enabled'} channel: ${channelKey}`);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+    return true;
+  }
+
   if (url === '/api/config/add-model' && req.method === 'POST') {
     const d = JSON.parse(body);
     const { channelKey, model } = d;
@@ -2707,7 +2696,7 @@ async function handleConfigAPI(req, res, url, body) {
     res.end(JSON.stringify({ ok: true }));
     return true;
   }
-  
+
   if (url === '/api/config/remove-model' && req.method === 'POST') {
     const d = JSON.parse(body);
     const { channelKey, model } = d;
@@ -2723,8 +2712,7 @@ async function handleConfigAPI(req, res, url, body) {
     res.end(JSON.stringify({ ok: true }));
     return true;
   }
-  
-  // Backend proxy: probe upstream models (avoids browser CORS)
+
   if (url === '/api/probe-models' && req.method === 'POST') {
     try {
       const d = JSON.parse(body);
@@ -2764,7 +2752,6 @@ async function handleConfigAPI(req, res, url, body) {
     return true;
   }
 
-  // Backend proxy: test channel by sending a minimal chat request
   if (url === '/api/test-channel' && req.method === 'POST') {
     try {
       const d = JSON.parse(body);
@@ -2773,6 +2760,11 @@ async function handleConfigAPI(req, res, url, body) {
       if (!ch) {
         res.writeHead(404, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: false, error: '渠道不存在' }));
+        return true;
+      }
+      if (!isChannelEnabled(ch)) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: '渠道已禁用' }));
         return true;
       }
       const model = ch.models[0];
@@ -2823,13 +2815,13 @@ const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', '*');
-  
+
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
     res.end();
     return;
   }
-  
+
   const url = req.url;
   
   // Web UI

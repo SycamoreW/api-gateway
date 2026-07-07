@@ -48,6 +48,7 @@ On Termux, `start.sh` will try to open the WebUI automatically. If it does not o
 - OpenAI-compatible `/v1/models` and `/v1/chat/completions`
 - Route models to multiple upstream channels
 - WebUI channel and model management
+- Disable channels without deleting their saved configuration, keys, or model list
 - Multiple upstream keys per channel with round-robin rotation
 - Generated client API keys for `/v1` access
 - Request logs and usage stats, including per-IP usage
@@ -140,6 +141,7 @@ Important fields:
       "name": "anthropic",
       "base_url": "https://api.anthropic.com/v1",
       "key": "sk-ant-...",
+      "enabled": true,
       "format": "anthropic",
       "anthropic_version": "2023-06-01",
       "prompt_cache_enabled": true,
@@ -152,6 +154,7 @@ Important fields:
       "name": "pio",
       "base_url": "https://api.pioneer.ai/v1",
       "key": "pio_sk_...",
+      "enabled": true,
       "keys": ["pio_sk_...", "pio_sk_second..."],
       "prompt_cache_enabled": true,
       "prompt_cache_ttl": "1h",
