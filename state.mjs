@@ -1,7 +1,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-const CONFIG_FILE = path.resolve(process.argv[2] || 'config.json');
+let CONFIG_FILE = path.resolve(process.argv[2] || 'config.json');
+if (!fs.existsSync(CONFIG_FILE)) {
+  const fallback = path.resolve(import.meta.dirname, 'config.json');
+  if (fs.existsSync(fallback)) {
+    CONFIG_FILE = fallback;
+  }
+}
 const config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
 if (!Array.isArray(config.api_keys)) config.api_keys = [];
 
