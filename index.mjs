@@ -1,9 +1,10 @@
 import http from 'node:http';
 import fs from 'node:fs';
-import { config, modelMap, stats, SERVE_UI } from './state.mjs';
+import { config, modelMap, stats, SERVE_UI, UI_FILE } from './state.mjs';
 import {
   writeGatewayLog, newRequestId, saveStats,
   backfillHourlyStatsFromRecentLogs, backfillUsageCacheFromRecentLogs,
+  backfillUpstreamKeyUsageFromRecentLogs,
 } from './logger.mjs';
 import { rebuildModelMap } from './config.mjs';
 import { adminAuth, clientAuth } from './auth.mjs';
@@ -16,6 +17,7 @@ import {
 rebuildModelMap();
 backfillHourlyStatsFromRecentLogs();
 backfillUsageCacheFromRecentLogs();
+backfillUpstreamKeyUsageFromRecentLogs();
 
 const server = http.createServer(async (req, res) => {
   const requestId = newRequestId();
@@ -39,19 +41,19 @@ const server = http.createServer(async (req, res) => {
   }
 
   const url = req.url;
-  
+
   // Web UI
   if (SERVE_UI && (url === '/' || url === '/ui')) {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(fs.readFileSync('ui.html', 'utf-8'));
+    res.end(fs.readFileSync(UI_FILE, 'utf-8'));
     return;
   }
-  
+
   // Health check
   if (url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ 
-      status: 'ok', 
+    res.end(JSON.stringify({
+      status: 'ok',
       name: '聚合渠道',
       channels: Object.keys(config.channels).length,
       models: [...modelMap.keys()].length,
@@ -59,7 +61,7 @@ const server = http.createServer(async (req, res) => {
     }));
     return;
   }
-  
+
   // Collect body for POST
   let body = '';
   if (req.method === 'POST') {
@@ -69,7 +71,7 @@ const server = http.createServer(async (req, res) => {
       req.on('end', () => resolve(Buffer.concat(chunks).toString()));
     });
   }
-  
+
   // Route
   if (url.startsWith('/api/')) {
     if (!adminAuth(req, res)) return;
@@ -84,7 +86,7 @@ const server = http.createServer(async (req, res) => {
   if (url.startsWith('/v1/')) {
     if (!clientAuth(req, res)) return;
   }
-  
+
   if (url === '/v1/models' && req.method === 'GET') {
     await handleModels(req, res);
   } else if (url === '/v1/chat/completions' && req.method === 'POST') {
@@ -123,7 +125,7 @@ server.listen(config.port, '0.0.0.0', () => {
   console.log(`模型总数: ${[...modelMap.keys()].length}`);
   console.log(`统计功能: 已启用`);
   console.log(`========================================`);
-  
+
   // 显示已有统计
   if (stats.totalRequests > 0) {
     console.log(`历史请求数: ${stats.totalRequests}`);

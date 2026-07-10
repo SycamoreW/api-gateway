@@ -11,12 +11,12 @@ if (!fs.existsSync(CONFIG_FILE)) {
 const config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
 if (!Array.isArray(config.api_keys)) config.api_keys = [];
 
-const LOG_DIR = path.resolve('logs');
+const LOG_DIR = path.resolve(import.meta.dirname, 'logs');
 const LOG_MAX_BODY_CHARS = 2000;
 const HIDDEN_UI_LOG_EVENTS = new Set(['http_request', 'model_params', 'model_routed']);
 const channelKeyCursors = new Map();
 
-const STATS_FILE = path.resolve('stats.json');
+const STATS_FILE = path.resolve(import.meta.dirname, 'stats.json');
 let stats = {};
 if (fs.existsSync(STATS_FILE)) {
   stats = JSON.parse(fs.readFileSync(STATS_FILE, 'utf-8'));
@@ -32,8 +32,10 @@ if (fs.existsSync(STATS_FILE)) {
   };
 }
 if (!stats.hourlyStats || typeof stats.hourlyStats !== 'object') stats.hourlyStats = {};
+if (!stats.upstreamKeyUsage || typeof stats.upstreamKeyUsage !== 'object') stats.upstreamKeyUsage = {};
 
-const SERVE_UI = fs.existsSync(path.resolve('ui.html'));
+const UI_FILE = path.resolve(import.meta.dirname, 'ui.html');
+const SERVE_UI = fs.existsSync(UI_FILE);
 
 const LEGACY_MODEL_ALIASES = new Map([
 ]);
@@ -49,6 +51,7 @@ export function resetStats() {
     ipUsage: {},
     dailyStats: {},
     hourlyStats: {},
+    upstreamKeyUsage: {},
     recentLogs: [],
   });
 }
@@ -61,6 +64,7 @@ export {
   HIDDEN_UI_LOG_EVENTS,
   channelKeyCursors,
   STATS_FILE,
+  UI_FILE,
   SERVE_UI,
   LEGACY_MODEL_ALIASES,
   modelMap,

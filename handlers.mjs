@@ -6,12 +6,14 @@ import {
   writeGatewayLog, logRequest, responseLogFields, requestLogOptions,
   getClientIp, sanitizeHeaders, buildLogContext, truncateText,
   currentLogFile, readVisibleGatewayLogs, clearCurrentGatewayLog,
-  saveStats, newRequestId,
+  saveStats, newRequestId, fingerprintKey, recordUpstreamKeyTest,
 } from './logger.mjs';
 import {
-  isChannelEnabled, getChannelKeys, normalizeKeyList, normalizeStringArray,
+  isChannelEnabled, getChannelKeys, getActiveChannelKeys, isKeyDisabled,
+  normalizeKeyList, normalizeStringArray,
   normalizeExpiresAt, normalizeClientKeyEntry, normalizeChannelForSave,
   normalizeImportedConfig, rebuildModelMap, saveConfig,
+  classifyUpstreamKeyFailure, disableUpstreamChannelKey, enableUpstreamChannelKey,
 } from './config.mjs';
 import {
   stripModelPrefix, applyOpenAICompatiblePromptCache,
@@ -66,7 +68,7 @@ async function handleChatCompletions(req, res, body, requestId) {
     inputContent: logContext.inputContent,
     headers: sanitizeHeaders(req.headers),
   });
-  
+
   if (!modelName) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { message: 'model is required', type: 'invalid_request' } }));
@@ -94,7 +96,7 @@ async function handleChatCompletions(req, res, body, requestId) {
     data.model = aliasedModelName;
     modelName = aliasedModelName;
   }
-  
+
   let entry = modelMap.get(modelName);
   if (entry && !clientCanUseModel(req, modelName, entry.channelKey)) {
     entry = null;
@@ -130,7 +132,7 @@ async function handleChatCompletions(req, res, body, requestId) {
       channelKey: entry.channelKey,
     });
   }
-  
+
   const channel = config.channels[entry.channelKey];
   if (!clientCanUseChannel(req, entry.channelKey)) {
     res.writeHead(404, { 'Content-Type': 'application/json' });
@@ -199,7 +201,7 @@ async function handleChatCompletions(req, res, body, requestId) {
     }));
     return;
   }
-  
+
   // Strip prefix from model name for upstream
   const upstreamModel = entry.upstreamModel;
   // Remove provider prefixes like "local/" before passing upstream.
@@ -235,7 +237,7 @@ async function handleChatCompletions(req, res, body, requestId) {
     ...(Object.keys(modelParams).length ? { modelParams: Object.keys(modelParams) } : {}),
     ...(sanitized.removedParams.length ? { removedParams: sanitized.removedParams } : {}),
   });
-  
+
   try {
     if (channel.format === 'anthropic') {
       await proxyAnthropicChatRequest(channel, req, res, data, upstreamModel, modelName, requestId, logContext, entry.channelKey);
@@ -285,6 +287,176 @@ async function handleModels(req, res) {
   res.end(JSON.stringify({ object: 'list', data: models }));
 }
 
+function getChannelKeyDashboard(channelKey, ch = {}) {
+  const keys = getChannelKeys(ch);
+  const disabledSet = new Set(Array.isArray(ch.disabled_keys) ? ch.disabled_keys : []);
+  const disabledMeta = ch.disabled_key_meta && typeof ch.disabled_key_meta === 'object'
+    ? ch.disabled_key_meta
+    : {};
+  const rows = keys.map((key, index) => {
+    const fingerprint = fingerprintKey(key);
+    const usage = stats.upstreamKeyUsage?.[fingerprint] || {};
+    const meta = disabledMeta[key] || {};
+    return {
+      id: fingerprint,
+      index,
+      key,
+      maskedKey: key.length <= 8 ? `${key.slice(0, 1)}***${key.slice(-1)}` : `${key.slice(0, 6)}…${key.slice(-4)}`,
+      enabled: !disabledSet.has(key),
+      disabledReason: meta.reason || '',
+      disabledStatus: meta.status || null,
+      disabledAt: meta.disabled_at || '',
+      lastError: usage.lastError || meta.last_error || '',
+      lastErrorAt: usage.lastErrorAt || meta.last_error_at || '',
+      lastUsedAt: usage.lastUsedAt || null,
+      lastStatus: usage.lastStatus || null,
+      lastTestAt: usage.lastTestAt || null,
+      lastTestStatus: usage.lastTestStatus || null,
+      lastTestPassed: typeof usage.lastTestPassed === 'boolean' ? usage.lastTestPassed : null,
+      totalRequests: Number(usage.totalRequests) || 0,
+      totalErrors: Number(usage.totalErrors) || 0,
+      totalInputTokens: Number(usage.totalInputTokens) || 0,
+      totalOutputTokens: Number(usage.totalOutputTokens) || 0,
+    };
+  });
+  return {
+    channelKey,
+    name: ch.name || channelKey,
+    keys: rows,
+    totals: rows.reduce((total, row) => ({
+      total: total.total + 1,
+      enabled: total.enabled + (row.enabled ? 1 : 0),
+      disabled: total.disabled + (row.enabled ? 0 : 1),
+      requests: total.requests + row.totalRequests,
+      errors: total.errors + row.totalErrors,
+      inputTokens: total.inputTokens + row.totalInputTokens,
+      outputTokens: total.outputTokens + row.totalOutputTokens,
+    }), { total: 0, enabled: 0, disabled: 0, requests: 0, errors: 0, inputTokens: 0, outputTokens: 0 }),
+  };
+}
+
+function parseUpstreamTestPayload(text = '') {
+  try {
+    return JSON.parse(text);
+  } catch {
+    for (const line of String(text).split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data: ')) continue;
+      const payload = trimmed.slice(6);
+      if (!payload || payload === '[DONE]') continue;
+      try { return JSON.parse(payload); } catch { /* continue */ }
+    }
+  }
+  return null;
+}
+
+async function testUpstreamChannelKey(channelKey, key, options = {}) {
+  const ch = config.channels[channelKey];
+  if (!ch) return { ok: false, pass: false, error: '渠道不存在', status: null };
+  const trimmedKey = String(key || '').trim();
+  if (!trimmedKey || !getChannelKeys(ch).includes(trimmedKey)) {
+    return { ok: false, pass: false, error: 'Key 不存在', status: null };
+  }
+  const model = ch.models?.[0];
+  if (!model) return { ok: false, pass: false, error: '渠道没有模型', status: null };
+
+  const realModel = stripModelPrefix(model, channelKey);
+  const format = ch.format || '';
+  const baseUrl = ch.base_url.replace(/\/+$/, '');
+  let chatUrl;
+  let headers;
+  let requestBody;
+  if (format === 'anthropic') {
+    chatUrl = `${baseUrl}/messages`;
+    headers = {
+      'Content-Type': 'application/json',
+      'x-api-key': trimmedKey,
+      'anthropic-version': ch.anthropic_version || '2023-06-01',
+    };
+    requestBody = { model: realModel, max_tokens: 5, messages: [{ role: 'user', content: 'ping' }] };
+  } else if (format === 'unlimited_api_chat') {
+    chatUrl = `${baseUrl}/api/chat`;
+    headers = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${trimmedKey}` };
+    requestBody = { model: realModel, prompt: 'ping' };
+  } else {
+    chatUrl = `${baseUrl}/chat/completions`;
+    headers = isYepApiChannel(ch)
+      ? { 'Content-Type': 'application/json', 'x-api-key': trimmedKey }
+      : { 'Content-Type': 'application/json', 'Authorization': `Bearer ${trimmedKey}` };
+    requestBody = { model: realModel, messages: [{ role: 'user', content: 'ping' }], max_tokens: 5, stream: false };
+  }
+
+  try {
+    const upstream = await fetch(chatUrl, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(requestBody),
+      signal: AbortSignal.timeout(15000),
+    });
+    const text = await upstream.text();
+    const data = parseUpstreamTestPayload(text);
+    const errorMessage = data?.error?.message
+      || (typeof data?.error === 'string' ? data.error : '')
+      || data?.message
+      || (upstream.ok ? '' : truncateText(text, 500))
+      || (upstream.ok ? '' : `HTTP ${upstream.status}`);
+    const pass = upstream.ok && !errorMessage;
+    const verdict = pass
+      ? { disable: false, retry: false, reason: '' }
+      : classifyUpstreamKeyFailure(upstream.status, errorMessage);
+    let autoDisabled = false;
+    let reenabled = false;
+    if (!pass && verdict.disable && options.autoDisable !== false) {
+      autoDisabled = disableUpstreamChannelKey(channelKey, trimmedKey, {
+        status: upstream.status,
+        reason: verdict.reason,
+        error: errorMessage,
+      });
+    } else if (pass && options.reenable === true && isKeyDisabled(ch, trimmedKey)) {
+      reenabled = enableUpstreamChannelKey(channelKey, trimmedKey);
+    }
+    const reply = data?.choices?.[0]?.message?.content
+      || data?.content?.[0]?.text
+      || data?.output_text
+      || (pass ? '(ok)' : '');
+    recordUpstreamKeyTest(fingerprintKey(trimmedKey), {
+      success: pass,
+      statusCode: upstream.status,
+      error: errorMessage || verdict.reason,
+    });
+    return {
+      ok: true,
+      pass,
+      status: upstream.status,
+      id: fingerprintKey(trimmedKey),
+      key: trimmedKey,
+      reply: truncateText(reply, 200),
+      error: pass ? '' : (errorMessage || verdict.reason || `HTTP ${upstream.status}`),
+      reason: pass ? '' : (verdict.reason || `http_${upstream.status}`),
+      excerpt: truncateText(text, 300),
+      autoDisabled,
+      reenabled,
+    };
+  } catch (err) {
+    recordUpstreamKeyTest(fingerprintKey(trimmedKey), {
+      success: false,
+      statusCode: null,
+      error: `network:${err.message}`,
+    });
+    return {
+      ok: true,
+      pass: false,
+      status: null,
+      id: fingerprintKey(trimmedKey),
+      key: trimmedKey,
+      error: `network:${err.message}`,
+      reason: `network:${err.message}`,
+      autoDisabled: false,
+      reenabled: false,
+    };
+  }
+}
+
 async function handleConfigAPI(req, res, url, body) {
   if (url === '/api/config' && req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -292,6 +464,43 @@ async function handleConfigAPI(req, res, url, body) {
       channels: config.channels,
       api_keys: getClientKeyEntries(),
     }));
+    return true;
+  }
+
+  if (url.startsWith('/api/config/channel-keys?') && req.method === 'GET') {
+    const parsed = new URL(url, 'http://localhost');
+    const channelKey = String(parsed.searchParams.get('channelKey') || '');
+    const ch = config.channels[channelKey];
+    if (!ch) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: '渠道不存在' }));
+      return true;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, ...getChannelKeyDashboard(channelKey, ch) }));
+    return true;
+  }
+
+  if (url.startsWith('/api/config/channel-keys/export?') && req.method === 'GET') {
+    const parsed = new URL(url, 'http://localhost');
+    const channelKey = String(parsed.searchParams.get('channelKey') || '');
+    const only = String(parsed.searchParams.get('only') || 'all');
+    const ch = config.channels[channelKey];
+    if (!ch) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: '渠道不存在' }));
+      return true;
+    }
+    const disabled = new Set(ch.disabled_keys || []);
+    let keys = getChannelKeys(ch);
+    if (only === 'enabled') keys = keys.filter(key => !disabled.has(key));
+    if (only === 'disabled') keys = keys.filter(key => disabled.has(key));
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    res.writeHead(200, {
+      'Content-Type': 'text/plain; charset=utf-8',
+      'Content-Disposition': `attachment; filename="${channelKey}-keys-${only}-${stamp}.txt"`,
+    });
+    res.end(keys.join('\n') + (keys.length ? '\n' : ''));
     return true;
   }
 
@@ -527,6 +736,8 @@ async function handleConfigAPI(req, res, url, body) {
       base_url: base_url || existingChannel.base_url || '',
       key: configuredKeys[0] || '',
       keys: configuredKeys,
+      disabled_keys: existingChannel.disabled_keys,
+      disabled_key_meta: existingChannel.disabled_key_meta,
       ...(format || existingChannel.format ? { format: format || existingChannel.format } : {}),
       ...(anthropic_version || existingChannel.anthropic_version ? { anthropic_version: anthropic_version || existingChannel.anthropic_version } : {}),
       ...(prompt_cache_enabled ? { prompt_cache_enabled: true, prompt_cache_ttl } : {}),
@@ -688,28 +899,306 @@ async function handleConfigAPI(req, res, url, body) {
         res.end(JSON.stringify({ ok: false, error: '渠道没有模型' }));
         return true;
       }
-      const keys = getChannelKeys(ch);
-      const upstreamKey = keys[0] || '';
-      const chatUrl = ch.base_url.replace(/\/+$/, '') + '/chat/completions';
-      const realModel = stripModelPrefix(model, channelKey);
-      const upResp = await fetch(chatUrl, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${upstreamKey}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: realModel, messages: [{ role: 'user', content: 'hi' }], max_tokens: 5 }),
-        signal: AbortSignal.timeout(15000),
-      });
-      const upJson = await upResp.json();
-      if (upJson.choices && upJson.choices[0]) {
+      const activeKeys = getActiveChannelKeys(ch);
+      if (!activeKeys.length) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, reply: upJson.choices[0].message?.content || '(ok)' }));
-      } else {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: upJson.error?.message || JSON.stringify(upJson) }));
+        res.end(JSON.stringify({ ok: false, error: '渠道没有可用 Key，请先恢复或导入 Key' }));
+        return true;
       }
+      const result = await testUpstreamChannelKey(channelKey, activeKeys[0], { autoDisable: true });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: result.pass === true,
+        reply: result.reply || '',
+        error: result.pass ? '' : (result.error || result.reason || '测试失败'),
+        status: result.status,
+        autoDisabled: result.autoDisabled === true,
+      }));
     } catch (e) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: false, error: e.message }));
     }
+    return true;
+  }
+
+  // ==================== Channel Key 管理 ====================
+
+  if (url === '/api/config/channel-keys/test' && req.method === 'POST') {
+    const d = JSON.parse(body || '{}');
+    const result = await testUpstreamChannelKey(d.channelKey, d.key, {
+      reenable: d.reenable === true,
+      autoDisable: d.autoDisable !== false,
+    });
+    res.writeHead(result.ok === false ? 400 : 200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(result));
+    return true;
+  }
+
+  if (url === '/api/config/channel-keys/batch-test' && req.method === 'POST') {
+    const d = JSON.parse(body || '{}');
+    const channelKey = String(d.channelKey || '');
+    const ch = config.channels[channelKey];
+    if (!ch) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: '渠道不存在' }));
+      return true;
+    }
+    const allKeys = getChannelKeys(ch);
+    const requestedKeys = normalizeKeyList(Array.isArray(d.keys) ? d.keys : []);
+    const targets = (requestedKeys.length ? requestedKeys : allKeys)
+      .filter(key => allKeys.includes(key));
+    const concurrency = Math.min(Math.max(parseInt(d.concurrency || '5', 10) || 5, 1), 20);
+    const results = new Array(targets.length);
+    let cursor = 0;
+    async function worker() {
+      while (cursor < targets.length) {
+        const index = cursor++;
+        results[index] = await testUpstreamChannelKey(channelKey, targets[index], {
+          reenable: d.reenable === true,
+          autoDisable: d.autoDisable !== false,
+        });
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(concurrency, targets.length || 1) }, () => worker()));
+    const passed = results.filter(result => result.pass).length;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      ok: true,
+      results,
+      summary: { total: results.length, pass: passed, fail: results.length - passed },
+    }));
+    return true;
+  }
+
+  if (url === '/api/config/channel-keys/disable' && req.method === 'POST') {
+    const d = JSON.parse(body || '{}');
+    const { channelKey, key } = d;
+    const ch = config.channels[channelKey];
+    if (!ch) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: '渠道不存在' }));
+      return true;
+    }
+    const trimmedKey = String(key || '').trim();
+    if (!trimmedKey || !getChannelKeys(ch).includes(trimmedKey)) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Key 不存在' }));
+      return true;
+    }
+    disableUpstreamChannelKey(channelKey, trimmedKey, { reason: 'manual' });
+    rebuildModelMap();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+    return true;
+  }
+
+  if (url === '/api/config/channel-keys/enable' && req.method === 'POST') {
+    const d = JSON.parse(body || '{}');
+    const { channelKey, key } = d;
+    const ch = config.channels[channelKey];
+    if (!ch) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: '渠道不存在' }));
+      return true;
+    }
+    const trimmedKey = String(key || '').trim();
+    if (!trimmedKey || !getChannelKeys(ch).includes(trimmedKey)) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Key 不存在' }));
+      return true;
+    }
+    enableUpstreamChannelKey(channelKey, trimmedKey);
+    rebuildModelMap();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+    return true;
+  }
+
+  if (url === '/api/config/channel-keys/enable-all' && req.method === 'POST') {
+    const d = JSON.parse(body || '{}');
+    const channelKey = String(d.channelKey || '');
+    const ch = config.channels[channelKey];
+    if (!ch) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: '渠道不存在' }));
+      return true;
+    }
+    let enabled = 0;
+    for (const key of [...(ch.disabled_keys || [])]) {
+      if (enableUpstreamChannelKey(channelKey, key)) enabled++;
+    }
+    rebuildModelMap();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, enabled }));
+    return true;
+  }
+
+  if (url === '/api/config/channel-keys/edit' && req.method === 'POST') {
+    const d = JSON.parse(body || '{}');
+    const channelKey = String(d.channelKey || '');
+    const oldKey = String(d.key || '').trim();
+    const newKey = String(d.newKey || '').trim();
+    const ch = config.channels[channelKey];
+    if (!ch) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: '渠道不存在' }));
+      return true;
+    }
+    const allKeys = getChannelKeys(ch);
+    const index = allKeys.indexOf(oldKey);
+    if (index < 0) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Key 不存在' }));
+      return true;
+    }
+    if (!newKey) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: '新 Key 不能为空' }));
+      return true;
+    }
+    if (allKeys.some((key, keyIndex) => key === newKey && keyIndex !== index)) {
+      res.writeHead(409, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: '新 Key 已存在' }));
+      return true;
+    }
+    const nextKeys = [...allKeys];
+    nextKeys[index] = newKey;
+    const wasDisabled = isKeyDisabled(ch, oldKey);
+    const disabledKeys = (ch.disabled_keys || []).filter(key => key !== oldKey);
+    if (wasDisabled) disabledKeys.push(newKey);
+    const disabledMeta = { ...(ch.disabled_key_meta || {}) };
+    if (disabledMeta[oldKey]) {
+      disabledMeta[newKey] = disabledMeta[oldKey];
+      delete disabledMeta[oldKey];
+    }
+    config.channels[channelKey] = normalizeChannelForSave({
+      ...ch,
+      key: nextKeys[0],
+      keys: nextKeys,
+      disabled_keys: disabledKeys,
+      disabled_key_meta: disabledMeta,
+    });
+    channelKeyCursors.delete(channelKey);
+    saveConfig();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, id: fingerprintKey(newKey) }));
+    return true;
+  }
+
+  if (url === '/api/config/channel-keys/delete-batch' && req.method === 'POST') {
+    const d = JSON.parse(body || '{}');
+    const channelKey = String(d.channelKey || '');
+    const ch = config.channels[channelKey];
+    if (!ch) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: '渠道不存在' }));
+      return true;
+    }
+    const allKeys = getChannelKeys(ch);
+    const deleteSet = new Set(normalizeKeyList(Array.isArray(d.keys) ? d.keys : []));
+    const remainingKeys = allKeys.filter(key => !deleteSet.has(key));
+    const deleted = allKeys.length - remainingKeys.length;
+    if (!deleted) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, deleted: 0, total: allKeys.length }));
+      return true;
+    }
+    if (!remainingKeys.length) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: '至少保留一个 Key' }));
+      return true;
+    }
+    config.channels[channelKey] = normalizeChannelForSave({ ...ch, key: remainingKeys[0], keys: remainingKeys });
+    channelKeyCursors.delete(channelKey);
+    saveConfig();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, deleted, total: remainingKeys.length }));
+    return true;
+  }
+
+  if (url === '/api/config/channel-keys/delete-disabled' && req.method === 'POST') {
+    const d = JSON.parse(body || '{}');
+    const channelKey = String(d.channelKey || '');
+    const ch = config.channels[channelKey];
+    if (!ch) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: '渠道不存在' }));
+      return true;
+    }
+    const allKeys = getChannelKeys(ch);
+    const disabledSet = new Set(ch.disabled_keys || []);
+    const remainingKeys = allKeys.filter(key => !disabledSet.has(key));
+    if (!remainingKeys.length && allKeys.length) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: '不能删除全部 Key，请先恢复至少一个' }));
+      return true;
+    }
+    config.channels[channelKey] = normalizeChannelForSave({ ...ch, key: remainingKeys[0] || '', keys: remainingKeys });
+    channelKeyCursors.delete(channelKey);
+    saveConfig();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, deleted: allKeys.length - remainingKeys.length, total: remainingKeys.length }));
+    return true;
+  }
+
+  if (url === '/api/config/channel-keys/delete' && req.method === 'POST') {
+    const d = JSON.parse(body || '{}');
+    const { channelKey, key } = d;
+    const ch = config.channels[channelKey];
+    if (!ch) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: '渠道不存在' }));
+      return true;
+    }
+    const trimmedKey = String(key || '').trim();
+    const allKeys = getChannelKeys(ch);
+    if (!allKeys.includes(trimmedKey)) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Key 不存在' }));
+      return true;
+    }
+    if (allKeys.length <= 1) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: '至少保留一个 Key' }));
+      return true;
+    }
+    const remainingKeys = allKeys.filter(k => k !== trimmedKey);
+    config.channels[channelKey] = normalizeChannelForSave({
+      ...ch,
+      key: remainingKeys[0],
+      keys: remainingKeys,
+    });
+    rebuildModelMap();
+    saveConfig();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+    return true;
+  }
+
+  if (url === '/api/config/channel-keys/import' && req.method === 'POST') {
+    const d = JSON.parse(body || '{}');
+    const { channelKey, keys: keysText } = d;
+    const ch = config.channels[channelKey];
+    if (!ch) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: '渠道不存在' }));
+      return true;
+    }
+    const existingKeys = getChannelKeys(ch);
+    const newKeys = normalizeKeyList([
+      ...existingKeys,
+      ...String(keysText || '').split(/[\r\n,]+/).map(k => k.trim()).filter(Boolean),
+    ]);
+    const addedCount = newKeys.length - existingKeys.length;
+    config.channels[channelKey] = normalizeChannelForSave({
+      ...ch,
+      key: newKeys[0],
+      keys: newKeys,
+    });
+    rebuildModelMap();
+    saveConfig();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, added: addedCount, total: newKeys.length }));
     return true;
   }
 
@@ -772,7 +1261,7 @@ async function handleResponses(req, res, body, requestId) {
         }
         fakeRes.headersSent = true;
       },
-      setHeader() {},
+      setHeader() { },
       getHeader(name) { return res.getHeader(name); },
       write(chunk) {
         const str = typeof chunk === 'string' ? chunk : chunk.toString();
@@ -811,7 +1300,7 @@ async function handleResponses(req, res, body, requestId) {
                 type: 'response.output_text.delta', output_index: 0, content_index: 0, delta: delta.content,
               }) + '\n\n');
             }
-          } catch {}
+          } catch { }
         }
       },
       end(endData) {
@@ -832,7 +1321,7 @@ async function handleResponses(req, res, body, requestId) {
     headersSent: false,
     writableEnded: false,
     writeHead(status) { capturedStatus = status; fakeRes.headersSent = true; },
-    setHeader() {},
+    setHeader() { },
     getHeader(name) { return res.getHeader(name); },
     write(chunk) { capturedBody += (typeof chunk === 'string' ? chunk : chunk.toString()); },
     end(endData) {
@@ -925,7 +1414,7 @@ async function handleAnthropicMessages(req, res, body, requestId) {
         }
         fakeRes.headersSent = true;
       },
-      setHeader() {},
+      setHeader() { },
       getHeader(name) { return res.getHeader(name); },
       write(chunk) {
         const str = typeof chunk === 'string' ? chunk : chunk.toString();
@@ -973,7 +1462,7 @@ async function handleAnthropicMessages(req, res, body, requestId) {
               }) + '\n\n');
               res.write('event: message_stop\ndata: ' + JSON.stringify({ type: 'message_stop' }) + '\n\n');
             }
-          } catch {}
+          } catch { }
         }
       },
       end(endData) {
@@ -994,7 +1483,7 @@ async function handleAnthropicMessages(req, res, body, requestId) {
     headersSent: false,
     writableEnded: false,
     writeHead(status) { capturedStatus = status; fakeRes.headersSent = true; },
-    setHeader() {},
+    setHeader() { },
     getHeader(name) { return res.getHeader(name); },
     write(chunk) { capturedBody += (typeof chunk === 'string' ? chunk : chunk.toString()); },
     end(endData) {

@@ -1,5 +1,5 @@
 import fs from 'node:fs';
-import { config, modelMap, CONFIG_FILE } from './state.mjs';
+import { config, modelMap, channelKeyCursors, CONFIG_FILE } from './state.mjs';
 
 function normalizeKeyList(keys = []) {
   const seen = new Set();
@@ -18,6 +18,17 @@ function getChannelKeys(channel = {}) {
     channel.key,
     ...(Array.isArray(channel.keys) ? channel.keys : []),
   ]);
+}
+
+function isKeyDisabled(channel = {}, key = '') {
+  const disabled = Array.isArray(channel.disabled_keys) ? channel.disabled_keys : [];
+  return disabled.includes(String(key).trim());
+}
+
+function getActiveChannelKeys(channel = {}) {
+  const allKeys = getChannelKeys(channel);
+  const disabled = new Set(Array.isArray(channel.disabled_keys) ? channel.disabled_keys.map(k => String(k || '').trim()) : []);
+  return allKeys.filter(k => !disabled.has(k));
 }
 
 function normalizeChannelForSave(channel = {}) {
@@ -40,7 +51,101 @@ function normalizeChannelForSave(channel = {}) {
     next.key = '';
     delete next.keys;
   }
+  // Normalize disabled_keys: dedupe, trim, and remove entries for keys that no longer exist
+  if (Array.isArray(next.disabled_keys) && next.disabled_keys.length > 0) {
+    const keySet = new Set(keys);
+    next.disabled_keys = normalizeKeyList(next.disabled_keys.filter(k => keySet.has(String(k || '').trim())));
+    if (next.disabled_keys.length === 0) delete next.disabled_keys;
+  } else {
+    delete next.disabled_keys;
+  }
+  // Keep failure metadata only for currently configured and disabled keys.
+  const rawDisabledMeta = next.disabled_key_meta && typeof next.disabled_key_meta === 'object' && !Array.isArray(next.disabled_key_meta)
+    ? next.disabled_key_meta
+    : {};
+  const normalizedDisabledMeta = {};
+  for (const key of next.disabled_keys || []) {
+    const meta = rawDisabledMeta[key];
+    if (!meta || typeof meta !== 'object' || Array.isArray(meta)) continue;
+    normalizedDisabledMeta[key] = {
+      reason: String(meta.reason || '').slice(0, 500),
+      status: Number(meta.status) || null,
+      disabled_at: String(meta.disabled_at || ''),
+      last_error: String(meta.last_error || meta.reason || '').slice(0, 1000),
+      last_error_at: String(meta.last_error_at || meta.disabled_at || ''),
+    };
+  }
+  if (Object.keys(normalizedDisabledMeta).length) next.disabled_key_meta = normalizedDisabledMeta;
+  else delete next.disabled_key_meta;
   return next;
+}
+
+const HARD_KEY_FAILURE_PATTERNS = [
+  { re: /invalid[_\s-]*api[_\s-]*key|incorrect api key|api key.*(?:invalid|not valid)/i, reason: 'invalid_api_key' },
+  { re: /unauthorized|authentication (?:failed|error)/i, reason: 'unauthorized' },
+  { re: /permission|forbidden|not allowed/i, reason: 'forbidden' },
+  { re: /insufficient|no (?:remaining )?(?:quota|balance|credit)/i, reason: 'insufficient_quota' },
+  { re: /quota (?:exceeded|exhausted)|out of (?:quota|credit)/i, reason: 'quota_exhausted' },
+  { re: /expired|过期|失效/i, reason: 'expired' },
+  { re: /余额不足|额度(?:不足|用尽|耗尽)|欠费/i, reason: 'insufficient_quota_zh' },
+  { re: /无效(?:的)?(?:key|密钥|令牌|token)|密钥无效|令牌无效/i, reason: 'invalid_api_key_zh' },
+  { re: /封禁|禁用|已停用|冻结|suspend|banned|deactivat/i, reason: 'banned' },
+  { re: /account.*(?:disabled|suspended|blocked)/i, reason: 'account_disabled' },
+];
+
+function classifyUpstreamKeyFailure(status = 0, message = '') {
+  const text = String(message || '');
+  for (const item of HARD_KEY_FAILURE_PATTERNS) {
+    if (item.re.test(text)) return { disable: true, reason: item.reason, status: Number(status) || null };
+  }
+  const code = Number(status) || 0;
+  if ([401, 402, 403].includes(code)) return { disable: true, reason: `http_${code}`, status: code };
+  if (code === 429) return { disable: false, retry: true, reason: 'rate_limited', status: code };
+  if (code >= 500) return { disable: false, retry: true, reason: `http_${code}`, status: code };
+  return { disable: false, retry: false, reason: code >= 400 ? `http_${code}` : '', status: code || null };
+}
+
+function disableUpstreamChannelKey(channelKey, key, details = {}) {
+  const channel = config.channels?.[channelKey];
+  const trimmedKey = String(key || '').trim();
+  if (!channel || !trimmedKey || !getChannelKeys(channel).includes(trimmedKey)) return false;
+  const disabledKeys = normalizeKeyList([...(channel.disabled_keys || []), trimmedKey]);
+  const now = new Date().toISOString();
+  const meta = {
+    ...(channel.disabled_key_meta && typeof channel.disabled_key_meta === 'object' ? channel.disabled_key_meta : {}),
+    [trimmedKey]: {
+      reason: String(details.reason || 'manual'),
+      status: Number(details.status) || null,
+      disabled_at: String(details.disabled_at || now),
+      last_error: String(details.error || details.reason || 'manual'),
+      last_error_at: String(details.last_error_at || now),
+    },
+  };
+  config.channels[channelKey] = normalizeChannelForSave({
+    ...channel,
+    disabled_keys: disabledKeys,
+    disabled_key_meta: meta,
+  });
+  channelKeyCursors.delete(channelKey);
+  saveConfig();
+  return true;
+}
+
+function enableUpstreamChannelKey(channelKey, key) {
+  const channel = config.channels?.[channelKey];
+  const trimmedKey = String(key || '').trim();
+  if (!channel || !trimmedKey || !getChannelKeys(channel).includes(trimmedKey)) return false;
+  const disabledKeys = (channel.disabled_keys || []).filter(item => item !== trimmedKey);
+  const meta = { ...(channel.disabled_key_meta || {}) };
+  delete meta[trimmedKey];
+  config.channels[channelKey] = normalizeChannelForSave({
+    ...channel,
+    disabled_keys: disabledKeys,
+    disabled_key_meta: meta,
+  });
+  channelKeyCursors.delete(channelKey);
+  saveConfig();
+  return true;
 }
 
 function isChannelEnabled(channel = {}) {
@@ -153,6 +258,8 @@ function normalizeImportedConfig(input) {
 export {
   normalizeKeyList,
   getChannelKeys,
+  getActiveChannelKeys,
+  isKeyDisabled,
   normalizeChannelForSave,
   isChannelEnabled,
   normalizePromptCacheTtl,
@@ -162,4 +269,7 @@ export {
   normalizeClientKeyEntry,
   saveConfig,
   normalizeImportedConfig,
+  classifyUpstreamKeyFailure,
+  disableUpstreamChannelKey,
+  enableUpstreamChannelKey,
 };

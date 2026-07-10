@@ -273,8 +273,43 @@ function requestLogOptions(context = {}, requestId = '', error = null, extra = {
     clientKey: context.clientKey || '',
     clientKeyFingerprint: context.clientKeyFingerprint || '',
     clientKeyType: context.clientKeyType || '',
+    ...(context.upstreamKeyFingerprint ? { upstreamKeyFingerprint: context.upstreamKeyFingerprint } : {}),
+    ...(context.upstreamKeyIndex != null ? { upstreamKeyIndex: context.upstreamKeyIndex } : {}),
     ...extra,
   };
+}
+
+function recordUpstreamKeyUsage(fingerprint = '', details = {}) {
+  const key = String(fingerprint || '');
+  if (!key) return;
+  if (!stats.upstreamKeyUsage) stats.upstreamKeyUsage = {};
+  if (!stats.upstreamKeyUsage[key]) {
+    stats.upstreamKeyUsage[key] = {
+      totalRequests: 0,
+      totalErrors: 0,
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      lastUsedAt: null,
+      lastError: '',
+      lastErrorAt: null,
+    };
+  }
+  const usage = stats.upstreamKeyUsage[key];
+  const now = new Date().toISOString();
+  const success = details.success !== false;
+  usage.totalRequests++;
+  if (!success) usage.totalErrors++;
+  usage.totalInputTokens += toTokenNumber(details.inputTokens);
+  usage.totalOutputTokens += toTokenNumber(details.outputTokens);
+  usage.lastUsedAt = now;
+  usage.lastStatus = Number(details.statusCode) || null;
+  if (success) {
+    usage.lastError = '';
+    usage.lastErrorAt = null;
+  } else {
+    usage.lastError = String(details.error || 'upstream_error').slice(0, 1000);
+    usage.lastErrorAt = now;
+  }
 }
 
 function saveStats() {
@@ -389,6 +424,68 @@ function backfillHourlyStatsFromRecentLogs() {
   if (recentLogs.length) saveStats();
 }
 
+function backfillUpstreamKeyUsageFromRecentLogs() {
+  if (Object.keys(stats.upstreamKeyUsage || {}).length > 0) return;
+  stats.upstreamKeyUsage = {};
+  for (const entry of stats.recentLogs || []) {
+    const fingerprint = String(entry.upstreamKeyFingerprint || '');
+    if (!fingerprint) continue;
+    if (!stats.upstreamKeyUsage[fingerprint]) {
+      stats.upstreamKeyUsage[fingerprint] = {
+        totalRequests: 0,
+        totalErrors: 0,
+        totalInputTokens: 0,
+        totalOutputTokens: 0,
+        lastUsedAt: null,
+        lastError: '',
+        lastErrorAt: null,
+      };
+    }
+    const keyUsage = stats.upstreamKeyUsage[fingerprint];
+    keyUsage.totalRequests++;
+    if (entry.success === false) keyUsage.totalErrors++;
+    keyUsage.totalInputTokens += toTokenNumber(entry.inputTokens);
+    keyUsage.totalOutputTokens += toTokenNumber(entry.outputTokens);
+    if (!keyUsage.lastUsedAt || String(entry.timestamp || '') > keyUsage.lastUsedAt) {
+      keyUsage.lastUsedAt = entry.timestamp || null;
+      keyUsage.lastError = entry.success === false ? String(entry.error || '') : '';
+      keyUsage.lastErrorAt = entry.success === false ? entry.timestamp || null : null;
+    }
+  }
+  if ((stats.recentLogs || []).length) saveStats();
+}
+
+function recordUpstreamKeyTest(fingerprint = '', details = {}) {
+  const key = String(fingerprint || '');
+  if (!key) return;
+  if (!stats.upstreamKeyUsage) stats.upstreamKeyUsage = {};
+  if (!stats.upstreamKeyUsage[key]) {
+    stats.upstreamKeyUsage[key] = {
+      totalRequests: 0,
+      totalErrors: 0,
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      lastUsedAt: null,
+      lastError: '',
+      lastErrorAt: null,
+    };
+  }
+  const usage = stats.upstreamKeyUsage[key];
+  const now = new Date().toISOString();
+  const success = details.success === true;
+  usage.lastTestAt = now;
+  usage.lastTestStatus = Number(details.statusCode) || null;
+  usage.lastTestPassed = success;
+  if (success) {
+    usage.lastError = '';
+    usage.lastErrorAt = null;
+  } else {
+    usage.lastError = String(details.error || 'test_failed').slice(0, 1000);
+    usage.lastErrorAt = now;
+  }
+  saveStats();
+}
+
 function logRequest(model, channel, tokens = 0, success = true, error = null) {
   const options = error && typeof error === 'object' && !Array.isArray(error)
     ? error
@@ -398,21 +495,23 @@ function logRequest(model, channel, tokens = 0, success = true, error = null) {
   const cacheReadInputTokens = toTokenNumber(options.cacheReadInputTokens);
   const cacheCreationInputTokens = toTokenNumber(options.cacheCreationInputTokens);
   const cacheHit = cacheReadInputTokens > 0;
+  const inputTokens = toTokenNumber(options.inputTokens);
+  const outputTokens = toTokenNumber(options.outputTokens);
   const now = new Date();
   const isoTime = now.toISOString();
   const date = isoTime.slice(0, 10);
   const hour = isoTime.slice(0, 13);
   const time = now.toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai' });
-  
+
   // 更新总计数
   stats.totalRequests++;
-  
+
   // 更新模型使用统计
   if (!stats.modelUsage[model]) {
     stats.modelUsage[model] = makeUsageBucket();
   }
   addUsageRequest(stats.modelUsage[model], tokens, { cacheReadInputTokens, cacheCreationInputTokens });
-  
+
   // 更新渠道使用统计
   if (!stats.channelUsage[channel]) {
     stats.channelUsage[channel] = makeUsageBucket();
@@ -426,11 +525,19 @@ function logRequest(model, channel, tokens = 0, success = true, error = null) {
     stats.ipUsage[clientIp] = makeUsageBucket();
   }
   addUsageRequest(stats.ipUsage[clientIp], tokens, { cacheReadInputTokens, cacheCreationInputTokens });
-  
+
   // 更新每日和每小时统计
   addUsageToScope(ensureUsageScope(stats.dailyStats, date), model, channel, clientIp, tokens, { cacheReadInputTokens, cacheCreationInputTokens });
   addUsageToScope(ensureUsageScope(stats.hourlyStats, hour), model, channel, clientIp, tokens, { cacheReadInputTokens, cacheCreationInputTokens });
-  
+
+  recordUpstreamKeyUsage(options.upstreamKeyFingerprint, {
+    success,
+    error,
+    statusCode: options.statusCode,
+    inputTokens,
+    outputTokens,
+  });
+
   // 添加到最近日志（保留最近100条）
   const logEntry = {
     timestamp: now.toISOString(),
@@ -444,18 +551,22 @@ function logRequest(model, channel, tokens = 0, success = true, error = null) {
     cacheHit,
     cacheReadInputTokens,
     cacheCreationInputTokens,
+    inputTokens,
+    outputTokens,
     ...(options.clientKeyFingerprint ? { clientKeyFingerprint: options.clientKeyFingerprint } : {}),
     ...(options.clientKeyType ? { clientKeyType: options.clientKeyType } : {}),
+    ...(options.upstreamKeyFingerprint ? { upstreamKeyFingerprint: options.upstreamKeyFingerprint } : {}),
+    ...(options.upstreamKeyIndex != null ? { upstreamKeyIndex: options.upstreamKeyIndex } : {}),
   };
-  
+
   stats.recentLogs.unshift(logEntry);
   if (stats.recentLogs.length > 100) {
     stats.recentLogs = stats.recentLogs.slice(0, 100);
   }
-  
+
   // 控制台输出
   console.log(`[${time}] ${success ? '✓' : '✗'} ${model} (${channel}) - ${tokens} tokens${error ? ` - ${error}` : ''}`);
-  
+
   // 定期保存（每10次请求保存一次）
   if (stats.totalRequests % 10 === 0) {
     saveStats();
@@ -483,6 +594,7 @@ export {
   buildLogContext,
   responseLogFields,
   requestLogOptions,
+  recordUpstreamKeyUsage,
   saveStats,
   makeUsageBucket,
   addUsageRequest,
@@ -494,5 +606,7 @@ export {
   backfillUsageScopeCache,
   backfillUsageCacheFromRecentLogs,
   backfillHourlyStatsFromRecentLogs,
+  backfillUpstreamKeyUsageFromRecentLogs,
+  recordUpstreamKeyTest,
   logRequest,
 };

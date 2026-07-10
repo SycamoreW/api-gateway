@@ -13,22 +13,57 @@ import {
   shouldBufferNonStreamResponse,
 } from './format-converters.mjs';
 import {
-  getChannelKeys, isChannelEnabled,
+  getChannelKeys, getActiveChannelKeys, isChannelEnabled,
+  classifyUpstreamKeyFailure, disableUpstreamChannelKey,
 } from './config.mjs';
 
-function selectChannelKey(channel = {}, channelKey = '') {
-  const keys = getChannelKeys(channel);
-  if (keys.length === 0) return { key: '', index: -1, count: 0, fingerprint: '' };
+function handleSelectedKeyFailure(channel, channelKey, selectedKey, statusCode, errorMessage = '') {
+  const verdict = classifyUpstreamKeyFailure(statusCode, errorMessage);
+  if (!verdict.disable || !selectedKey?.key || !channelKey) return verdict;
+  if (disableUpstreamChannelKey(channelKey, selectedKey.key, {
+    status: verdict.status,
+    reason: verdict.reason,
+    error: errorMessage,
+  })) {
+    writeGatewayLog('upstream_key_disabled', {
+      channelKey,
+      channel: channel.name,
+      upstreamKeyFingerprint: selectedKey.fingerprint,
+      statusCode: verdict.status,
+      errorMessage,
+      reason: verdict.reason,
+    });
+  }
+  return verdict;
+}
+
+function selectChannelKey(channel = {}, channelKey = '', excludedKeys = new Set()) {
+  const allKeys = getChannelKeys(channel);
+  const excluded = excludedKeys instanceof Set ? excludedKeys : new Set(excludedKeys || []);
+  const activeKeys = getActiveChannelKeys(channel).filter(key => !excluded.has(key));
+  if (allKeys.length === 0 || activeKeys.length === 0) return { key: '', index: -1, count: allKeys.length, fingerprint: '' };
   const cursorKey = channelKey || channel.name || channel.base_url || 'default';
   const cursor = channelKeyCursors.get(cursorKey) || 0;
-  const index = cursor % keys.length;
-  channelKeyCursors.set(cursorKey, (index + 1) % keys.length);
+  const index = cursor % activeKeys.length;
+  channelKeyCursors.set(cursorKey, (cursor + 1) % activeKeys.length);
+  const selectedKey = activeKeys[index];
+  // index in allKeys for logging purposes
+  const allIndex = allKeys.indexOf(selectedKey);
   return {
-    key: keys[index],
-    index,
-    count: keys.length,
-    fingerprint: fingerprintKey(keys[index]),
+    key: selectedKey,
+    index: allIndex >= 0 ? allIndex : index,
+    count: allKeys.length,
+    fingerprint: fingerprintKey(selectedKey),
   };
+}
+
+function hasUntriedActiveKey(channel = {}, attemptedKeys = new Set()) {
+  const attempted = attemptedKeys instanceof Set ? attemptedKeys : new Set(attemptedKeys || []);
+  return getActiveChannelKeys(channel).some(key => !attempted.has(key));
+}
+
+function shouldRetryWithAnotherKey(verdict = {}, channel = {}, attemptedKeys = new Set()) {
+  return Boolean(verdict.disable || verdict.retry) && hasUntriedActiveKey(channel, attemptedKeys);
 }
 
 function isYepApiChannel(channel = {}) {
@@ -39,7 +74,7 @@ function isYepApiChannel(channel = {}) {
   }
 }
 
-async function proxyUnlimitedChatRequest(channel, req, res, data, upstreamModel = '', requestedModel = '', requestId = '', logContext = {}, channelKey = '') {
+async function proxyUnlimitedChatRequest(channel, req, res, data, upstreamModel = '', requestedModel = '', requestId = '', logContext = {}, channelKey = '', attemptedKeys = new Set()) {
   const fullUrl = `${channel.base_url.replace(/\/$/, '')}/api/chat`;
   const parsed = new URL(fullUrl);
   const realModel = stripModelPrefix(upstreamModel, channelKey);
@@ -47,7 +82,11 @@ async function proxyUnlimitedChatRequest(channel, req, res, data, upstreamModel 
   const body = JSON.stringify(unlimitedPayload);
   const wantsStream = data.stream === true;
   const startedAt = Date.now();
-  const selectedKey = selectChannelKey(channel, channelKey);
+  const selectedKey = selectChannelKey(channel, channelKey, attemptedKeys);
+  if (!selectedKey.key) throw new Error('渠道没有可用 Key，请在管理面板恢复或导入 Key');
+  attemptedKeys.add(selectedKey.key);
+  logContext.upstreamKeyFingerprint = selectedKey.fingerprint;
+  logContext.upstreamKeyIndex = selectedKey.index;
   const streamId = `chatcmpl-${requestId || newRequestId()}`;
   const streamCreated = Math.floor(Date.now() / 1000);
 
@@ -124,7 +163,9 @@ async function proxyUnlimitedChatRequest(channel, req, res, data, upstreamModel 
       if (completed) return;
       completed = true;
       const safeStatusCode = statusCode || inferUnlimitedErrorStatus(errorMessage);
-      logRequest(upstreamModel || requestedModel || 'unknown', channel.name, 0, false, requestLogOptions(logContext, requestId, errorMessage));
+      const verdict = handleSelectedKeyFailure(channel, channelKey, selectedKey, safeStatusCode, errorMessage);
+      const { forceRetry = false, ...logExtra } = extra;
+      logRequest(upstreamModel || requestedModel || 'unknown', channel.name, 0, false, requestLogOptions(logContext, requestId, errorMessage, { statusCode: safeStatusCode }));
       writeGatewayLog('request_complete', responseLogFields(logContext, {
         requestId,
         model: upstreamModel || 'unknown',
@@ -142,26 +183,35 @@ async function proxyUnlimitedChatRequest(channel, req, res, data, upstreamModel 
         errorMessage,
         responseBody: truncateText(rawResponse),
         format: 'unlimited_api_chat',
-        ...extra,
+        ...logExtra,
       }));
-      if (res.writableEnded) return;
+      const canRetry = !streamStarted && !res.headersSent
+        && (forceRetry || verdict.disable || verdict.retry)
+        && hasUntriedActiveKey(channel, attemptedKeys);
+      if (canRetry) {
+        proxyUnlimitedChatRequest(channel, req, res, data, upstreamModel, requestedModel, requestId, logContext, channelKey, attemptedKeys)
+          .then(resolve, reject);
+        return true;
+      }
+      if (res.writableEnded) return false;
       if (wantsStream) {
         if (!res.headersSent) {
           res.writeHead(safeStatusCode, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: { message: errorMessage, type: 'upstream_error' } }));
-          return;
+          return false;
         }
         if (streamStarted) {
           writeOpenAIStreamChunk('', 'stop');
           res.write('data: [DONE]\n\n');
           res.end();
         }
-        return;
+        return false;
       }
       if (!res.headersSent) {
         res.writeHead(safeStatusCode, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: { message: errorMessage, type: 'upstream_error' } }));
       }
+      return false;
     }
 
     function handleEvent(payload) {
@@ -215,13 +265,13 @@ async function proxyUnlimitedChatRequest(channel, req, res, data, upstreamModel 
 
         if (proxyRes.statusCode >= 400 || upstreamError) {
           const errorMessage = upstreamError || `HTTP ${proxyRes.statusCode}`;
-          finishWithUpstreamError(proxyRes.statusCode >= 400 ? proxyRes.statusCode : inferUnlimitedErrorStatus(errorMessage), errorMessage);
-          resolve();
+          const retried = finishWithUpstreamError(proxyRes.statusCode >= 400 ? proxyRes.statusCode : inferUnlimitedErrorStatus(errorMessage), errorMessage);
+          if (!retried) resolve();
           return;
         }
 
         completed = true;
-        logRequest(upstreamModel || requestedModel || 'unknown', channel.name, 0, true, requestLogOptions(logContext, requestId, null));
+        logRequest(upstreamModel || requestedModel || 'unknown', channel.name, 0, true, requestLogOptions(logContext, requestId, null, { statusCode: proxyRes.statusCode }));
         writeGatewayLog('request_complete', responseLogFields(logContext, {
           requestId,
           model: upstreamModel || 'unknown',
@@ -258,24 +308,24 @@ async function proxyUnlimitedChatRequest(channel, req, res, data, upstreamModel 
       });
 
       proxyRes.on('error', (err) => {
-        finishWithUpstreamError(424, err.message || 'upstream aborted', { upstreamEvent: 'response_error' });
-        resolve();
+        const retried = finishWithUpstreamError(424, err.message || 'upstream aborted', { upstreamEvent: 'response_error', forceRetry: true });
+        if (!retried) resolve();
       });
       proxyRes.on('aborted', () => {
-        finishWithUpstreamError(424, 'upstream aborted', { upstreamEvent: 'response_aborted' });
-        resolve();
+        const retried = finishWithUpstreamError(424, 'upstream aborted', { upstreamEvent: 'response_aborted', forceRetry: true });
+        if (!retried) resolve();
       });
     });
 
     proxy.on('error', (err) => {
-      finishWithUpstreamError(inferUnlimitedErrorStatus(err.message), err.message || 'upstream error', { upstreamEvent: 'request_error' });
-      resolve();
+      const retried = finishWithUpstreamError(inferUnlimitedErrorStatus(err.message), err.message || 'upstream error', { upstreamEvent: 'request_error', forceRetry: true });
+      if (!retried) resolve();
     });
 
     proxy.on('timeout', () => {
-      finishWithUpstreamError(408, 'timeout', { upstreamEvent: 'request_timeout' });
+      const retried = finishWithUpstreamError(408, 'timeout', { upstreamEvent: 'request_timeout', forceRetry: true });
       proxy.destroy();
-      resolve();
+      if (!retried) resolve();
     });
 
     proxy.write(body);
@@ -283,25 +333,29 @@ async function proxyUnlimitedChatRequest(channel, req, res, data, upstreamModel 
   });
 }
 
-async function proxyRequest(channel, req, res, body, modelName = '', requestId = '', logContext = {}, channelKey = '') {
+async function proxyRequest(channel, req, res, body, modelName = '', requestId = '', logContext = {}, channelKey = '', attemptedKeys = new Set()) {
   const targetUrl = new URL(channel.base_url);
   // Append the request path (strip /v1 prefix if base_url already has it)
   const reqPath = req.url.startsWith('/v1/') ? req.url.slice(3) : req.url;
   const fullUrl = `${channel.base_url}${reqPath}`;
-  const bufferNonStream = shouldBufferNonStreamResponse(channelKey, modelName, body);
-  
+  const requestedBuffering = shouldBufferNonStreamResponse(channelKey, modelName, body);
+
   const headers = {};
   // Forward only necessary headers
   if (req.headers['content-type']) headers['content-type'] = req.headers['content-type'];
   if (req.headers['accept']) headers['accept'] = req.headers['accept'];
-  const selectedKey = selectChannelKey(channel, channelKey);
+  const selectedKey = selectChannelKey(channel, channelKey, attemptedKeys);
+  if (!selectedKey.key) throw new Error('渠道没有可用 Key，请在管理面板恢复或导入 Key');
+  attemptedKeys.add(selectedKey.key);
+  logContext.upstreamKeyFingerprint = selectedKey.fingerprint;
+  logContext.upstreamKeyIndex = selectedKey.index;
   if (isYepApiChannel(channel)) {
     headers['x-api-key'] = selectedKey.key;
   } else {
     headers['authorization'] = `Bearer ${selectedKey.key}`;
   }
   headers['content-length'] = body ? Buffer.byteLength(body) : 0;
-  
+
   return new Promise((resolve, reject) => {
     const parsed = new URL(fullUrl);
     const options = {
@@ -312,7 +366,7 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
       headers,
       timeout: 120000,
     };
-    
+
     const transport = parsed.protocol === 'https:' ? https : http;
     let responseData = '';
     const startedAt = Date.now();
@@ -327,43 +381,36 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
       method: req.method,
       requestBytes: Buffer.byteLength(body || ''),
       inputContent: logContext.inputContent,
-      ...(bufferNonStream ? { bufferNonStream: true } : {}),
+      ...(requestedBuffering ? { bufferNonStream: true } : {}),
       upstreamKeyIndex: selectedKey.index,
       upstreamKeyCount: selectedKey.count,
       upstreamKeyFingerprint: selectedKey.fingerprint,
     });
-    
+
     const proxy = transport.request(options, (proxyRes) => {
-      if (!bufferNonStream) {
+      // Always hold error responses until they have been classified so another
+      // key can be tried without leaking the failed response to the client.
+      const bufferResponse = requestedBuffering || proxyRes.statusCode >= 400;
+      if (!bufferResponse) {
         res.writeHead(proxyRes.statusCode, proxyRes.headers);
       }
       // 收集响应数据以提取 token 使用量
       proxyRes.on('data', chunk => {
         responseData += chunk.toString();
-        if (!bufferNonStream) {
+        if (!bufferResponse) {
           res.write(chunk);
         }
       });
-      
+
       proxyRes.on('end', () => {
-        if (bufferNonStream && !res.headersSent) {
-          const responseHeaders = { ...proxyRes.headers };
-          delete responseHeaders['transfer-encoding'];
-          responseHeaders['content-length'] = Buffer.byteLength(responseData);
-          res.writeHead(proxyRes.statusCode, responseHeaders);
-          res.end(responseData);
-        } else if (!res.writableEnded) {
-          res.end();
-        }
-        
         // 尝试解析 token 使用量和输出内容
         const responseDetails = extractResponseLogDetails(responseData);
         const errorMessage = responseDetails.errorMessage;
         const tokens = responseDetails.totalTokens;
-        
+
         // 记录成功的请求
         if (proxyRes.statusCode < 400 && !errorMessage) {
-          logRequest(modelName || 'unknown', channel.name, tokens, true, requestLogOptions(logContext, requestId, null, responseDetails));
+          logRequest(modelName || 'unknown', channel.name, tokens, true, requestLogOptions(logContext, requestId, null, { ...responseDetails, statusCode: proxyRes.statusCode }));
           writeGatewayLog('request_complete', responseLogFields(logContext, {
             requestId,
             model: modelName || 'unknown',
@@ -381,9 +428,19 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
             upstreamKeyFingerprint: selectedKey.fingerprint,
             outputContent: responseDetails.outputContent,
           }));
+          if (bufferResponse && !res.headersSent) {
+            const responseHeaders = { ...proxyRes.headers };
+            delete responseHeaders['transfer-encoding'];
+            responseHeaders['content-length'] = Buffer.byteLength(responseData);
+            res.writeHead(proxyRes.statusCode, responseHeaders);
+            res.end(responseData);
+          } else if (!res.writableEnded) {
+            res.end();
+          }
         } else {
           const finalErrorMessage = errorMessage || `HTTP ${proxyRes.statusCode}`;
-          logRequest(modelName || 'unknown', channel.name, 0, false, requestLogOptions(logContext, requestId, finalErrorMessage));
+          const verdict = handleSelectedKeyFailure(channel, channelKey, selectedKey, proxyRes.statusCode, finalErrorMessage);
+          logRequest(modelName || 'unknown', channel.name, 0, false, requestLogOptions(logContext, requestId, finalErrorMessage, { ...responseDetails, statusCode: proxyRes.statusCode }));
           writeGatewayLog('request_complete', responseLogFields(logContext, {
             requestId,
             model: modelName || 'unknown',
@@ -403,16 +460,52 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
             errorMessage: finalErrorMessage,
             responseBody: truncateText(responseData),
           }));
+          if (bufferResponse && !res.headersSent && shouldRetryWithAnotherKey(verdict, channel, attemptedKeys)) {
+            proxyRequest(channel, req, res, body, modelName, requestId, logContext, channelKey, attemptedKeys)
+              .then(resolve, reject);
+            return;
+          }
+          if (bufferResponse && !res.headersSent) {
+            const responseHeaders = { ...proxyRes.headers };
+            delete responseHeaders['transfer-encoding'];
+            responseHeaders['content-length'] = Buffer.byteLength(responseData);
+            res.writeHead(proxyRes.statusCode, responseHeaders);
+            res.end(responseData);
+          } else if (!res.writableEnded) {
+            res.end();
+          }
         }
-        
+
         resolve();
       });
-      
-      proxyRes.on('error', reject);
+
+      proxyRes.on('error', (err) => {
+        logRequest(modelName || 'unknown', channel.name, 0, false, requestLogOptions(logContext, requestId, err.message, { statusCode: 502 }));
+        writeGatewayLog('request_complete', responseLogFields(logContext, {
+          requestId,
+          model: modelName || 'unknown',
+          channel: channel.name,
+          statusCode: 502,
+          durationMs: Date.now() - startedAt,
+          inputTokens: 0,
+          outputTokens: 0,
+          totalTokens: 0,
+          errorMessage: err.message,
+          upstreamKeyIndex: selectedKey.index,
+          upstreamKeyCount: selectedKey.count,
+          upstreamKeyFingerprint: selectedKey.fingerprint,
+        }));
+        if (!res.headersSent && hasUntriedActiveKey(channel, attemptedKeys)) {
+          proxyRequest(channel, req, res, body, modelName, requestId, logContext, channelKey, attemptedKeys)
+            .then(resolve, reject);
+          return;
+        }
+        reject(err);
+      });
     });
-    
+
     proxy.on('error', (err) => {
-      logRequest(modelName || 'unknown', channel.name, 0, false, requestLogOptions(logContext, requestId, err.message));
+      logRequest(modelName || 'unknown', channel.name, 0, false, requestLogOptions(logContext, requestId, err.message, { statusCode: 502 }));
       writeGatewayLog('request_complete', responseLogFields(logContext, {
         requestId,
         model: modelName || 'unknown',
@@ -423,12 +516,20 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
         outputTokens: 0,
         totalTokens: 0,
         errorMessage: err.message,
+        upstreamKeyIndex: selectedKey.index,
+        upstreamKeyCount: selectedKey.count,
+        upstreamKeyFingerprint: selectedKey.fingerprint,
       }));
+      if (!res.headersSent && hasUntriedActiveKey(channel, attemptedKeys)) {
+        proxyRequest(channel, req, res, body, modelName, requestId, logContext, channelKey, attemptedKeys)
+          .then(resolve, reject);
+        return;
+      }
       reject(err);
     });
-    
+
     proxy.on('timeout', () => {
-      logRequest(modelName || 'unknown', channel.name, 0, false, requestLogOptions(logContext, requestId, 'timeout'));
+      logRequest(modelName || 'unknown', channel.name, 0, false, requestLogOptions(logContext, requestId, 'timeout', { statusCode: 504 }));
       writeGatewayLog('request_complete', responseLogFields(logContext, {
         requestId,
         model: modelName || 'unknown',
@@ -439,17 +540,25 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
         outputTokens: 0,
         totalTokens: 0,
         errorMessage: 'timeout',
+        upstreamKeyIndex: selectedKey.index,
+        upstreamKeyCount: selectedKey.count,
+        upstreamKeyFingerprint: selectedKey.fingerprint,
       }));
-      proxy.destroy(); 
-      reject(new Error('timeout')); 
+      proxy.destroy();
+      if (!res.headersSent && hasUntriedActiveKey(channel, attemptedKeys)) {
+        proxyRequest(channel, req, res, body, modelName, requestId, logContext, channelKey, attemptedKeys)
+          .then(resolve, reject);
+        return;
+      }
+      reject(new Error('timeout'));
     });
-    
+
     if (body) proxy.write(body);
     proxy.end();
   });
 }
 
-async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel = '', requestedModel = '', requestId = '', logContext = {}, channelKey = '') {
+async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel = '', requestedModel = '', requestId = '', logContext = {}, channelKey = '', attemptedKeys = new Set()) {
   const parsedBase = new URL(channel.base_url);
   const fullUrl = `${channel.base_url.replace(/\/$/, '')}/messages`;
   const parsed = new URL(fullUrl);
@@ -458,7 +567,11 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
   if (wantsStream) anthropicPayload.stream = true;
   const body = JSON.stringify(anthropicPayload);
   const startedAt = Date.now();
-  const selectedKey = selectChannelKey(channel, channelKey);
+  const selectedKey = selectChannelKey(channel, channelKey, attemptedKeys);
+  if (!selectedKey.key) throw new Error('渠道没有可用 Key，请在管理面板恢复或导入 Key');
+  attemptedKeys.add(selectedKey.key);
+  logContext.upstreamKeyFingerprint = selectedKey.fingerprint;
+  logContext.upstreamKeyIndex = selectedKey.index;
 
   const headers = {
     'content-type': 'application/json',
@@ -627,7 +740,7 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
               res.end();
               const usageDetails = extractTokenUsageDetails(openAIData);
               const tokens = usageDetails.totalTokens;
-              logRequest(upstreamModel || requestedModel || 'unknown', channel.name, tokens, true, requestLogOptions(logContext, requestId, null, usageDetails));
+              logRequest(upstreamModel || requestedModel || 'unknown', channel.name, tokens, true, requestLogOptions(logContext, requestId, null, { ...usageDetails, statusCode: proxyRes.statusCode }));
               writeGatewayLog('request_complete', responseLogFields(logContext, {
                 requestId,
                 model: upstreamModel || 'unknown',
@@ -645,7 +758,7 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
               }));
               resolve();
             } catch (err) {
-              logRequest(upstreamModel || requestedModel || 'unknown', channel.name, 0, false, requestLogOptions(logContext, requestId, err.message));
+              logRequest(upstreamModel || requestedModel || 'unknown', channel.name, 0, false, requestLogOptions(logContext, requestId, err.message, { statusCode: 502 }));
               writeGatewayLog('request_complete', responseLogFields(logContext, {
                 requestId,
                 model: upstreamModel || 'unknown',
@@ -671,6 +784,9 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
           logRequest(upstreamModel || requestedModel || 'unknown', channel.name, tokens, true, requestLogOptions(logContext, requestId, null, {
             cacheCreationInputTokens: streamCacheCreationInputTokens,
             cacheReadInputTokens: streamCacheReadInputTokens,
+            inputTokens: streamInputTokens,
+            outputTokens: streamOutputTokens,
+            statusCode: proxyRes.statusCode,
           }));
           writeGatewayLog('request_complete', responseLogFields(logContext, {
             requestId,
@@ -698,7 +814,8 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
         if (proxyRes.statusCode >= 400) {
           const responseDetails = extractResponseLogDetails(responseData);
           const errorMessage = responseDetails.errorMessage || `HTTP ${proxyRes.statusCode}`;
-          logRequest(upstreamModel || requestedModel || 'unknown', channel.name, 0, false, requestLogOptions(logContext, requestId, errorMessage));
+          const verdict = handleSelectedKeyFailure(channel, channelKey, selectedKey, proxyRes.statusCode, errorMessage);
+          logRequest(upstreamModel || requestedModel || 'unknown', channel.name, 0, false, requestLogOptions(logContext, requestId, errorMessage, { ...responseDetails, statusCode: proxyRes.statusCode }));
           writeGatewayLog('request_complete', responseLogFields(logContext, {
             requestId,
             model: upstreamModel || 'unknown',
@@ -713,7 +830,15 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
             outputContent: responseDetails.outputContent,
             errorMessage,
             responseBody: truncateText(responseData),
+            upstreamKeyIndex: selectedKey.index,
+            upstreamKeyCount: selectedKey.count,
+            upstreamKeyFingerprint: selectedKey.fingerprint,
           }));
+          if (!res.headersSent && shouldRetryWithAnotherKey(verdict, channel, attemptedKeys)) {
+            proxyAnthropicChatRequest(channel, req, res, data, upstreamModel, requestedModel, requestId, logContext, channelKey, attemptedKeys)
+              .then(resolve, reject);
+            return;
+          }
           res.writeHead(proxyRes.statusCode, { 'Content-Type': 'application/json' });
           res.end(responseData);
           resolve();
@@ -725,7 +850,7 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
           const openAIData = convertAnthropicResponseToOpenAI(anthropicData, requestedModel || upstreamModel);
           const usageDetails = extractTokenUsageDetails(openAIData);
           const tokens = usageDetails.totalTokens;
-          logRequest(upstreamModel || requestedModel || 'unknown', channel.name, tokens, true, requestLogOptions(logContext, requestId, null, usageDetails));
+          logRequest(upstreamModel || requestedModel || 'unknown', channel.name, tokens, true, requestLogOptions(logContext, requestId, null, { ...usageDetails, statusCode: proxyRes.statusCode }));
           writeGatewayLog('request_complete', responseLogFields(logContext, {
             requestId,
             model: upstreamModel || 'unknown',
@@ -745,7 +870,7 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
           res.end(JSON.stringify(openAIData));
           resolve();
         } catch (err) {
-          logRequest(upstreamModel || requestedModel || 'unknown', channel.name, 0, false, requestLogOptions(logContext, requestId, err.message));
+          logRequest(upstreamModel || requestedModel || 'unknown', channel.name, 0, false, requestLogOptions(logContext, requestId, err.message, { statusCode: 502 }));
           writeGatewayLog('request_complete', responseLogFields(logContext, {
             requestId,
             model: upstreamModel || 'unknown',
@@ -758,16 +883,42 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
             totalTokens: 0,
             errorMessage: err.message,
             responseBody: truncateText(responseData),
+            upstreamKeyIndex: selectedKey.index,
+            upstreamKeyCount: selectedKey.count,
+            upstreamKeyFingerprint: selectedKey.fingerprint,
           }));
           reject(err);
         }
       });
 
-      proxyRes.on('error', reject);
+      proxyRes.on('error', (err) => {
+        logRequest(upstreamModel || requestedModel || 'unknown', channel.name, 0, false, requestLogOptions(logContext, requestId, err.message, { statusCode: 502 }));
+        writeGatewayLog('request_complete', responseLogFields(logContext, {
+          requestId,
+          model: upstreamModel || 'unknown',
+          channel: channel.name,
+          requestedModel,
+          statusCode: 502,
+          durationMs: Date.now() - startedAt,
+          inputTokens: 0,
+          outputTokens: 0,
+          totalTokens: 0,
+          errorMessage: err.message,
+          upstreamKeyIndex: selectedKey.index,
+          upstreamKeyCount: selectedKey.count,
+          upstreamKeyFingerprint: selectedKey.fingerprint,
+        }));
+        if (!res.headersSent && hasUntriedActiveKey(channel, attemptedKeys)) {
+          proxyAnthropicChatRequest(channel, req, res, data, upstreamModel, requestedModel, requestId, logContext, channelKey, attemptedKeys)
+            .then(resolve, reject);
+          return;
+        }
+        reject(err);
+      });
     });
 
     proxy.on('error', (err) => {
-      logRequest(upstreamModel || requestedModel || 'unknown', channel.name, 0, false, requestLogOptions(logContext, requestId, err.message));
+      logRequest(upstreamModel || requestedModel || 'unknown', channel.name, 0, false, requestLogOptions(logContext, requestId, err.message, { statusCode: 502 }));
       writeGatewayLog('request_complete', responseLogFields(logContext, {
         requestId,
         model: upstreamModel || 'unknown',
@@ -779,12 +930,20 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
         outputTokens: 0,
         totalTokens: 0,
         errorMessage: err.message,
+        upstreamKeyIndex: selectedKey.index,
+        upstreamKeyCount: selectedKey.count,
+        upstreamKeyFingerprint: selectedKey.fingerprint,
       }));
+      if (!res.headersSent && hasUntriedActiveKey(channel, attemptedKeys)) {
+        proxyAnthropicChatRequest(channel, req, res, data, upstreamModel, requestedModel, requestId, logContext, channelKey, attemptedKeys)
+          .then(resolve, reject);
+        return;
+      }
       reject(err);
     });
 
     proxy.on('timeout', () => {
-      logRequest(upstreamModel || requestedModel || 'unknown', channel.name, 0, false, requestLogOptions(logContext, requestId, 'timeout'));
+      logRequest(upstreamModel || requestedModel || 'unknown', channel.name, 0, false, requestLogOptions(logContext, requestId, 'timeout', { statusCode: 504 }));
       writeGatewayLog('request_complete', responseLogFields(logContext, {
         requestId,
         model: upstreamModel || 'unknown',
@@ -796,8 +955,16 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
         outputTokens: 0,
         totalTokens: 0,
         errorMessage: 'timeout',
+        upstreamKeyIndex: selectedKey.index,
+        upstreamKeyCount: selectedKey.count,
+        upstreamKeyFingerprint: selectedKey.fingerprint,
       }));
       proxy.destroy();
+      if (!res.headersSent && hasUntriedActiveKey(channel, attemptedKeys)) {
+        proxyAnthropicChatRequest(channel, req, res, data, upstreamModel, requestedModel, requestId, logContext, channelKey, attemptedKeys)
+          .then(resolve, reject);
+        return;
+      }
       reject(new Error('timeout'));
     });
 
