@@ -1,4 +1,4 @@
-import { config, modelMap } from './state.mjs';
+import { config, modelMap, stats } from './state.mjs';
 import { fingerprintKey, writeGatewayLog, getClientIp } from './logger.mjs';
 import {
   isChannelEnabled,
@@ -10,6 +10,34 @@ function getClientKeyEntries() {
   return (Array.isArray(config.api_keys) ? config.api_keys : [])
     .map(normalizeClientKeyEntry)
     .filter(Boolean);
+}
+
+function withClientKeyUsage(entry, type = 'generated') {
+  const usage = stats.clientKeyUsage?.[fingerprintKey(entry.key)] || {};
+  return {
+    ...entry,
+    key_type: type,
+    usage_count: Number(usage.totalRequests) || 0,
+    usage_errors: Number(usage.totalErrors) || 0,
+    usage_input_tokens: Number(usage.totalInputTokens) || 0,
+    usage_output_tokens: Number(usage.totalOutputTokens) || 0,
+    last_used_at: usage.lastUsedAt || '',
+    last_status: usage.lastStatus || null,
+  };
+}
+
+function getClientKeyDashboardEntries() {
+  const admin = withClientKeyUsage({
+    key: config.api_key,
+    name: '主要 Key',
+    allowed_channels: [],
+    allowed_models: [],
+    quota_limit: 0,
+    quota_used: 0,
+    expires_at: '',
+    enabled: true,
+  }, 'admin');
+  return [admin, ...getClientKeyEntries().map(entry => withClientKeyUsage(entry))];
 }
 
 function saveClientKeyEntries(entries) {
@@ -165,6 +193,7 @@ function clientAuth(req, res) {
 
 export {
   getClientKeyEntries,
+  getClientKeyDashboardEntries,
   saveClientKeyEntries,
   findClientKeyEntry,
   isClientKeyExpired,

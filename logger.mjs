@@ -486,6 +486,29 @@ function recordUpstreamKeyTest(fingerprint = '', details = {}) {
   saveStats();
 }
 
+function recordClientKeyUsage(fingerprint = '', details = {}) {
+  const key = String(fingerprint || '');
+  if (!key) return;
+  if (!stats.clientKeyUsage) stats.clientKeyUsage = {};
+  if (!stats.clientKeyUsage[key]) {
+    stats.clientKeyUsage[key] = {
+      totalRequests: 0,
+      totalErrors: 0,
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      lastUsedAt: null,
+      lastStatus: null,
+    };
+  }
+  const usage = stats.clientKeyUsage[key];
+  usage.totalRequests++;
+  if (!details.success) usage.totalErrors++;
+  usage.totalInputTokens += toTokenNumber(details.inputTokens);
+  usage.totalOutputTokens += toTokenNumber(details.outputTokens);
+  usage.lastUsedAt = new Date().toISOString();
+  usage.lastStatus = Number(details.statusCode) || null;
+}
+
 function logRequest(model, channel, tokens = 0, success = true, error = null) {
   const options = error && typeof error === 'object' && !Array.isArray(error)
     ? error
@@ -533,6 +556,12 @@ function logRequest(model, channel, tokens = 0, success = true, error = null) {
   recordUpstreamKeyUsage(options.upstreamKeyFingerprint, {
     success,
     error,
+    statusCode: options.statusCode,
+    inputTokens,
+    outputTokens,
+  });
+  recordClientKeyUsage(options.clientKeyFingerprint, {
+    success,
     statusCode: options.statusCode,
     inputTokens,
     outputTokens,

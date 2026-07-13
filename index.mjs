@@ -116,7 +116,7 @@ process.on('SIGTERM', () => {
   process.exit();
 });
 
-server.listen(config.port, '0.0.0.0', () => {
+server.listen(config.port, '127.0.0.1', () => {
   console.log(`========================================`);
   console.log(`聚合渠道 (API Gateway) v2.0`);
   console.log(`========================================`);

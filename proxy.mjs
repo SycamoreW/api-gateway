@@ -138,7 +138,7 @@ async function proxyUnlimitedChatRequest(channel, req, res, data, upstreamModel 
       path: parsed.pathname + parsed.search,
       method: 'POST',
       headers,
-      timeout: 120000,
+      timeout: 480000,
     };
     const transport = parsed.protocol === 'https:' ? https : http;
     let rawResponse = '';
@@ -364,7 +364,7 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
       path: parsed.pathname + parsed.search,
       method: req.method,
       headers,
-      timeout: 120000,
+      timeout: 480000,
     };
 
     const transport = parsed.protocol === 'https:' ? https : http;
@@ -590,7 +590,7 @@ async function proxyAnthropicChatRequest(channel, req, res, data, upstreamModel 
       path: parsed.pathname + parsed.search,
       method: 'POST',
       headers,
-      timeout: 120000,
+      timeout: 480000,
     };
 
     const transport = parsed.protocol === 'https:' ? https : http;

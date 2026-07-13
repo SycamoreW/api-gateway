@@ -9,7 +9,7 @@ import {
   saveStats, newRequestId, fingerprintKey, recordUpstreamKeyTest,
 } from './logger.mjs';
 import {
-  isChannelEnabled, getChannelKeys, getActiveChannelKeys, isKeyDisabled,
+  isChannelEnabled, getChannelKeys, getForceEnabledChannelKeys, getActiveChannelKeys, isKeyDisabled,
   normalizeKeyList, normalizeStringArray,
   normalizeExpiresAt, normalizeClientKeyEntry, normalizeChannelForSave,
   normalizeImportedConfig, rebuildModelMap, saveConfig,
@@ -19,13 +19,13 @@ import {
   stripModelPrefix, applyOpenAICompatiblePromptCache,
   isForcedNonStreamModel, sanitizePayloadForUpstream, getConfiguredModelParams,
   reorderYepApiMessages, normalizeOpenAIFinishReason,
-  convertResponsesInputToMessages, convertResponsesToolsToOpenAI,
+  convertResponsesInputToMessages, convertResponsesToolsToOpenAI, convertResponsesToolChoiceToOpenAI,
   convertChatCompletionToResponsesFormat,
   convertAnthropicMessagesToOpenAIChat, convertOpenAIChatResultToAnthropicMessages,
   toPositiveInteger,
 } from './format-converters.mjs';
 import {
-  getClientKeyEntries, saveClientKeyEntries, findClientKeyEntry,
+  getClientKeyEntries, getClientKeyDashboardEntries, saveClientKeyEntries, findClientKeyEntry,
   isClientKeyExpired, clientCanUseChannel, clientCanUseModel,
   getAccessibleModelEntries, getModelQuotaCost, consumeClientQuota,
   adminAuth, clientAuth,
@@ -34,6 +34,56 @@ import {
   selectChannelKey, isYepApiChannel,
   proxyRequest, proxyAnthropicChatRequest, proxyUnlimitedChatRequest,
 } from './proxy.mjs';
+
+
+const responseStateStore = new Map();
+const RESPONSE_STATE_LIMIT = 200;
+
+function cloneMessages(messages = []) {
+  return JSON.parse(JSON.stringify(Array.isArray(messages) ? messages : []));
+}
+
+function rememberResponseState(responseId, messages = [], outputItems = []) {
+  if (!responseId) return;
+  const fullMessages = cloneMessages(messages);
+  const toolCalls = [];
+  let assistantText = '';
+  for (const item of Array.isArray(outputItems) ? outputItems : []) {
+    if (!item || typeof item !== 'object') continue;
+    if (item.type === 'function_call') {
+      toolCalls.push({
+        id: item.call_id || item.id || ('call_' + newRequestId()),
+        type: 'function',
+        function: {
+          name: item.name || '',
+          arguments: typeof item.arguments === 'string' ? item.arguments : JSON.stringify(item.arguments || {}),
+        },
+      });
+    } else if (item.type === 'message' && Array.isArray(item.content)) {
+      for (const part of item.content) {
+        if (part?.type === 'output_text' && part.text) assistantText += part.text;
+      }
+    }
+  }
+  if (toolCalls.length) {
+    fullMessages.push({ role: 'assistant', content: null, tool_calls: toolCalls });
+  } else if (assistantText) {
+    fullMessages.push({ role: 'assistant', content: assistantText });
+  }
+  responseStateStore.set(responseId, { messages: fullMessages, createdAt: Date.now() });
+  if (responseStateStore.size > RESPONSE_STATE_LIMIT) {
+    const oldest = [...responseStateStore.entries()].sort((a, b) => a[1].createdAt - b[1].createdAt)[0]?.[0];
+    if (oldest) responseStateStore.delete(oldest);
+  }
+}
+
+function hydrateResponsesMessages(data = {}, messages = []) {
+  const previousId = data.previous_response_id;
+  if (!previousId) return messages;
+  const previous = responseStateStore.get(previousId);
+  if (!previous) return messages;
+  return [...cloneMessages(previous.messages), ...messages];
+}
 
 async function handleChatCompletions(req, res, body, requestId) {
   let data;
@@ -290,6 +340,7 @@ async function handleModels(req, res) {
 function getChannelKeyDashboard(channelKey, ch = {}) {
   const keys = getChannelKeys(ch);
   const disabledSet = new Set(Array.isArray(ch.disabled_keys) ? ch.disabled_keys : []);
+  const forceEnabledSet = new Set(getForceEnabledChannelKeys(ch));
   const disabledMeta = ch.disabled_key_meta && typeof ch.disabled_key_meta === 'object'
     ? ch.disabled_key_meta
     : {};
@@ -302,7 +353,8 @@ function getChannelKeyDashboard(channelKey, ch = {}) {
       index,
       key,
       maskedKey: key.length <= 8 ? `${key.slice(0, 1)}***${key.slice(-1)}` : `${key.slice(0, 6)}…${key.slice(-4)}`,
-      enabled: !disabledSet.has(key),
+      enabled: forceEnabledSet.has(key) || !disabledSet.has(key),
+      forceEnabled: forceEnabledSet.has(key),
       disabledReason: meta.reason || '',
       disabledStatus: meta.status || null,
       disabledAt: meta.disabled_at || '',
@@ -462,7 +514,7 @@ async function handleConfigAPI(req, res, url, body) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       channels: config.channels,
-      api_keys: getClientKeyEntries(),
+      api_keys: getClientKeyDashboardEntries(),
     }));
     return true;
   }
@@ -534,6 +586,7 @@ async function handleConfigAPI(req, res, url, body) {
     const count = Math.min(Math.max(parseInt(d.count || '1', 10) || 1, 1), 100);
     const prefix = String(d.prefix || 'key').trim().replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24) || 'key';
     const allowedChannels = normalizeStringArray(d.allowed_channels);
+    const allowedModels = normalizeStringArray(d.allowed_models).filter(model => modelMap.has(model));
     const quotaLimit = Math.max(0, Math.floor(Number(d.quota_limit) || 0));
     const expiresAt = normalizeExpiresAt(d.expires_at);
     const existingEntries = getClientKeyEntries();
@@ -547,7 +600,7 @@ async function handleConfigAPI(req, res, url, body) {
           key,
           name: count === 1 ? prefix : `${prefix}-${created.length + 1}`,
           allowed_channels: allowedChannels,
-          allowed_models: [],
+          allowed_models: allowedModels,
           quota_limit: quotaLimit,
           quota_used: 0,
           expires_at: expiresAt,
@@ -561,7 +614,7 @@ async function handleConfigAPI(req, res, url, body) {
     res.end(JSON.stringify({
       ok: true,
       keys: created.map(entry => entry.key),
-      api_keys: getClientKeyEntries(),
+      api_keys: getClientKeyDashboardEntries(),
     }));
     return true;
   }
@@ -585,7 +638,7 @@ async function handleConfigAPI(req, res, url, body) {
       key,
       name: String(d.name || '').trim(),
       allowed_channels: normalizeStringArray(d.allowed_channels).filter(channelKey => Boolean(config.channels[channelKey])),
-      allowed_models: normalizeStringArray(d.allowed_models),
+      allowed_models: normalizeStringArray(d.allowed_models).filter(model => modelMap.has(model)),
       quota_limit: Math.max(0, Math.floor(Number(d.quota_limit) || 0)),
       quota_used: Math.max(0, Math.floor(Number(d.quota_used) || 0)),
       expires_at: normalizeExpiresAt(d.expires_at),
@@ -596,7 +649,7 @@ async function handleConfigAPI(req, res, url, body) {
     saveClientKeyEntries(entries);
     saveConfig();
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, api_keys: getClientKeyEntries() }));
+    res.end(JSON.stringify({ ok: true, api_keys: getClientKeyDashboardEntries() }));
     return true;
   }
 
@@ -612,7 +665,7 @@ async function handleConfigAPI(req, res, url, body) {
     saveClientKeyEntries(entries.filter(entry => entry.key !== key));
     saveConfig();
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, api_keys: getClientKeyEntries() }));
+    res.end(JSON.stringify({ ok: true, api_keys: getClientKeyDashboardEntries() }));
     return true;
   }
 
@@ -738,6 +791,7 @@ async function handleConfigAPI(req, res, url, body) {
       keys: configuredKeys,
       disabled_keys: existingChannel.disabled_keys,
       disabled_key_meta: existingChannel.disabled_key_meta,
+      force_enabled_keys: existingChannel.force_enabled_keys,
       ...(format || existingChannel.format ? { format: format || existingChannel.format } : {}),
       ...(anthropic_version || existingChannel.anthropic_version ? { anthropic_version: anthropic_version || existingChannel.anthropic_version } : {}),
       ...(prompt_cache_enabled ? { prompt_cache_enabled: true, prompt_cache_ttl } : {}),
@@ -970,6 +1024,40 @@ async function handleConfigAPI(req, res, url, body) {
     return true;
   }
 
+  if (url === '/api/config/channel-keys/force-enable' && req.method === 'POST') {
+    const d = JSON.parse(body || '{}');
+    const channelKey = String(d.channelKey || '');
+    const ch = config.channels[channelKey];
+    if (!ch) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: '渠道不存在' }));
+      return true;
+    }
+    const allKeys = getChannelKeys(ch);
+    const targetKeys = d.all === true
+      ? allKeys
+      : normalizeKeyList(Array.isArray(d.keys) ? d.keys : [d.key]).filter(key => allKeys.includes(key));
+    if (!targetKeys.length) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: '请选择至少一个 Key' }));
+      return true;
+    }
+    const enabled = d.enabled !== false;
+    const forceSet = new Set(getForceEnabledChannelKeys(ch));
+    for (const key of targetKeys) enabled ? forceSet.add(key) : forceSet.delete(key);
+    const disabledKeys = enabled ? (ch.disabled_keys || []).filter(key => !forceSet.has(key)) : (ch.disabled_keys || []);
+    config.channels[channelKey] = normalizeChannelForSave({
+      ...ch,
+      force_enabled_keys: [...forceSet],
+      disabled_keys: disabledKeys,
+    });
+    channelKeyCursors.delete(channelKey);
+    saveConfig();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, updated: targetKeys.length, enabled }));
+    return true;
+  }
+
   if (url === '/api/config/channel-keys/disable' && req.method === 'POST') {
     const d = JSON.parse(body || '{}');
     const { channelKey, key } = d;
@@ -1064,6 +1152,7 @@ async function handleConfigAPI(req, res, url, body) {
     const nextKeys = [...allKeys];
     nextKeys[index] = newKey;
     const wasDisabled = isKeyDisabled(ch, oldKey);
+    const wasForceEnabled = getForceEnabledChannelKeys(ch).includes(oldKey);
     const disabledKeys = (ch.disabled_keys || []).filter(key => key !== oldKey);
     if (wasDisabled) disabledKeys.push(newKey);
     const disabledMeta = { ...(ch.disabled_key_meta || {}) };
@@ -1077,6 +1166,7 @@ async function handleConfigAPI(req, res, url, body) {
       keys: nextKeys,
       disabled_keys: disabledKeys,
       disabled_key_meta: disabledMeta,
+      force_enabled_keys: getForceEnabledChannelKeys(ch).filter(key => key !== oldKey).concat(wasForceEnabled ? [newKey] : []),
     });
     channelKeyCursors.delete(channelKey);
     saveConfig();
@@ -1108,7 +1198,7 @@ async function handleConfigAPI(req, res, url, body) {
       res.end(JSON.stringify({ ok: false, error: '至少保留一个 Key' }));
       return true;
     }
-    config.channels[channelKey] = normalizeChannelForSave({ ...ch, key: remainingKeys[0], keys: remainingKeys });
+    config.channels[channelKey] = normalizeChannelForSave({ ...ch, key: remainingKeys[0], keys: remainingKeys, force_enabled_keys: getForceEnabledChannelKeys(ch).filter(key => remainingKeys.includes(key)) });
     channelKeyCursors.delete(channelKey);
     saveConfig();
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1133,7 +1223,7 @@ async function handleConfigAPI(req, res, url, body) {
       res.end(JSON.stringify({ ok: false, error: '不能删除全部 Key，请先恢复至少一个' }));
       return true;
     }
-    config.channels[channelKey] = normalizeChannelForSave({ ...ch, key: remainingKeys[0] || '', keys: remainingKeys });
+    config.channels[channelKey] = normalizeChannelForSave({ ...ch, key: remainingKeys[0] || '', keys: remainingKeys, force_enabled_keys: getForceEnabledChannelKeys(ch).filter(key => remainingKeys.includes(key)) });
     channelKeyCursors.delete(channelKey);
     saveConfig();
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1167,6 +1257,7 @@ async function handleConfigAPI(req, res, url, body) {
       ...ch,
       key: remainingKeys[0],
       keys: remainingKeys,
+      force_enabled_keys: getForceEnabledChannelKeys(ch).filter(key => remainingKeys.includes(key)),
     });
     rebuildModelMap();
     saveConfig();
@@ -1220,10 +1311,11 @@ async function handleResponses(req, res, body, requestId) {
     return;
   }
   const wantsStream = data.stream === true;
-  const messages = convertResponsesInputToMessages(data.input);
-  if (data.instructions) {
+  let messages = convertResponsesInputToMessages(data.input);
+  if (data.instructions && !data.previous_response_id) {
     messages.unshift({ role: 'system', content: data.instructions });
   }
+  messages = hydrateResponsesMessages(data, messages);
   const chatData = {
     model: data.model,
     messages,
@@ -1235,14 +1327,115 @@ async function handleResponses(req, res, body, requestId) {
   if (data.max_tokens != null) chatData.max_tokens = data.max_tokens;
   const tools = convertResponsesToolsToOpenAI(data.tools);
   if (tools?.length) chatData.tools = tools;
-  if (data.tool_choice) chatData.tool_choice = data.tool_choice;
+  if (data.tool_choice) chatData.tool_choice = convertResponsesToolChoiceToOpenAI(data.tool_choice);
+  if (data.parallel_tool_calls != null) chatData.parallel_tool_calls = data.parallel_tool_calls;
 
   if (wantsStream) {
     const chatBody = JSON.stringify(chatData);
     let headersSent = false;
     let isFirst = true;
+    let finalized = false;
+    let outputText = '';
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let outputStarted = false;
+    let outputKind = '';
+    let toolCallId = '';
+    let toolItemId = '';
+    let toolName = '';
+    let toolArguments = '';
+    let upstreamSseBuffer = '';
+    const toolCallsByIndex = new Map();
     const responseId = 'resp_' + newRequestId();
     const msgId = 'msg_' + newRequestId();
+    const modelName = data.model || '';
+    const messageItem = () => ({
+      type: 'message', id: msgId, role: 'assistant', status: 'completed',
+      content: [{ type: 'output_text', text: outputText, annotations: [] }],
+    });
+    const responseObject = (status = 'completed', error = null) => ({
+      id: responseId, object: 'response', created_at: Math.floor(Date.now() / 1000),
+      status, error, incomplete_details: null, instructions: data.instructions || null,
+      max_output_tokens: data.max_output_tokens ?? null, model: modelName,
+      output: status === 'completed' ? [messageItem()] : [], parallel_tool_calls: data.parallel_tool_calls ?? true,
+      previous_response_id: data.previous_response_id || null, reasoning: { effort: null, summary: null }, store: false,
+      temperature: data.temperature ?? 1, text: { format: { type: 'text' } },
+      tool_choice: data.tool_choice || 'auto', tools: Array.isArray(data.tools) ? data.tools : [],
+      top_p: data.top_p ?? 1, truncation: 'disabled',
+      usage: { input_tokens: inputTokens, input_tokens_details: { cached_tokens: 0 },
+        output_tokens: outputTokens, output_tokens_details: { reasoning_tokens: 0 },
+        total_tokens: inputTokens + outputTokens },
+      user: data.user || null, metadata: data.metadata || {},
+    });
+    const emit = event => res.write('data: ' + JSON.stringify(event) + '\n\n');
+    const startTextOutput = () => {
+      if (outputStarted) return;
+      outputStarted = true;
+      outputKind = 'text';
+      emit({ type: 'response.output_item.added', output_index: 0,
+        item: { type: 'message', id: msgId, role: 'assistant', status: 'in_progress', content: [] } });
+      emit({ type: 'response.content_part.added', item_id: msgId, output_index: 0, content_index: 0,
+        part: { type: 'output_text', text: '', annotations: [] } });
+    };
+    const startToolOutput = (toolCall, index = 0) => {
+      outputStarted = true;
+      outputKind = 'tool';
+      let state = toolCallsByIndex.get(index);
+      if (!state) {
+        state = {
+          callId: toolCall.id || ('call_' + newRequestId()),
+          itemId: 'fc_' + newRequestId(),
+          name: toolCall.function?.name || '',
+          arguments: '',
+        };
+        toolCallsByIndex.set(index, state);
+        emit({ type: 'response.output_item.added', output_index: index,
+          item: { type: 'function_call', id: state.itemId, call_id: state.callId,
+            name: state.name, arguments: '', status: 'in_progress' } });
+      }
+      if (toolCall.function?.name) state.name = toolCall.function.name;
+      if (index === 0) {
+        toolCallId = state.callId;
+        toolItemId = state.itemId;
+        toolName = state.name;
+        toolArguments = state.arguments;
+      }
+      return state;
+    };
+    const finalizeCompleted = () => {
+      if (finalized) return;
+      finalized = true;
+      if (outputKind === 'tool') {
+        const output = [...toolCallsByIndex.entries()].sort((a, b) => a[0] - b[0]).map(([index, state]) => {
+          emit({ type: 'response.function_call_arguments.done', item_id: state.itemId,
+            output_index: index, arguments: state.arguments });
+          const item = { type: 'function_call', id: state.itemId, call_id: state.callId,
+            name: state.name, arguments: state.arguments, status: 'completed' };
+          emit({ type: 'response.output_item.done', output_index: index, item });
+          return item;
+        });
+        const response = responseObject('completed');
+        response.output = output;
+        rememberResponseState(responseId, messages, output);
+        emit({ type: 'response.completed', response });
+        return;
+      }
+      startTextOutput();
+      emit({ type: 'response.output_text.done', output_index: 0, content_index: 0, text: outputText });
+      emit({ type: 'response.content_part.done', output_index: 0, content_index: 0,
+        part: { type: 'output_text', text: outputText, annotations: [] } });
+      const textItem = messageItem();
+      emit({ type: 'response.output_item.done', output_index: 0, item: textItem });
+      const response = responseObject('completed');
+      rememberResponseState(responseId, messages, [textItem]);
+      emit({ type: 'response.completed', response });
+    };
+    const finalizeFailed = message => {
+      if (finalized) return;
+      finalized = true;
+      const error = { type: 'server_error', code: 'upstream_stream_error', message };
+      emit({ type: 'response.failed', response: responseObject('failed', error) });
+    };
     const fakeRes = {
       headersSent: false,
       writableEnded: false,
@@ -1264,16 +1457,15 @@ async function handleResponses(req, res, body, requestId) {
       setHeader() { },
       getHeader(name) { return res.getHeader(name); },
       write(chunk) {
-        const str = typeof chunk === 'string' ? chunk : chunk.toString();
-        for (const line of str.split('\n')) {
+        upstreamSseBuffer += typeof chunk === 'string' ? chunk : chunk.toString();
+        const lines = upstreamSseBuffer.split('\n');
+        upstreamSseBuffer = lines.pop() || '';
+        for (const line of lines) {
           const trimmed = line.trim();
-          if (!trimmed.startsWith('data: ')) continue;
-          const payload = trimmed.slice(6);
+          if (!trimmed.startsWith('data:')) continue;
+          const payload = trimmed.slice(5).trimStart();
           if (payload === '[DONE]') {
-            res.write('data: ' + JSON.stringify({ type: 'response.output_text.done', output_index: 0, content_index: 0 }) + '\n\n');
-            res.write('data: ' + JSON.stringify({ type: 'response.content_part.done', output_index: 0, content_index: 0 }) + '\n\n');
-            res.write('data: ' + JSON.stringify({ type: 'response.output_item.done', output_index: 0 }) + '\n\n');
-            res.write('data: ' + JSON.stringify({ type: 'response.completed' }) + '\n\n');
+            finalizeCompleted();
             return;
           }
           try {
@@ -1284,27 +1476,46 @@ async function handleResponses(req, res, body, requestId) {
                 type: 'response.created',
                 response: { id: responseId, object: 'response', status: 'in_progress', model: data.model || chatChunk.model || '', output: [] },
               }) + '\n\n');
-              res.write('data: ' + JSON.stringify({ type: 'response.in_progress' }) + '\n\n');
-              res.write('data: ' + JSON.stringify({
-                type: 'response.output_item.added', output_index: 0,
-                item: { type: 'message', id: msgId, role: 'assistant', status: 'in_progress', content: [] },
-              }) + '\n\n');
-              res.write('data: ' + JSON.stringify({
-                type: 'response.content_part.added', output_index: 0, content_index: 0,
-                part: { type: 'output_text', text: '', annotations: [] },
-              }) + '\n\n');
+              emit({ type: 'response.in_progress', response: { ...responseObject('in_progress'), output: [] } });
+            }
+            const usage = chatChunk.usage;
+            if (usage) {
+              inputTokens = usage.prompt_tokens || usage.input_tokens || inputTokens;
+              outputTokens = usage.completion_tokens || usage.output_tokens || outputTokens;
             }
             const delta = chatChunk.choices?.[0]?.delta;
             if (delta?.content) {
-              res.write('data: ' + JSON.stringify({
-                type: 'response.output_text.delta', output_index: 0, content_index: 0, delta: delta.content,
-              }) + '\n\n');
+              startTextOutput();
+              outputText += delta.content;
+              emit({ type: 'response.output_text.delta', item_id: msgId,
+                output_index: 0, content_index: 0, delta: delta.content });
+            }
+            if (Array.isArray(delta?.tool_calls)) {
+              for (const toolCall of delta.tool_calls) {
+                const index = Number.isInteger(toolCall.index) ? toolCall.index : 0;
+                const state = startToolOutput(toolCall, index);
+                const argsDelta = toolCall.function?.arguments || '';
+                if (argsDelta) {
+                  state.arguments += argsDelta;
+                  if (index === 0) toolArguments = state.arguments;
+                  emit({ type: 'response.function_call_arguments.delta', item_id: state.itemId,
+                    output_index: index, delta: argsDelta });
+                }
+              }
             }
           } catch { }
         }
       },
       end(endData) {
         if (endData) fakeRes.write(endData);
+        if (upstreamSseBuffer.trim()) fakeRes.write('\n');
+        if (!finalized && headersSent) {
+          if (!isFirst) finalizeCompleted();
+          else finalizeFailed('Upstream stream ended without a response');
+        } else if (!finalized && !headersSent) {
+          res.writeHead(502, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: 'Upstream stream ended without a response', type: 'upstream_error' } }));
+        }
         if (!res.writableEnded) res.end();
         fakeRes.writableEnded = true;
       },
@@ -1338,6 +1549,7 @@ async function handleResponses(req, res, body, requestId) {
   try {
     const chatResult = JSON.parse(capturedBody);
     const responsesResult = convertChatCompletionToResponsesFormat(chatResult, data.model);
+    rememberResponseState(responsesResult.id, messages, responsesResult.output);
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(responsesResult));
   } catch {

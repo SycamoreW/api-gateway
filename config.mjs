@@ -25,10 +25,20 @@ function isKeyDisabled(channel = {}, key = '') {
   return disabled.includes(String(key).trim());
 }
 
+function getForceEnabledChannelKeys(channel = {}) {
+  const allKeys = new Set(getChannelKeys(channel));
+  return normalizeKeyList(channel.force_enabled_keys || []).filter(key => allKeys.has(key));
+}
+
+function isKeyForceEnabled(channel = {}, key = '') {
+  return getForceEnabledChannelKeys(channel).includes(String(key || '').trim());
+}
+
 function getActiveChannelKeys(channel = {}) {
   const allKeys = getChannelKeys(channel);
   const disabled = new Set(Array.isArray(channel.disabled_keys) ? channel.disabled_keys.map(k => String(k || '').trim()) : []);
-  return allKeys.filter(k => !disabled.has(k));
+  const forced = new Set(getForceEnabledChannelKeys(channel));
+  return allKeys.filter(k => forced.has(k) || !disabled.has(k));
 }
 
 function normalizeChannelForSave(channel = {}) {
@@ -51,10 +61,13 @@ function normalizeChannelForSave(channel = {}) {
     next.key = '';
     delete next.keys;
   }
-  // Normalize disabled_keys: dedupe, trim, and remove entries for keys that no longer exist
+  const keySet = new Set(keys);
+  next.force_enabled_keys = normalizeKeyList(next.force_enabled_keys || []).filter(key => keySet.has(key));
+  if (next.force_enabled_keys.length === 0) delete next.force_enabled_keys;
+  const forceEnabledSet = new Set(next.force_enabled_keys || []);
+  // Normalize disabled_keys: dedupe, trim, remove missing and force-enabled entries.
   if (Array.isArray(next.disabled_keys) && next.disabled_keys.length > 0) {
-    const keySet = new Set(keys);
-    next.disabled_keys = normalizeKeyList(next.disabled_keys.filter(k => keySet.has(String(k || '').trim())));
+    next.disabled_keys = normalizeKeyList(next.disabled_keys.filter(k => keySet.has(String(k || '').trim()) && !forceEnabledSet.has(String(k || '').trim())));
     if (next.disabled_keys.length === 0) delete next.disabled_keys;
   } else {
     delete next.disabled_keys;
@@ -109,6 +122,7 @@ function disableUpstreamChannelKey(channelKey, key, details = {}) {
   const channel = config.channels?.[channelKey];
   const trimmedKey = String(key || '').trim();
   if (!channel || !trimmedKey || !getChannelKeys(channel).includes(trimmedKey)) return false;
+  if (isKeyForceEnabled(channel, trimmedKey)) return false;
   const disabledKeys = normalizeKeyList([...(channel.disabled_keys || []), trimmedKey]);
   const now = new Date().toISOString();
   const meta = {
@@ -258,6 +272,8 @@ function normalizeImportedConfig(input) {
 export {
   normalizeKeyList,
   getChannelKeys,
+  getForceEnabledChannelKeys,
+  isKeyForceEnabled,
   getActiveChannelKeys,
   isKeyDisabled,
   normalizeChannelForSave,

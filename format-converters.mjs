@@ -474,6 +474,24 @@ function sanitizePayloadForUpstream(data, upstreamModel) {
     }
   }
 
+  if (model.includes('glm') && Array.isArray(next.messages)) {
+    const normalizedMessages = next.messages.map((message) => (
+      message?.role === 'developer' ? { ...message, role: 'system' } : { ...message }
+    ));
+    const mergedMessages = [];
+    for (const message of normalizedMessages) {
+      const previous = mergedMessages[mergedMessages.length - 1];
+      if (message?.role === 'system' && previous?.role === 'system') {
+        previous.content = [flattenTextContent(previous.content), flattenTextContent(message.content)]
+          .filter(Boolean)
+          .join('\n\n');
+      } else {
+        mergedMessages.push(message);
+      }
+    }
+    next.messages = mergedMessages;
+  }
+
   return { data: next, removedParams };
 }
 
@@ -531,6 +549,21 @@ function convertResponsesInputToMessages(input) {
       messages.push({ role: item.role, content });
       continue;
     }
+    if (item.type === 'function_call') {
+      messages.push({
+        role: 'assistant',
+        content: null,
+        tool_calls: [{
+          id: item.call_id || item.id || '',
+          type: 'function',
+          function: {
+            name: item.name || '',
+            arguments: typeof item.arguments === 'string' ? item.arguments : JSON.stringify(item.arguments || {}),
+          },
+        }],
+      });
+      continue;
+    }
     if (item.type === 'function_call_output') {
       messages.push({
         role: 'tool',
@@ -541,6 +574,20 @@ function convertResponsesInputToMessages(input) {
     }
   }
   return messages.length > 0 ? messages : [{ role: 'user', content: '' }];
+}
+
+
+function convertResponsesToolChoiceToOpenAI(toolChoice) {
+  if (!toolChoice) return undefined;
+  if (typeof toolChoice === 'string') return toolChoice;
+  if (toolChoice.type === 'auto' || toolChoice.type === 'none' || toolChoice.type === 'required') return toolChoice.type;
+  if (toolChoice.type === 'function' && toolChoice.name) {
+    return { type: 'function', function: { name: toolChoice.name } };
+  }
+  if (toolChoice.type === 'function' && toolChoice.function?.name) {
+    return { type: 'function', function: { name: toolChoice.function.name } };
+  }
+  return toolChoice;
 }
 
 function convertResponsesToolsToOpenAI(tools) {
@@ -752,6 +799,7 @@ export {
   isForcedNonStreamModel,
   shouldBufferNonStreamResponse,
   convertResponsesInputToMessages,
+  convertResponsesToolChoiceToOpenAI,
   convertResponsesToolsToOpenAI,
   convertChatCompletionToResponsesFormat,
   convertAnthropicMessagesToOpenAIChat,

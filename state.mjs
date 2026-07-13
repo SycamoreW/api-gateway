@@ -33,6 +33,7 @@ if (fs.existsSync(STATS_FILE)) {
 }
 if (!stats.hourlyStats || typeof stats.hourlyStats !== 'object') stats.hourlyStats = {};
 if (!stats.upstreamKeyUsage || typeof stats.upstreamKeyUsage !== 'object') stats.upstreamKeyUsage = {};
+if (!stats.clientKeyUsage || typeof stats.clientKeyUsage !== 'object') stats.clientKeyUsage = {};
 
 const UI_FILE = path.resolve(import.meta.dirname, 'ui.html');
 const SERVE_UI = fs.existsSync(UI_FILE);
@@ -52,6 +53,7 @@ export function resetStats() {
     dailyStats: {},
     hourlyStats: {},
     upstreamKeyUsage: {},
+    clientKeyUsage: {},
     recentLogs: [],
   });
 }

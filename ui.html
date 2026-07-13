@@ -1968,7 +1968,8 @@
           <button class="btn btn-primary btn-sm" onclick="showAddChannel()">+ 添加渠道</button>
           <button class="btn btn-outline btn-sm" onclick="exportBackup()">导出备份</button>
           <button class="btn btn-outline btn-sm" onclick="importBackup()">导入备份</button>
-          <button class="btn btn-outline btn-sm" onclick="showApiKeyModal()">管理 Key</button>
+          <button class="btn btn-primary btn-sm" onclick="showClientKeysModal()">🔐 调用 Key</button>
+          <button class="btn btn-outline btn-sm" onclick="showApiKeyModal()">修改管理 Key</button>
         </div>
       </div>
       <div class="channel-filter" id="channelFilter"></div>
@@ -2644,6 +2645,9 @@
         const allowed = item.allowed_channels?.length
           ? item.allowed_channels.map(key => channels[key]?.name || key).join(', ')
           : '全部渠道';
+        const allowedModels = item.allowed_models?.length
+          ? item.allowed_models.join(', ')
+          : '全部模型';
         const quotaText = item.quota_limit > 0
           ? `${item.quota_used || 0}/${item.quota_limit}`
           : '不限';
@@ -2660,12 +2664,14 @@
           </div>
           <code style="display:block;word-break:break-all;color:#79c0ff;margin-top:4px">${escapeHtml(item.key)}</code>
           <div class="hint">可用渠道：${escapeHtml(allowed)}</div>
+          <div class="hint">可用模型：${escapeHtml(allowedModels)}</div>
+          <div class="hint">使用次数：${formatNumber(item.usage_count)} · 错误 ${formatNumber(item.usage_errors)} · Token ${formatNumber(item.usage_input_tokens + item.usage_output_tokens)}</div>
           <div class="hint">额度：${escapeHtml(quotaText)} · 每次请求扣 1</div>
           <div class="hint">截止时间：${escapeHtml(expiresText)}</div>
         </div>
         <button class="btn btn-outline btn-sm" onclick="copyText(${jsArg(item.key)})">复制</button>
-        <button class="btn btn-outline btn-sm" onclick="editClientKey(${jsArg(item.key)})">编辑</button>
-        <button class="btn btn-danger btn-sm" onclick="deleteClientKey(${jsArg(item.key)})">删除</button>
+        ${item.key_type === 'admin' ? '<span class="hint">管理 Key</span>' : `<button class="btn btn-outline btn-sm" onclick="editClientKey(${jsArg(item.key)})">编辑</button>
+        <button class="btn btn-danger btn-sm" onclick="deleteClientKey(${jsArg(item.key)})">删除</button>`}
       </div>
     </div>
   `}).join('') : '<div class="empty" style="padding:18px">还没有调用 Key</div>';
@@ -2683,6 +2689,7 @@
     <input id="clientKeyExpiresAt" type="datetime-local">
     <div class="hint">留空 = 永久有效。到期后这个 Key 不能调用 /v1。</div>
     ${renderClientKeyChannelPicker('newClientKeyChannels', [])}
+    ${renderClientKeyModelPicker('newClientKeyModels', [])}
     <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
       <button class="btn btn-primary" onclick="generateClientKeys()">批量生成</button>
       <button class="btn btn-outline" onclick="showManualClientKeyModal()">手动添加</button>
@@ -2708,6 +2715,12 @@
         quota_used: Math.max(0, Math.floor(Number(raw?.quota_used) || 0)),
         expires_at: String(raw?.expires_at || ''),
         enabled: raw?.enabled !== false,
+        key_type: String(raw?.key_type || 'generated'),
+        usage_count: Math.max(0, Number(raw?.usage_count) || 0),
+        usage_errors: Math.max(0, Number(raw?.usage_errors) || 0),
+        usage_input_tokens: Math.max(0, Number(raw?.usage_input_tokens) || 0),
+        usage_output_tokens: Math.max(0, Number(raw?.usage_output_tokens) || 0),
+        last_used_at: String(raw?.last_used_at || ''),
       };
     }
 
@@ -2765,6 +2778,27 @@
       return [...document.querySelectorAll(`#${CSS.escape(id)} input:checked`)].map(input => input.value);
     }
 
+    function renderClientKeyModelPicker(id, selected = []) {
+      const selectedSet = new Set(selected || []);
+      const modelRows = Object.entries(channels).flatMap(([ckey, ch]) =>
+        (ch.models || []).map(model => `
+    <label>
+      <input type="checkbox" value="${escapeHtml(model)}" ${selectedSet.has(model) ? 'checked' : ''}>
+      ${escapeHtml(model)} <span class="count">${escapeHtml(ch.name || ckey)}</span>
+    </label>`)
+      ).join('');
+      return `
+    <label>可用模型</label>
+    <div class="model-picker" id="${escapeHtml(id)}">
+      ${modelRows || '<div class="empty" style="padding:12px">还没有模型</div>'}
+    </div>
+    <div class="hint">不勾选任何模型 = 已选渠道中的全部模型可用。</div>`;
+    }
+
+    function getCheckedModels(id) {
+      return [...document.querySelectorAll(`#${CSS.escape(id)} input:checked`)].map(input => input.value);
+    }
+
     function showManualClientKeyModal() {
       showClientKeyEditor({ key: '', name: '', allowed_channels: [], quota_limit: 0, quota_used: 0, expires_at: '', enabled: true }, true);
     }
@@ -2796,6 +2830,7 @@
     <input id="clientKeyEditExpiresAt" type="datetime-local" value="${escapeHtml(toDatetimeLocalValue(item.expires_at || ''))}">
     <div class="hint">留空 = 永久有效。可以自由选择任意截止时间。</div>
     ${renderClientKeyChannelPicker('editClientKeyChannels', item.allowed_channels || [])}
+    ${renderClientKeyModelPicker('editClientKeyModels', item.allowed_models || [])}
     <div class="actions">
       <button class="btn btn-outline" onclick="showClientKeysModal()">返回</button>
       <button class="btn btn-primary" onclick="saveClientKey(${isNew ? 'true' : 'false'})">保存</button>
@@ -2817,6 +2852,7 @@
             quota_used: Number(document.getElementById('clientKeyEditQuotaUsed')?.value || 0),
             expires_at: datetimeLocalToIso('clientKeyEditExpiresAt'),
             allowed_channels: getCheckedChannelKeys('editClientKeyChannels'),
+            allowed_models: getCheckedModels('editClientKeyModels'),
           })
         });
         clientKeys = res.api_keys || [];
@@ -2842,7 +2878,7 @@
       try {
         const res = await api('/api/config/client-keys/generate', {
           method: 'POST',
-          body: JSON.stringify({ count, prefix, quota_limit: quotaLimit, expires_at: expiresAt, allowed_channels: getCheckedChannelKeys('newClientKeyChannels') })
+          body: JSON.stringify({ count, prefix, quota_limit: quotaLimit, expires_at: expiresAt, allowed_channels: getCheckedChannelKeys('newClientKeyChannels'), allowed_models: getCheckedModels('newClientKeyModels') })
         });
         clientKeys = res.api_keys || [];
         toast(`已生成 ${res.keys?.length || 0} 个调用 Key`);
@@ -3520,11 +3556,12 @@
       const ch = channels[channelKey];
       if (!ch) return null;
       const disabledSet = new Set(getDisabledKeys(ch));
+      const forceEnabledSet = new Set(Array.isArray(ch.force_enabled_keys) ? ch.force_enabled_keys : []);
       const metaMap = ch.disabled_key_meta && typeof ch.disabled_key_meta === 'object' ? ch.disabled_key_meta : {};
       const rows = getChannelKeys(ch).map((key, index) => {
         const meta = metaMap[key] || {};
         return {
-          id: key, index, key, maskedKey: maskKey(key), enabled: !disabledSet.has(key),
+          id: key, index, key, maskedKey: maskKey(key), enabled: forceEnabledSet.has(key) || !disabledSet.has(key), forceEnabled: forceEnabledSet.has(key),
           disabledReason: meta.reason || '', disabledStatus: meta.status ?? null,
           disabledAt: meta.disabled_at || '', lastError: meta.last_error || '',
           lastErrorAt: meta.last_error_at || '', lastUsedAt: '', lastStatus: null,
@@ -3785,6 +3822,29 @@
       }
     }
 
+    async function setForceEnabledChannelKeys(keys, enabled) {
+      const unique = [...new Set((keys || []).filter(Boolean))];
+      if (!unique.length) { toast('请先选择 Key', false); return; }
+      await runChannelKeyAction('/api/config/channel-keys/force-enable', { keys: unique, enabled }, enabled ? `已强制启用 ${unique.length} 个 Key` : `已取消 ${unique.length} 个 Key 的强制启用`);
+    }
+
+    async function forceEnableActiveChannelKey(key, enabled = true) {
+      await setForceEnabledChannelKeys([key], enabled);
+    }
+
+    async function forceEnableSelectedChannelKeys(enabled = true) {
+      const rows = getSelectedCurrentChannelRows();
+      if (!rows.length) { toast('请先选择 Key', false); return; }
+      await setForceEnabledChannelKeys(rows.map(row => row.key), enabled);
+    }
+
+    async function forceEnableAllChannelKeys(enabled = true) {
+      const rows = getCurrentChannelKeyDashboard()?.keys || [];
+      if (!rows.length) return;
+      if (!confirm(`${enabled ? '强制启用' : '取消强制启用'}当前渠道全部 ${rows.length} 个 Key？`)) return;
+      await setForceEnabledChannelKeys(rows.map(row => row.key), enabled);
+    }
+
     async function disableActiveChannelKey(key) {
       if (!confirm(`确定禁用 ${maskKey(key)}？`)) return;
       await runChannelKeyAction('/api/config/channel-keys/disable', { key }, 'Key 已禁用');
@@ -3917,8 +3977,12 @@
       <button class="btn btn-danger" onclick="deleteDisabledChannelKeys()">🗑 删除禁用</button>
       <button class="btn btn-outline" onclick="showChannelBatchTestModal()">🧪 批量测试</button>
       <button class="btn btn-outline" onclick="enableAllChannelKeys()">✅ 全部恢复</button>
+      <button class="btn btn-outline" onclick="forceEnableAllChannelKeys(true)">🛡 全部强启</button>
+      <button class="btn btn-outline" onclick="forceEnableAllChannelKeys(false)">取消全部强启</button>
       <span class="toolbar-divider"></span>
       <button class="btn btn-outline" onclick="toggleSelectAllChannelKeys()">☑ 全选/取消</button>
+      <button class="btn btn-outline" onclick="forceEnableSelectedChannelKeys(true)">🛡 强启选中</button>
+      <button class="btn btn-outline" onclick="forceEnableSelectedChannelKeys(false)">取消选中强启</button>
       <button class="btn btn-outline" onclick="exportSelectedChannelKeys()">📥 导出选中</button>
       <button class="btn btn-danger" onclick="deleteSelectedChannelKeys()">🗑 删除选中</button>
       <span class="selection-count">已选 ${selected.length} / 可见 ${rows.length} / 总计 ${(dashboard?.keys || []).length}</span>
@@ -3936,6 +4000,7 @@
           <input class="key-select" type="checkbox" ${selectedChannelKeys.has(row.key) ? 'checked' : ''} onchange="toggleSelectChannelKey(${jsArg(row.key)})">
           <code class="key-value" title="点击复制完整 Key" onclick="copyText(${jsArg(row.key)})">${escapeHtml(row.maskedKey || maskKey(row.key))}</code>
           <span class="status-pill ${row.enabled ? 'on' : 'off'}">${row.enabled ? '可用' : '禁用'}</span>
+          ${row.forceEnabled ? '<span class="status-pill on">强制启用</span>' : ''}
           ${row.lastTestPassed === true ? '<span class="status-pill on">测试通过</span>' : row.lastTestPassed === false ? '<span class="status-pill off">测试失败</span>' : ''}
         </div>
         <div class="key-meta-grid">
@@ -3953,6 +4018,7 @@
           <button class="btn btn-outline btn-sm" onclick="copyText(${jsArg(row.key)})">复制</button>
           <button class="btn btn-outline btn-sm" onclick="testActiveChannelKey(${jsArg(row.key)}, ${row.enabled ? 'false' : 'true'})">${row.enabled ? '测试' : '测试并恢复'}</button>
           ${row.enabled ? `<button class="btn btn-outline btn-sm" onclick="disableActiveChannelKey(${jsArg(row.key)})">禁用</button>` : `<button class="btn btn-outline btn-sm" onclick="enableActiveChannelKey(${jsArg(row.key)})">启用</button>`}
+          ${row.forceEnabled ? `<button class="btn btn-outline btn-sm" onclick="forceEnableActiveChannelKey(${jsArg(row.key)}, false)">取消强启</button>` : `<button class="btn btn-outline btn-sm" onclick="forceEnableActiveChannelKey(${jsArg(row.key)}, true)">强制启用</button>`}
           <button class="btn btn-outline btn-sm" onclick="editActiveChannelKey(${jsArg(row.key)})">修改</button>
           <button class="btn btn-danger btn-sm" onclick="deleteActiveChannelKey(${jsArg(row.key)})">删除</button>
         </div>
