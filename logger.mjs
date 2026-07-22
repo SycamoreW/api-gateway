@@ -498,15 +498,38 @@ function recordClientKeyUsage(fingerprint = '', details = {}) {
       totalOutputTokens: 0,
       lastUsedAt: null,
       lastStatus: null,
+      byChannel: {},
     };
   }
   const usage = stats.clientKeyUsage[key];
+  if (!usage.byChannel || typeof usage.byChannel !== 'object') usage.byChannel = {};
+  const now = new Date().toISOString();
   usage.totalRequests++;
   if (!details.success) usage.totalErrors++;
   usage.totalInputTokens += toTokenNumber(details.inputTokens);
   usage.totalOutputTokens += toTokenNumber(details.outputTokens);
-  usage.lastUsedAt = new Date().toISOString();
+  usage.lastUsedAt = now;
   usage.lastStatus = Number(details.statusCode) || null;
+
+  // 同一调用 Key 按渠道拆分统计，便于区分不同项目/渠道的用量
+  const channel = String(details.channel || 'unknown');
+  if (!usage.byChannel[channel]) {
+    usage.byChannel[channel] = {
+      totalRequests: 0,
+      totalErrors: 0,
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      lastUsedAt: null,
+      lastStatus: null,
+    };
+  }
+  const chUsage = usage.byChannel[channel];
+  chUsage.totalRequests++;
+  if (!details.success) chUsage.totalErrors++;
+  chUsage.totalInputTokens += toTokenNumber(details.inputTokens);
+  chUsage.totalOutputTokens += toTokenNumber(details.outputTokens);
+  chUsage.lastUsedAt = now;
+  chUsage.lastStatus = Number(details.statusCode) || null;
 }
 
 function logRequest(model, channel, tokens = 0, success = true, error = null) {
@@ -565,6 +588,7 @@ function logRequest(model, channel, tokens = 0, success = true, error = null) {
     statusCode: options.statusCode,
     inputTokens,
     outputTokens,
+    channel,
   });
 
   // 添加到最近日志（保留最近100条）

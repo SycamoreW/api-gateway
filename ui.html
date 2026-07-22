@@ -3482,10 +3482,15 @@
 
     function formatCompactNumber(value) {
       const n = Number(value) || 0;
-      if (n >= 1e9) return `${(n / 1e9).toFixed(2)}B`;
-      if (n >= 1e6) return `${(n / 1e6).toFixed(2)}M`;
-      if (n >= 1e3) return `${(n / 1e3).toFixed(1)}K`;
-      return String(n);
+      const abs = Math.abs(n);
+      const compact = (unit, label) => {
+        const scaled = n / unit;
+        return `${Number(scaled.toFixed(2))}${label}`;
+      };
+      if (abs >= 1e12) return compact(1e12, '万亿');
+      if (abs >= 1e8) return compact(1e8, '亿');
+      if (abs >= 1e4) return compact(1e4, '万');
+      return n.toLocaleString('zh-CN');
     }
 
     function renderUsageStats() {
@@ -3908,9 +3913,13 @@
       const selected = getSelectedCurrentChannelRows();
       const targets = selected.length ? selected : getVisibleChannelKeyRows();
       if (!targets.length) { toast('当前没有可测试的 Key', false); return; }
+      const models = Array.isArray(channels[activeChannelTab]?.models) ? channels[activeChannelTab].models : [];
+      if (!models.length) { toast('当前渠道没有可测试的模型', false); return; }
       document.getElementById('modalContent').innerHTML = `
     <h3>🧪 批量测试 Key</h3>
     <div class="hint">将测试 ${targets.length} 个 Key；有选中项时仅测试选中项。</div>
+    <label>测试模型</label>
+    <select id="channelBatchModel">${models.map(model => `<option value="${escapeHtml(model)}">${escapeHtml(model)}</option>`).join('')}</select>
     <label>并发数</label><input id="channelBatchConcurrency" type="number" min="1" max="20" value="5">
     <label class="checkbox-label"><input id="channelBatchAutoDisable" type="checkbox" checked> 失败后自动禁用坏 Key</label>
     <label class="checkbox-label"><input id="channelBatchReenable" type="checkbox"> 测试通过后恢复已禁用 Key</label>
@@ -3931,16 +3940,19 @@
       const bar = document.getElementById('channelBatchProgressBar');
       const status = document.getElementById('channelBatchStatus');
       const results = document.getElementById('channelBatchResults');
+      const model = document.getElementById('channelBatchModel')?.value || '';
+      if (!model) { toast('请选择测试模型', false); return; }
       channelBatchRunning = true;
       if (button) button.disabled = true;
       if (progress) progress.style.display = '';
       if (bar) bar.style.width = '15%';
-      if (status) status.textContent = `正在测试 ${targets.length} 个 Key...`;
+      if (status) status.textContent = `正在用 ${model} 测试 ${targets.length} 个 Key...`;
       try {
         const data = await api('/api/config/channel-keys/batch-test', {
           method: 'POST',
           body: JSON.stringify({
             channelKey: activeChannelTab,
+            model,
             keys: targets.map(row => row.key),
             concurrency: Math.min(Math.max(Number(document.getElementById('channelBatchConcurrency')?.value) || 5, 1), 20),
             autoDisable: document.getElementById('channelBatchAutoDisable')?.checked !== false,
@@ -3948,7 +3960,7 @@
           })
         });
         if (bar) bar.style.width = '100%';
-        if (status) status.textContent = `完成：通过 ${data.summary?.pass || 0}，失败 ${data.summary?.fail || 0}`;
+        if (status) status.textContent = `完成（${data.model || model}）：通过 ${data.summary?.pass || 0}，失败 ${data.summary?.fail || 0}`;
         if (results) results.innerHTML = (data.results || []).map(item => `<div class="batch-result-row ${item.pass ? 'pass' : 'fail'}"><strong>${escapeHtml(maskKey(item.key))}</strong><span>${item.pass ? '✅ 通过' : '❌ 失败'}</span><span style="flex:1">${escapeHtml(item.pass ? (item.reply || '(ok)') : (item.error || item.reason || '测试失败'))}</span></div>`).join('');
         await load();
       } catch (e) {
@@ -4059,6 +4071,7 @@
       </div>
       <div class="channel-actions">
         <button class="btn btn-outline btn-sm" onclick="testChannel(${jsArg(ckey)})">测试渠道</button>
+        ${ch.website ? `<button class="btn btn-outline btn-sm" onclick="window.open(${jsArg(ch.website)}, '_blank', 'noopener')">官网</button>` : ''}
         <button class="btn btn-outline btn-sm" onclick="setChannelEnabled(${jsArg(ckey)}, ${enabled ? 'false' : 'true'})">${enabled ? '禁用' : '启用'}</button>
         <button class="btn btn-outline btn-sm" onclick="editChannel(${jsArg(ckey)})">编辑</button>
         <button class="btn btn-danger btn-sm" onclick="deleteChannel(${jsArg(ckey)})">删除</button>
@@ -4094,6 +4107,9 @@
     <div class="hint">模型会显示为 [ds]model-name</div>
     <label>API 地址</label>
     <input id="chUrl" placeholder="https://api.example.com/v1">
+    <label>官网地址（可选）</label>
+    <input id="chWebsite" placeholder="https://example.com">
+    <div class="hint">填写后渠道会显示一个直达官网的按钮。</div>
     <label>API Key（每行一个，会按请求轮询）</label>
     <textarea id="chKeys" placeholder="sk-xxx&#10;sk-yyy" style="min-height:60px"></textarea>
     <label class="checkbox-label">
@@ -4287,6 +4303,9 @@
     <div class="hint">留空时模型名不加前缀；渠道内部 key 会保持不变。</div>
     <label>API 地址</label>
     <input id="chUrl" value="${escapeHtml(ch.base_url || '')}">
+    <label>官网地址（可选）</label>
+    <input id="chWebsite" value="${escapeHtml(ch.website || '')}" placeholder="https://example.com">
+    <div class="hint">填写后渠道会显示一个直达官网的按钮。</div>
     <label>Key 管理</label>
     <div id="chKeyList"></div>
     <label class="checkbox-label">
@@ -4397,6 +4416,7 @@
       const name = document.getElementById('chName').value.trim();
       const prefix = document.getElementById('chPrefix')?.value.trim() || '';
       const url = document.getElementById('chUrl').value.trim();
+      const website = document.getElementById('chWebsite')?.value.trim() || '';
       const key = document.getElementById('chKey')?.value.trim() || '';
       const upstreamKeys = editingKey
         ? getChannelKeys(channels[editingKey])
@@ -4422,6 +4442,7 @@
             body: JSON.stringify({
               channelKey: ckey,
               name, base_url: url,
+              website,
               key: upstreamKeys[0] || key,
               keys: upstreamKeys,
               models: finalModels,
@@ -4448,6 +4469,7 @@
             previousChannelKey: editingKey,
             channelKey: ckey,
             name, base_url: url,
+            website,
             key: upstreamKeys[0] || key || channels[editingKey]?.key,
             keys: upstreamKeys.length ? upstreamKeys : getChannelKeys(channels[editingKey]),
             models: finalModels,

@@ -459,11 +459,30 @@ function reorderYepApiMessages(data) {
   return { ...data, messages: newMessages };
 }
 
-function sanitizePayloadForUpstream(data, upstreamModel) {
+function isWorkBuddySensitiveClaudeChannel(channelKey = '', modelName = '') {
+  const key = String(channelKey || '').toLowerCase();
+  const model = String(modelName || '').toLowerCase();
+  return (key === 'cheap' || key === 'odirouter') && model.includes('claude');
+}
+
+function sanitizePayloadForUpstream(data, upstreamModel, channelKey = '') {
   if (!data || typeof data !== 'object') return { data, removedParams: [] };
   const next = { ...data };
   const removedParams = [];
   const model = String(upstreamModel || next.model || '').toLowerCase();
+
+  // These OpenAI-compatible Claude relays mishandle WorkBuddy's optional
+  // OpenAI-only tuning fields when the request also carries a large tool set.
+  // Keep the messages/tools intact and remove only fields that are not needed
+  // for Claude tool calling.
+  if (isWorkBuddySensitiveClaudeChannel(channelKey, model)) {
+    for (const key of ['reasoning_effort', 'stream_options', 'temperature']) {
+      if (Object.prototype.hasOwnProperty.call(next, key)) {
+        delete next[key];
+        removedParams.push(key);
+      }
+    }
+  }
 
   if (model.includes('gemini')) {
     for (const key of ['presence_penalty', 'frequency_penalty']) {
@@ -514,7 +533,8 @@ function isForcedNonStreamModel(channelKey = '', modelName = '') {
 }
 
 function shouldBufferNonStreamResponse(channelKey = '', modelName = '', body = '') {
-  return isForcedNonStreamModel(channelKey, modelName);
+  return isForcedNonStreamModel(channelKey, modelName)
+    || isWorkBuddySensitiveClaudeChannel(channelKey, modelName);
 }
 
 function convertResponsesInputToMessages(input) {
@@ -795,6 +815,7 @@ export {
   buildOpenAIChatCompletion,
   reorderYepApiMessages,
   sanitizePayloadForUpstream,
+  isWorkBuddySensitiveClaudeChannel,
   getConfiguredModelParams,
   isForcedNonStreamModel,
   shouldBufferNonStreamResponse,

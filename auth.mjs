@@ -14,6 +14,16 @@ function getClientKeyEntries() {
 
 function withClientKeyUsage(entry, type = 'generated') {
   const usage = stats.clientKeyUsage?.[fingerprintKey(entry.key)] || {};
+  const byChannel = usage.byChannel && typeof usage.byChannel === 'object' ? usage.byChannel : {};
+  const usage_by_channel = Object.entries(byChannel).map(([channel, ch]) => ({
+    channel,
+    usage_count: Number(ch.totalRequests) || 0,
+    usage_errors: Number(ch.totalErrors) || 0,
+    usage_input_tokens: Number(ch.totalInputTokens) || 0,
+    usage_output_tokens: Number(ch.totalOutputTokens) || 0,
+    last_used_at: ch.lastUsedAt || '',
+    last_status: ch.lastStatus || null,
+  })).sort((a, b) => (b.usage_input_tokens + b.usage_output_tokens) - (a.usage_input_tokens + a.usage_output_tokens));
   return {
     ...entry,
     key_type: type,
@@ -23,6 +33,7 @@ function withClientKeyUsage(entry, type = 'generated') {
     usage_output_tokens: Number(usage.totalOutputTokens) || 0,
     last_used_at: usage.lastUsedAt || '',
     last_status: usage.lastStatus || null,
+    usage_by_channel,
   };
 }
 
@@ -90,6 +101,8 @@ function getModelQuotaCost(modelName = '') {
 function consumeClientQuota(req, modelName = '') {
   if (req.clientApiKeyType === 'admin') return { ok: true, cost: 0, remaining: Infinity };
   const entries = getClientKeyEntries();
+
+  // Find entry by key
   const index = entries.findIndex(entry => entry.key === req.clientApiKey);
   if (index < 0) return { ok: false, statusCode: 401, message: 'Invalid API key' };
 

@@ -10,7 +10,7 @@ import {
   stripModelPrefix, normalizeOpenAIFinishReason, buildUnlimitedChatPayload,
   buildOpenAIChatCompletion, convertOpenAIChatToAnthropic,
   convertAnthropicResponseToOpenAI, getAnthropicBetaHeader,
-  shouldBufferNonStreamResponse,
+  shouldBufferNonStreamResponse, isWorkBuddySensitiveClaudeChannel,
 } from './format-converters.mjs';
 import {
   getChannelKeys, getActiveChannelKeys, isChannelEnabled,
@@ -64,6 +64,39 @@ function hasUntriedActiveKey(channel = {}, attemptedKeys = new Set()) {
 
 function shouldRetryWithAnotherKey(verdict = {}, channel = {}, attemptedKeys = new Set()) {
   return Boolean(verdict.disable || verdict.retry) && hasUntriedActiveKey(channel, attemptedKeys);
+}
+
+function payloadHasToolCalls(payload) {
+  if (!payload || typeof payload !== 'object') return false;
+  if (Array.isArray(payload)) return payload.some(payloadHasToolCalls);
+  if (Array.isArray(payload.tool_calls) && payload.tool_calls.length > 0) return true;
+  if (payload.function_call && typeof payload.function_call === 'object') return true;
+  if (payload.type === 'tool_use' || payload.type === 'function_call') return true;
+  return Object.values(payload).some(payloadHasToolCalls);
+}
+
+function responseHasToolCalls(responseData = '') {
+  const raw = String(responseData || '').trim();
+  if (!raw) return false;
+  try {
+    return payloadHasToolCalls(JSON.parse(raw));
+  } catch {}
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line.startsWith('data:')) continue;
+    const value = line.slice(5).trim();
+    if (!value || value === '[DONE]') continue;
+    try {
+      if (payloadHasToolCalls(JSON.parse(value))) return true;
+    } catch {}
+  }
+  return false;
+}
+
+function isEmptyUpstreamSuccess(channelKey, modelName, responseDetails, responseData) {
+  if (!isWorkBuddySensitiveClaudeChannel(channelKey, modelName)) return false;
+  return Number(responseDetails?.totalTokens || 0) === 0
+    && !String(responseDetails?.outputContent || '').trim()
+    && !responseHasToolCalls(responseData);
 }
 
 function isYepApiChannel(channel = {}) {
@@ -317,6 +350,13 @@ async function proxyUnlimitedChatRequest(channel, req, res, data, upstreamModel 
       });
     });
 
+    // Some slow relay providers do not emit response bytes for tens of
+    // seconds. Match curl's connection behavior so NAT/LB idle tracking does
+    // not tear down an otherwise live request before the first token arrives.
+    proxy.on('socket', (socket) => {
+      socket.setKeepAlive(true, 10000);
+    });
+
     proxy.on('error', (err) => {
       const retried = finishWithUpstreamError(inferUnlimitedErrorStatus(err.message), err.message || 'upstream error', { upstreamEvent: 'request_error', forceRetry: true });
       if (!retried) resolve();
@@ -405,7 +445,11 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
       proxyRes.on('end', () => {
         // 尝试解析 token 使用量和输出内容
         const responseDetails = extractResponseLogDetails(responseData);
-        const errorMessage = responseDetails.errorMessage;
+        const emptySuccess = proxyRes.statusCode < 400
+          && !responseDetails.errorMessage
+          && isEmptyUpstreamSuccess(channelKey, modelName, responseDetails, responseData);
+        const errorMessage = responseDetails.errorMessage
+          || (emptySuccess ? 'Upstream returned HTTP 200 with no content, usage, or tool calls' : '');
         const tokens = responseDetails.totalTokens;
 
         // 记录成功的请求
@@ -438,14 +482,17 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
             res.end();
           }
         } else {
+          const finalStatusCode = emptySuccess ? 502 : proxyRes.statusCode;
           const finalErrorMessage = errorMessage || `HTTP ${proxyRes.statusCode}`;
-          const verdict = handleSelectedKeyFailure(channel, channelKey, selectedKey, proxyRes.statusCode, finalErrorMessage);
-          logRequest(modelName || 'unknown', channel.name, 0, false, requestLogOptions(logContext, requestId, finalErrorMessage, { ...responseDetails, statusCode: proxyRes.statusCode }));
+          const verdict = emptySuccess
+            ? { disable: false, retry: true }
+            : handleSelectedKeyFailure(channel, channelKey, selectedKey, proxyRes.statusCode, finalErrorMessage);
+          logRequest(modelName || 'unknown', channel.name, 0, false, requestLogOptions(logContext, requestId, finalErrorMessage, { ...responseDetails, statusCode: finalStatusCode }));
           writeGatewayLog('request_complete', responseLogFields(logContext, {
             requestId,
             model: modelName || 'unknown',
             channel: channel.name,
-            statusCode: proxyRes.statusCode,
+            statusCode: finalStatusCode,
             durationMs: Date.now() - startedAt,
             tokens: responseDetails.totalTokens,
             inputTokens: responseDetails.inputTokens,
@@ -466,11 +513,26 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
             return;
           }
           if (bufferResponse && !res.headersSent) {
-            const responseHeaders = { ...proxyRes.headers };
-            delete responseHeaders['transfer-encoding'];
-            responseHeaders['content-length'] = Buffer.byteLength(responseData);
-            res.writeHead(proxyRes.statusCode, responseHeaders);
-            res.end(responseData);
+            if (emptySuccess) {
+              const payload = JSON.stringify({
+                error: {
+                  message: finalErrorMessage,
+                  type: 'upstream_error',
+                  code: 'empty_upstream_response',
+                },
+              });
+              res.writeHead(502, {
+                'content-type': 'application/json; charset=utf-8',
+                'content-length': Buffer.byteLength(payload),
+              });
+              res.end(payload);
+            } else {
+              const responseHeaders = { ...proxyRes.headers };
+              delete responseHeaders['transfer-encoding'];
+              responseHeaders['content-length'] = Buffer.byteLength(responseData);
+              res.writeHead(proxyRes.statusCode, responseHeaders);
+              res.end(responseData);
+            }
           } else if (!res.writableEnded) {
             res.end();
           }
@@ -502,6 +564,10 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
         }
         reject(err);
       });
+    });
+
+    proxy.on('socket', (socket) => {
+      socket.setKeepAlive(true, 10000);
     });
 
     proxy.on('error', (err) => {

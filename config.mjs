@@ -48,6 +48,11 @@ function normalizeChannelForSave(channel = {}) {
   if (Object.prototype.hasOwnProperty.call(channel, 'model_prefix')) {
     next.model_prefix = String(channel.model_prefix || '').trim();
   }
+  if (Object.prototype.hasOwnProperty.call(channel, 'website')) {
+    const site = String(channel.website || '').trim();
+    if (site) next.website = site;
+    else delete next.website;
+  }
   if (next.prompt_cache_enabled) {
     next.prompt_cache_ttl = normalizePromptCacheTtl(next.prompt_cache_ttl);
   } else {

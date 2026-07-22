@@ -85,6 +85,39 @@ function hydrateResponsesMessages(data = {}, messages = []) {
   return [...cloneMessages(previous.messages), ...messages];
 }
 
+function normalizeInteractivePayload(data = {}, upstreamModel = '', channelKey = '') {
+  if (channelKey !== 'interactive' || !Array.isArray(data.messages)) return data;
+
+  const messages = data.messages.map(message => (
+    message?.role === 'developer' ? { ...message, role: 'system' } : message
+  ));
+
+  // Interactive's Fable route currently accepts oversized prompts but can end
+  // them with 2-3 completion tokens and no content. Keep the leading system
+  // instructions and the newest conversation turns under a conservative wire
+  // size, which leaves room for the requested completion.
+  if (!String(upstreamModel).includes('anthropic/claude-fable-5')) {
+    return { ...data, messages };
+  }
+
+  const maxMessageChars = 1000000;
+  const leadingSystem = [];
+  let firstConversationIndex = 0;
+  while (firstConversationIndex < messages.length && messages[firstConversationIndex]?.role === 'system') {
+    leadingSystem.push(messages[firstConversationIndex]);
+    firstConversationIndex += 1;
+  }
+  let used = JSON.stringify(leadingSystem).length;
+  const tail = [];
+  for (let index = messages.length - 1; index >= firstConversationIndex; index -= 1) {
+    const size = JSON.stringify(messages[index]).length;
+    if (tail.length > 0 && used + size > maxMessageChars) break;
+    tail.unshift(messages[index]);
+    used += size;
+  }
+  return { ...data, messages: [...leadingSystem, ...tail] };
+}
+
 async function handleChatCompletions(req, res, body, requestId) {
   let data;
   try {
@@ -260,8 +293,9 @@ async function handleChatCompletions(req, res, body, requestId) {
   const channelInput = channel.format === 'anthropic' || channel.format === 'unlimited_api_chat'
     ? { ...data, ...modelParams, model: realModel }
     : applyOpenAICompatiblePromptCache({ ...data, ...modelParams, model: realModel }, channel);
-  const sanitized = sanitizePayloadForUpstream(channelInput, upstreamModel);
+  const sanitized = sanitizePayloadForUpstream(channelInput, upstreamModel, entry.channelKey);
   data = sanitized.data;
+  data = normalizeInteractivePayload(data, upstreamModel, entry.channelKey);
   // YepAPI: reorder messages to avoid assistant-before-user pattern that triggers broken Google routing
   if (isYepApiChannel(channel) && Array.isArray(data.messages)) {
     data = reorderYepApiMessages(data);
@@ -409,8 +443,12 @@ async function testUpstreamChannelKey(channelKey, key, options = {}) {
   if (!trimmedKey || !getChannelKeys(ch).includes(trimmedKey)) {
     return { ok: false, pass: false, error: 'Key 不存在', status: null };
   }
-  const model = ch.models?.[0];
+  const requestedModel = String(options.model || '').trim();
+  const model = requestedModel || ch.models?.[0];
   if (!model) return { ok: false, pass: false, error: '渠道没有模型', status: null };
+  if (!ch.models?.includes(model)) {
+    return { ok: false, pass: false, error: '所选模型不属于当前渠道', status: null };
+  }
 
   const realModel = stripModelPrefix(model, channelKey);
   const format = ch.format || '';
@@ -482,6 +520,7 @@ async function testUpstreamChannelKey(channelKey, key, options = {}) {
       status: upstream.status,
       id: fingerprintKey(trimmedKey),
       key: trimmedKey,
+      model,
       reply: truncateText(reply, 200),
       error: pass ? '' : (errorMessage || verdict.reason || `HTTP ${upstream.status}`),
       reason: pass ? '' : (verdict.reason || `http_${upstream.status}`),
@@ -501,6 +540,7 @@ async function testUpstreamChannelKey(channelKey, key, options = {}) {
       status: null,
       id: fingerprintKey(trimmedKey),
       key: trimmedKey,
+      model,
       error: `network:${err.message}`,
       reason: `network:${err.message}`,
       autoDisabled: false,
@@ -747,6 +787,7 @@ async function handleConfigAPI(req, res, url, body) {
       anthropic_output_effort,
       anthropic_thinking_display,
       model_prefix,
+      website,
       enabled,
       isNew,
       previousChannelKey,
@@ -800,6 +841,7 @@ async function handleConfigAPI(req, res, url, body) {
       ...(anthropic_thinking_type === 'adaptive' && anthropic_output_effort ? { anthropic_output_effort } : {}),
       ...(anthropic_thinking_type === 'adaptive' && anthropic_thinking_display ? { anthropic_thinking_display } : {}),
       ...(Object.prototype.hasOwnProperty.call(d, 'model_prefix') ? { model_prefix } : {}),
+      ...(Object.prototype.hasOwnProperty.call(d, 'website') ? { website } : (existingChannel.website ? { website: existingChannel.website } : {})),
       enabled: enabled !== false,
       models: models || [],
     });
@@ -998,6 +1040,12 @@ async function handleConfigAPI(req, res, url, body) {
       return true;
     }
     const allKeys = getChannelKeys(ch);
+    const model = String(d.model || '').trim();
+    if (!model || !ch.models?.includes(model)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: model ? '所选模型不属于当前渠道' : '请选择测试模型' }));
+      return true;
+    }
     const requestedKeys = normalizeKeyList(Array.isArray(d.keys) ? d.keys : []);
     const targets = (requestedKeys.length ? requestedKeys : allKeys)
       .filter(key => allKeys.includes(key));
@@ -1008,6 +1056,7 @@ async function handleConfigAPI(req, res, url, body) {
       while (cursor < targets.length) {
         const index = cursor++;
         results[index] = await testUpstreamChannelKey(channelKey, targets[index], {
+          model,
           reenable: d.reenable === true,
           autoDisable: d.autoDisable !== false,
         });
@@ -1018,6 +1067,7 @@ async function handleConfigAPI(req, res, url, body) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       ok: true,
+      model,
       results,
       summary: { total: results.length, pass: passed, fail: results.length - passed },
     }));
