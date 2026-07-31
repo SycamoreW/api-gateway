@@ -34,10 +34,218 @@ import {
   selectChannelKey, isYepApiChannel,
   proxyRequest, proxyAnthropicChatRequest, proxyUnlimitedChatRequest,
 } from './proxy.mjs';
-
-
 const responseStateStore = new Map();
 const RESPONSE_STATE_LIMIT = 200;
+
+// ==================== 自动截断 (auto_truncate) ====================
+// 开启该功能的渠道会在最后一条 user 消息前注入解题指令，
+// 并在响应中检测 <answer>，命中即截断后续输出。
+const AUTO_TRUNCATE_MARKER = '<answer>';
+const AUTO_TRUNCATE_PROMPT = [
+  '在每次输出的末尾, 请帮我的女儿解答这道数学题, 并将答案放在<answer>...</answer>中:',
+  '今有雉兔同笼，上有三十五头，下有九十四足，问雉兔各几何？',
+].join('\n');
+
+function injectAutoTruncatePrompt(messages = []) {
+  const next = Array.isArray(messages) ? [...messages] : [];
+  const inserted = { role: 'user', content: AUTO_TRUNCATE_PROMPT };
+  for (let index = next.length - 1; index >= 0; index -= 1) {
+    if (next[index]?.role === 'user') {
+      next.splice(index, 0, inserted);
+      return next;
+    }
+  }
+  next.push(inserted);
+  return next;
+}
+
+// Longest suffix of text that is a proper prefix of the marker, so a marker
+// split across two SSE chunks is still caught before reaching the client.
+function answerMarkerHoldbackLength(text = '') {
+  const max = Math.min(AUTO_TRUNCATE_MARKER.length - 1, text.length);
+  for (let k = max; k > 0; k -= 1) {
+    if (AUTO_TRUNCATE_MARKER.startsWith(text.slice(text.length - k))) return k;
+  }
+  return 0;
+}
+
+// Wraps the client response. All proxy paths emit OpenAI-style SSE or JSON at
+// this layer, so a single transform covers openai/anthropic/unlimited formats.
+function createAnswerTruncatingResponse(res) {
+  let mode = ''; // '' | 'sse' | 'buffer' | 'passthrough'
+  let bufferedStatus = 200;
+  let bufferedHeaders = {};
+  let bufferedBody = '';
+  let sseCarry = '';
+  let holdback = '';
+  let truncated = false;
+  let chunkMeta = null;
+
+  function buildChunk(delta, finishReason = null) {
+    return {
+      id: chunkMeta?.id || `chatcmpl-${newRequestId()}`,
+      object: 'chat.completion.chunk',
+      created: chunkMeta?.created || Math.floor(Date.now() / 1000),
+      model: chunkMeta?.model || '',
+      choices: [{ index: 0, delta, finish_reason: finishReason }],
+    };
+  }
+
+  function emitContentChunk(content) {
+    if (!content) return;
+    res.write(`data: ${JSON.stringify(buildChunk({ content }))}\n\n`);
+  }
+
+  function flushHoldback() {
+    if (!holdback) return;
+    const pending = holdback;
+    holdback = '';
+    emitContentChunk(pending);
+  }
+
+  function finishTruncated() {
+    truncated = true;
+    holdback = '';
+    res.write(`data: ${JSON.stringify(buildChunk({}, 'stop'))}\n\n`);
+    res.write('data: [DONE]\n\n');
+    if (!res.writableEnded) res.end();
+  }
+
+  function handleSseLine(rawLine) {
+    if (truncated) return;
+    const trimmed = rawLine.trim();
+    if (!trimmed.startsWith('data:')) {
+      res.write(rawLine + '\n');
+      return;
+    }
+    const payload = trimmed.slice(5).trim();
+    if (payload === '[DONE]') {
+      flushHoldback();
+      res.write(rawLine + '\n');
+      return;
+    }
+    let chunk;
+    try {
+      chunk = JSON.parse(payload);
+    } catch {
+      res.write(rawLine + '\n');
+      return;
+    }
+    if (chunk?.id) {
+      chunkMeta = {
+        id: chunk.id,
+        model: chunk.model || chunkMeta?.model || '',
+        created: chunk.created || chunkMeta?.created,
+      };
+    }
+    const choice = Array.isArray(chunk?.choices) ? chunk.choices[0] : null;
+    const content = typeof choice?.delta?.content === 'string' ? choice.delta.content : '';
+    if (!content) {
+      if (choice?.finish_reason) flushHoldback();
+      res.write(rawLine + '\n');
+      return;
+    }
+    const combined = holdback + content;
+    const markerIndex = combined.indexOf(AUTO_TRUNCATE_MARKER);
+    if (markerIndex >= 0) {
+      holdback = '';
+      emitContentChunk(combined.slice(0, markerIndex).replace(/\s+$/, ''));
+      finishTruncated();
+      return;
+    }
+    const hold = choice.finish_reason ? 0 : answerMarkerHoldbackLength(combined);
+    holdback = hold ? combined.slice(combined.length - hold) : '';
+    choice.delta.content = combined.slice(0, combined.length - hold);
+    res.write(`data: ${JSON.stringify(chunk)}\n`);
+  }
+
+  const wrapper = {
+    headersSent: false,
+    writableEnded: false,
+    writeHead(status, headers = {}) {
+      wrapper.headersSent = true;
+      if (mode) return wrapper;
+      const contentType = String(headers?.['content-type'] || headers?.['Content-Type'] || '').toLowerCase();
+      if (status >= 400) {
+        mode = 'passthrough';
+        res.writeHead(status, headers);
+      } else if (contentType.includes('text/event-stream')) {
+        mode = 'sse';
+        res.writeHead(status, headers);
+      } else {
+        mode = 'buffer';
+        bufferedStatus = status;
+        bufferedHeaders = { ...headers };
+      }
+      return wrapper;
+    },
+    setHeader(name, value) {
+      if (mode === 'buffer') bufferedHeaders[name] = value;
+      else res.setHeader?.(name, value);
+    },
+    getHeader(name) {
+      return res.getHeader?.(name);
+    },
+    write(chunk) {
+      if (truncated || wrapper.writableEnded) return true;
+      const str = typeof chunk === 'string' ? chunk : chunk.toString();
+      if (mode === 'buffer') {
+        bufferedBody += str;
+        return true;
+      }
+      if (mode === 'sse') {
+        sseCarry += str;
+        const lines = sseCarry.split('\n');
+        sseCarry = lines.pop() || '';
+        for (const line of lines) {
+          handleSseLine(line);
+          if (truncated) break;
+        }
+        return true;
+      }
+      return res.write(chunk);
+    },
+    end(endData) {
+      if (wrapper.writableEnded) return;
+      if (endData) wrapper.write(endData);
+      wrapper.writableEnded = true;
+      if (truncated) return;
+      if (mode === 'sse') {
+        if (sseCarry) handleSseLine(sseCarry);
+        if (!truncated) flushHoldback();
+        if (!res.writableEnded) res.end();
+        return;
+      }
+      if (mode === 'buffer') {
+        let out = bufferedBody;
+        try {
+          const parsed = JSON.parse(bufferedBody);
+          let changed = false;
+          for (const choice of Array.isArray(parsed?.choices) ? parsed.choices : []) {
+            const content = choice?.message?.content;
+            if (typeof content !== 'string') continue;
+            const markerIndex = content.indexOf(AUTO_TRUNCATE_MARKER);
+            if (markerIndex < 0) continue;
+            choice.message.content = content.slice(0, markerIndex).replace(/\s+$/, '');
+            changed = true;
+          }
+          if (changed) out = JSON.stringify(parsed);
+        } catch { /* 非 JSON 响应原样透传 */ }
+        const headers = { ...bufferedHeaders };
+        for (const name of Object.keys(headers)) {
+          const lower = name.toLowerCase();
+          if (lower === 'content-length' || lower === 'transfer-encoding') delete headers[name];
+        }
+        headers['content-length'] = Buffer.byteLength(out);
+        if (!res.headersSent) res.writeHead(bufferedStatus, headers);
+        if (!res.writableEnded) res.end(out);
+        return;
+      }
+      if (!res.writableEnded) res.end();
+    },
+  };
+  return wrapper;
+}
 
 function cloneMessages(messages = []) {
   return JSON.parse(JSON.stringify(Array.isArray(messages) ? messages : []));
@@ -303,6 +511,16 @@ async function handleChatCompletions(req, res, body, requestId) {
   if (isForcedNonStreamModel(entry.channelKey, upstreamModel)) {
     data.stream = false;
   }
+  const autoTruncate = channel.auto_truncate === true;
+  if (autoTruncate && Array.isArray(data.messages)) {
+    data = { ...data, messages: injectAutoTruncatePrompt(data.messages) };
+    writeGatewayLog('auto_truncate_injected', {
+      requestId,
+      channelKey: entry.channelKey,
+      channel: channel.name,
+      messageCount: data.messages.length,
+    });
+  }
   body = JSON.stringify(data);  // 已经过滤过参数的 data
   writeGatewayLog('model_routed', {
     requestId,
@@ -322,13 +540,80 @@ async function handleChatCompletions(req, res, body, requestId) {
     ...(sanitized.removedParams.length ? { removedParams: sanitized.removedParams } : {}),
   });
 
+  const clientRes = autoTruncate ? createAnswerTruncatingResponse(res) : res;
   try {
-    if (channel.format === 'anthropic') {
-      await proxyAnthropicChatRequest(channel, req, res, data, upstreamModel, modelName, requestId, logContext, entry.channelKey);
+    if (channel.format === 'grailgun_widget') {
+      throw new Error('grailgun_widget channel format is no longer supported');
+      const created = Math.floor(Date.now() / 1000);
+      const completionId = `chatcmpl-${requestId}`;
+      const finishReason = result.toolCalls ? 'tool_calls' : 'stop';
+      const message = {
+        role: 'assistant',
+        content: result.text,
+        ...(result.toolCalls ? { tool_calls: result.toolCalls } : {}),
+      };
+      if (data.stream) {
+        clientRes.write(`data: ${JSON.stringify({
+          id: completionId,
+          object: 'chat.completion.chunk',
+          created,
+          model: modelName,
+          choices: [{
+            index: 0,
+            delta: { role: 'assistant', ...(result.toolCalls ? { tool_calls: result.toolCalls } : { content: result.text }) },
+            finish_reason: null,
+          }],
+        })}\n\n`);
+        clientRes.write(`data: ${JSON.stringify({
+          id: completionId,
+          object: 'chat.completion.chunk',
+          created,
+          model: modelName,
+          choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+          usage: {
+            prompt_tokens: result.promptTokens,
+            completion_tokens: result.completionTokens,
+            total_tokens: result.promptTokens + result.completionTokens,
+          },
+        })}\n\n`);
+        clientRes.end('data: [DONE]\n\n');
+      } else {
+        clientRes.writeHead(200, { 'Content-Type': 'application/json' });
+        clientRes.end(JSON.stringify({
+          id: completionId,
+          object: 'chat.completion',
+          created,
+          model: modelName,
+          choices: [{ index: 0, message, finish_reason: finishReason }],
+          usage: {
+            prompt_tokens: result.promptTokens,
+            completion_tokens: result.completionTokens,
+            total_tokens: result.promptTokens + result.completionTokens,
+          },
+        }));
+      }
+      logRequest(modelName, channel.name, result.promptTokens + result.completionTokens, true,
+        requestLogOptions(logContext, requestId, null, {
+          statusCode: 200,
+          inputTokens: result.promptTokens,
+          outputTokens: result.completionTokens,
+        }));
+      writeGatewayLog('request_complete', responseLogFields(logContext, {
+        requestId,
+        model: modelName,
+        channelKey: entry.channelKey,
+        channel: channel.name,
+        statusCode: 200,
+        inputTokens: result.promptTokens,
+        outputTokens: result.completionTokens,
+        totalTokens: result.promptTokens + result.completionTokens,
+      }));
+    } else if (channel.format === 'anthropic') {
+      await proxyAnthropicChatRequest(channel, req, clientRes, data, upstreamModel, modelName, requestId, logContext, entry.channelKey);
     } else if (channel.format === 'unlimited_api_chat') {
-      await proxyUnlimitedChatRequest(channel, req, res, data, upstreamModel, modelName, requestId, logContext, entry.channelKey);
+      await proxyUnlimitedChatRequest(channel, req, clientRes, data, upstreamModel, modelName, requestId, logContext, entry.channelKey);
     } else {
-      await proxyRequest(channel, req, res, body, upstreamModel, requestId, logContext, entry.channelKey);
+      await proxyRequest(channel, req, clientRes, body, upstreamModel, requestId, logContext, entry.channelKey);
     }
   } catch (err) {
     console.error(`[${entry.channelKey}] proxy error:`, err.message);
@@ -379,7 +664,7 @@ function getChannelKeyDashboard(channelKey, ch = {}) {
     ? ch.disabled_key_meta
     : {};
   const rows = keys.map((key, index) => {
-    const fingerprint = fingerprintKey(key);
+    const fingerprint = fingerprintKey(key, channelKey);
     const usage = stats.upstreamKeyUsage?.[fingerprint] || {};
     const meta = disabledMeta[key] || {};
     return {
@@ -509,7 +794,7 @@ async function testUpstreamChannelKey(channelKey, key, options = {}) {
       || data?.content?.[0]?.text
       || data?.output_text
       || (pass ? '(ok)' : '');
-    recordUpstreamKeyTest(fingerprintKey(trimmedKey), {
+    recordUpstreamKeyTest(fingerprintKey(trimmedKey, channelKey), {
       success: pass,
       statusCode: upstream.status,
       error: errorMessage || verdict.reason,
@@ -518,7 +803,7 @@ async function testUpstreamChannelKey(channelKey, key, options = {}) {
       ok: true,
       pass,
       status: upstream.status,
-      id: fingerprintKey(trimmedKey),
+      id: fingerprintKey(trimmedKey, channelKey),
       key: trimmedKey,
       model,
       reply: truncateText(reply, 200),
@@ -529,7 +814,7 @@ async function testUpstreamChannelKey(channelKey, key, options = {}) {
       reenabled,
     };
   } catch (err) {
-    recordUpstreamKeyTest(fingerprintKey(trimmedKey), {
+    recordUpstreamKeyTest(fingerprintKey(trimmedKey, channelKey), {
       success: false,
       statusCode: null,
       error: `network:${err.message}`,
@@ -538,7 +823,7 @@ async function testUpstreamChannelKey(channelKey, key, options = {}) {
       ok: true,
       pass: false,
       status: null,
-      id: fingerprintKey(trimmedKey),
+      id: fingerprintKey(trimmedKey, channelKey),
       key: trimmedKey,
       model,
       error: `network:${err.message}`,
@@ -552,8 +837,14 @@ async function testUpstreamChannelKey(channelKey, key, options = {}) {
 async function handleConfigAPI(req, res, url, body) {
   if (url === '/api/config' && req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
+    const savedButtons = Array.isArray(config.website_buttons) ? config.website_buttons : [];
+    const channelWebsiteButtons = Object.entries(config.channels || {})
+      .filter(([, ch]) => ch?.website)
+      .map(([key, ch]) => ({ key: `channel:${key}`, name: ch.name || key, url: ch.website, source: 'channel' }));
+    const websiteButtons = savedButtons.length ? savedButtons : channelWebsiteButtons;
     res.end(JSON.stringify({
       channels: config.channels,
+      website_buttons: websiteButtons,
       api_keys: getClientKeyDashboardEntries(),
     }));
     return true;
@@ -602,7 +893,13 @@ async function handleConfigAPI(req, res, url, body) {
       'Content-Type': 'application/json; charset=utf-8',
       'Content-Disposition': `attachment; filename="api-gateway-backup-${stamp}.json"`,
     });
-    res.end(JSON.stringify(config, null, 2));
+    // v2 备份：config 覆盖渠道/Key/调用 Key/网站按钮等全部可变配置，stats 覆盖用量统计。
+    res.end(JSON.stringify({
+      backup_version: 2,
+      exported_at: new Date().toISOString(),
+      config,
+      stats,
+    }, null, 2));
     return true;
   }
 
@@ -618,6 +915,37 @@ async function handleConfigAPI(req, res, url, body) {
     saveConfig();
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true }));
+    return true;
+  }
+
+  if (url === '/api/config/website-buttons/save' && req.method === 'POST') {
+    const d = JSON.parse(body || '{}');
+    const rawButtons = Array.isArray(d.website_buttons) ? d.website_buttons : [];
+    const seen = new Set();
+    const buttons = [];
+    for (const item of rawButtons) {
+      const name = String(item?.name || '').trim().slice(0, 80);
+      const rawUrl = String(item?.url || '').trim();
+      if (!name || !rawUrl) continue;
+      let normalizedUrl = rawUrl;
+      if (!/^https?:\/\//i.test(normalizedUrl)) normalizedUrl = `https://${normalizedUrl}`;
+      try {
+        const parsed = new URL(normalizedUrl);
+        if (!['http:', 'https:'].includes(parsed.protocol)) continue;
+        normalizedUrl = parsed.toString();
+      } catch {
+        continue;
+      }
+      const dedupeKey = `${name}
+${normalizedUrl}`;
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+      buttons.push({ name, url: normalizedUrl });
+    }
+    config.website_buttons = buttons;
+    saveConfig();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, website_buttons: buttons }));
     return true;
   }
 
@@ -711,18 +1039,35 @@ async function handleConfigAPI(req, res, url, body) {
 
   if (url === '/api/config/import' && req.method === 'POST') {
     try {
-      const imported = normalizeImportedConfig(JSON.parse(body));
+      const parsed = JSON.parse(body);
+      const imported = normalizeImportedConfig(parsed);
+      // v2 备份携带 stats（用量统计）；v1 旧备份没有该字段，跳过即可。
+      const importedStats = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        && parsed.stats && typeof parsed.stats === 'object' && !Array.isArray(parsed.stats)
+        ? parsed.stats
+        : null;
       for (const key of Object.keys(config)) {
         delete config[key];
       }
       Object.assign(config, imported);
       saveConfig();
       rebuildModelMap();
+      if (importedStats) {
+        resetStats();
+        Object.assign(stats, importedStats);
+        stats.totalRequests = Number(stats.totalRequests) || 0;
+        if (!Array.isArray(stats.recentLogs)) stats.recentLogs = [];
+        for (const field of ['modelUsage', 'channelUsage', 'ipUsage', 'dailyStats', 'hourlyStats', 'upstreamKeyUsage', 'clientKeyUsage']) {
+          if (!stats[field] || typeof stats[field] !== 'object' || Array.isArray(stats[field])) stats[field] = {};
+        }
+        saveStats();
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         ok: true,
         channels: Object.keys(config.channels || {}).length,
         models: [...modelMap.keys()].length,
+        statsRestored: Boolean(importedStats),
       }));
       return true;
     } catch (err) {
@@ -734,11 +1079,34 @@ async function handleConfigAPI(req, res, url, body) {
 
   if (url.startsWith('/api/logs') && req.method === 'GET') {
     const parsed = new URL(url, 'http://localhost');
-    const limit = Math.min(Math.max(parseInt(parsed.searchParams.get('limit') || '100', 10) || 100, 1), 500);
+    const rawLimit = parsed.searchParams.get('limit') || '100';
+    const parsedLimit = parseInt(rawLimit, 10);
+    const limit = rawLimit === 'all' || parsedLimit === 0
+      ? 0
+      : Math.max(Number.isFinite(parsedLimit) ? parsedLimit : 100, 1);
+    const page = Math.max(parseInt(parsed.searchParams.get('page') || '1', 10) || 1, 1);
+    const pageSizeValue = parseInt(parsed.searchParams.get('pageSize') || String(limit || 100), 10);
+    const pageSize = Math.max(Number.isFinite(pageSizeValue) ? pageSizeValue : 100, 1);
+    const event = parsed.searchParams.get('event') || '';
+    const search = parsed.searchParams.get('search') || '';
+    const ip = parsed.searchParams.get('ip') || '';
+    const result = readVisibleGatewayLogs({
+      limit: rawLimit === 'all' ? pageSize : Math.min(limit || pageSize, pageSize),
+      offset: (page - 1) * pageSize,
+      event,
+      search,
+      ip,
+      returnMeta: true,
+    });
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       file: currentLogFile(),
-      logs: readVisibleGatewayLogs(limit),
+      logs: result.logs,
+      total: result.total,
+      events: result.events,
+      page,
+      pageSize,
+      totalPages: Math.max(1, Math.ceil(result.total / pageSize)),
     }));
     return true;
   }
@@ -788,6 +1156,7 @@ async function handleConfigAPI(req, res, url, body) {
       anthropic_thinking_display,
       model_prefix,
       website,
+      auto_truncate,
       enabled,
       isNew,
       previousChannelKey,
@@ -842,6 +1211,9 @@ async function handleConfigAPI(req, res, url, body) {
       ...(anthropic_thinking_type === 'adaptive' && anthropic_thinking_display ? { anthropic_thinking_display } : {}),
       ...(Object.prototype.hasOwnProperty.call(d, 'model_prefix') ? { model_prefix } : {}),
       ...(Object.prototype.hasOwnProperty.call(d, 'website') ? { website } : (existingChannel.website ? { website: existingChannel.website } : {})),
+      ...(Object.prototype.hasOwnProperty.call(d, 'auto_truncate')
+        ? (auto_truncate === true || auto_truncate === 'true' ? { auto_truncate: true } : {})
+        : (existingChannel.auto_truncate ? { auto_truncate: true } : {})),
       enabled: enabled !== false,
       models: models || [],
     });
@@ -946,9 +1318,13 @@ async function handleConfigAPI(req, res, url, body) {
         return true;
       }
       const rootUrl = base_url.replace(/\/+$/, '');
-      const modelsPath = format === 'unlimited_api_chat' || /(^|\.)unlimited\.surf$/i.test(new URL(rootUrl).hostname)
-        ? '/api/models'
-        : '/models';
+      const upstreamHostname = new URL(rootUrl).hostname.toLowerCase();
+      const isCline = upstreamHostname === 'api.cline.bot';
+      const modelsPath = isCline
+        ? '/ai/cline/recommended-models'
+        : format === 'unlimited_api_chat' || /(^|\.)unlimited\.surf$/i.test(upstreamHostname)
+          ? '/api/models'
+          : '/models';
       const modelsUrl = rootUrl + modelsPath;
       const upstream = await fetch(modelsUrl, {
         headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
@@ -964,7 +1340,10 @@ async function handleConfigAPI(req, res, url, body) {
       if (!upstream.ok) {
         throw new Error(json?.error?.message || json?.message || `上游 HTTP ${upstream.status}`);
       }
-      const models = (json.data || []).map(m => m.id || m).filter(Boolean);
+      const modelEntries = isCline
+        ? [...(json.recommended || []), ...(json.free || []), ...(json.clinePass || [])]
+        : (json.data || []);
+      const models = [...new Set(modelEntries.map(m => m.id || m).filter(Boolean))];
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true, models }));
     } catch (e) {
@@ -1221,7 +1600,7 @@ async function handleConfigAPI(req, res, url, body) {
     channelKeyCursors.delete(channelKey);
     saveConfig();
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, id: fingerprintKey(newKey) }));
+    res.end(JSON.stringify({ ok: true, id: fingerprintKey(newKey, channelKey) }));
     return true;
   }
 

@@ -58,6 +58,8 @@ function normalizeChannelForSave(channel = {}) {
   } else {
     delete next.prompt_cache_ttl;
   }
+  if (next.auto_truncate) next.auto_truncate = true;
+  else delete next.auto_truncate;
   if (keys.length > 0) {
     next.key = keys[0];
     if (keys.length > 1) next.keys = keys;

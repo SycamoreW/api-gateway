@@ -53,7 +53,8 @@ function selectChannelKey(channel = {}, channelKey = '', excludedKeys = new Set(
     key: selectedKey,
     index: allIndex >= 0 ? allIndex : index,
     count: allKeys.length,
-    fingerprint: fingerprintKey(selectedKey),
+    // 按渠道作用域生成指纹，避免多个渠道共用同一上游 Key 时统计合并
+    fingerprint: fingerprintKey(selectedKey, channelKey || channel.name || ''),
   };
 }
 

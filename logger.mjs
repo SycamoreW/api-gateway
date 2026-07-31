@@ -1,9 +1,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
 import {
   stats, LOG_DIR, LOG_MAX_BODY_CHARS, HIDDEN_UI_LOG_EVENTS, STATS_FILE,
 } from './state.mjs';
+
+const LOG_INDEX_FILE = path.join(LOG_DIR, 'gateway-log-index.sqlite');
+let logDb = null;
 
 function ensureLogDir() {
   if (!fs.existsSync(LOG_DIR)) {
@@ -14,6 +18,115 @@ function ensureLogDir() {
 function currentLogFile() {
   const date = new Date().toISOString().split('T')[0];
   return path.join(LOG_DIR, `gateway-${date}.log`);
+}
+
+function logSourceName(file) {
+  return path.basename(file);
+}
+
+function insertIndexedLog(sourceFile, byteOffset, entry, payload) {
+  if (!logDb) return;
+  logDb.prepare(`
+    INSERT OR IGNORE INTO gateway_logs
+      (source_file, byte_offset, timestamp, event, client_ip, payload)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(
+    sourceFile,
+    byteOffset,
+    entry?.timestamp || null,
+    entry?.event || 'parse_error',
+    String(entry?.clientIp || entry?.ip || ''),
+    payload,
+  );
+}
+
+function syncLogFileToIndex(file) {
+  if (!logDb || !fs.existsSync(file)) return;
+  const sourceFile = logSourceName(file);
+  const fileSize = fs.statSync(file).size;
+  const meta = logDb.prepare('SELECT indexed_size FROM gateway_log_files WHERE source_file = ?').get(sourceFile);
+  let indexedSize = Number(meta?.indexed_size) || 0;
+
+  if (indexedSize > fileSize) {
+    logDb.prepare('DELETE FROM gateway_logs WHERE source_file = ?').run(sourceFile);
+    indexedSize = 0;
+  }
+  if (indexedSize === fileSize) return;
+
+  const fd = fs.openSync(file, 'r');
+  try {
+    const length = fileSize - indexedSize;
+    const buffer = Buffer.allocUnsafe(length);
+    fs.readSync(fd, buffer, 0, length, indexedSize);
+    logDb.exec('BEGIN');
+    try {
+      let start = 0;
+      while (start < buffer.length) {
+        const newline = buffer.indexOf(0x0a, start);
+        if (newline < 0) break;
+        const raw = buffer.subarray(start, newline).toString('utf8');
+        if (raw) {
+          let entry;
+          try {
+            entry = JSON.parse(raw);
+          } catch {
+            entry = { timestamp: null, event: 'parse_error', raw: truncateText(raw) };
+          }
+          insertIndexedLog(sourceFile, indexedSize + start, entry, JSON.stringify(entry));
+        }
+        start = newline + 1;
+      }
+      logDb.prepare(`
+        INSERT INTO gateway_log_files (source_file, indexed_size)
+        VALUES (?, ?)
+        ON CONFLICT(source_file) DO UPDATE SET indexed_size = excluded.indexed_size
+      `).run(sourceFile, indexedSize + start);
+      logDb.exec('COMMIT');
+    } catch (err) {
+      logDb.exec('ROLLBACK');
+      throw err;
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function initializeLogIndex() {
+  try {
+    ensureLogDir();
+    logDb = new DatabaseSync(LOG_INDEX_FILE);
+    logDb.exec(`
+      PRAGMA journal_mode = WAL;
+      PRAGMA synchronous = NORMAL;
+      PRAGMA temp_store = MEMORY;
+      CREATE TABLE IF NOT EXISTS gateway_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_file TEXT NOT NULL,
+        byte_offset INTEGER NOT NULL,
+        timestamp TEXT,
+        event TEXT,
+        client_ip TEXT,
+        payload TEXT NOT NULL,
+        UNIQUE(source_file, byte_offset)
+      );
+      CREATE INDEX IF NOT EXISTS idx_gateway_logs_event ON gateway_logs(event);
+      CREATE INDEX IF NOT EXISTS idx_gateway_logs_client_ip ON gateway_logs(client_ip);
+      CREATE TABLE IF NOT EXISTS gateway_log_files (
+        source_file TEXT PRIMARY KEY,
+        indexed_size INTEGER NOT NULL DEFAULT 0
+      );
+    `);
+    const files = fs.readdirSync(LOG_DIR)
+      .filter(name => /^gateway-\d{4}-\d{2}-\d{2}\.log$/.test(name))
+      .sort()
+      .map(name => path.join(LOG_DIR, name));
+    for (const file of files) syncLogFileToIndex(file);
+    logDb.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+  } catch (err) {
+    console.error('[log-index] initialization failed, falling back to file scan:', err.message);
+    try { logDb?.close(); } catch {}
+    logDb = null;
+  }
 }
 
 function sanitizeHeaders(headers = {}) {
@@ -43,47 +156,147 @@ function writeGatewayLog(event, fields = {}) {
       event,
       ...fields,
     };
-    fs.appendFileSync(currentLogFile(), `${JSON.stringify(entry)}\n`);
+    const file = currentLogFile();
+    const payload = JSON.stringify(entry);
+    const byteOffset = fs.existsSync(file) ? fs.statSync(file).size : 0;
+    fs.appendFileSync(file, `${payload}\n`);
+    if (logDb) {
+      insertIndexedLog(logSourceName(file), byteOffset, entry, payload);
+      logDb.prepare(`
+        INSERT INTO gateway_log_files (source_file, indexed_size)
+        VALUES (?, ?)
+        ON CONFLICT(source_file) DO UPDATE SET indexed_size = excluded.indexed_size
+      `).run(logSourceName(file), byteOffset + Buffer.byteLength(payload) + 1);
+    }
   } catch (err) {
     console.error('[log] failed to write gateway log:', err.message);
   }
 }
 
-function readVisibleGatewayLogs(limit = 100) {
-  try {
-    const file = currentLogFile();
-    if (!fs.existsSync(file)) return [];
-    const lines = fs.readFileSync(file, 'utf-8').trim().split('\n').filter(Boolean);
-    const logs = [];
-    for (let i = lines.length - 1; i >= 0 && logs.length < limit; i--) {
-      let entry;
-      try {
-        entry = JSON.parse(lines[i]);
-      } catch {
-        entry = { timestamp: null, event: 'parse_error', raw: truncateText(lines[i]) };
+function readVisibleGatewayLogs(options = 100) {
+  if (logDb) {
+    try {
+      const settings = typeof options === 'number' ? { limit: options } : (options || {});
+      const limit = Number(settings.limit) > 0 ? Math.floor(Number(settings.limit)) : 100;
+      const offset = Math.max(0, Math.floor(Number(settings.offset) || 0));
+      const eventFilter = String(settings.event || '').trim();
+      const search = String(settings.search || '').trim();
+      const ipFilter = String(settings.ip || '').trim();
+      const returnMeta = Boolean(settings.returnMeta);
+      const hiddenEvents = [...HIDDEN_UI_LOG_EVENTS];
+      const hiddenSql = hiddenEvents.map(() => '?').join(', ');
+      const where = [`event NOT IN (${hiddenSql})`];
+      const params = [...hiddenEvents];
+      if (eventFilter) {
+        where.push('event = ?');
+        params.push(eventFilter);
       }
-      if (!HIDDEN_UI_LOG_EVENTS.has(entry.event)) {
-        logs.push(entry);
+      if (ipFilter) {
+        where.push('client_ip LIKE ?');
+        params.push(`%${ipFilter}%`);
+      }
+      if (search) {
+        where.push('payload LIKE ?');
+        params.push(`%${search}%`);
+      }
+      const whereSql = `WHERE ${where.join(' AND ')}`;
+      const total = Number(logDb.prepare(`SELECT COUNT(*) AS count FROM gateway_logs ${whereSql}`).get(...params)?.count) || 0;
+      const rows = logDb.prepare(`
+        SELECT payload FROM gateway_logs
+        ${whereSql}
+        ORDER BY id DESC
+        LIMIT ? OFFSET ?
+      `).all(...params, limit, offset);
+      const logs = rows.map(row => {
+        try { return JSON.parse(row.payload); } catch { return { event: 'parse_error', raw: truncateText(row.payload) }; }
+      });
+      if (!returnMeta) return logs;
+      const events = logDb.prepare(`
+        SELECT DISTINCT event FROM gateway_logs
+        WHERE event NOT IN (${hiddenSql})
+        ORDER BY event
+      `).all(...hiddenEvents).map(row => row.event).filter(Boolean);
+      return { logs, total, events };
+    } catch (err) {
+      console.error('[log-index] query failed, falling back to file scan:', err.message);
+    }
+  }
+  try {
+    const settings = typeof options === 'number' ? { limit: options } : (options || {});
+    const limit = Number(settings.limit) > 0 ? Math.floor(Number(settings.limit)) : Infinity;
+    const offset = Math.max(0, Math.floor(Number(settings.offset) || 0));
+    const eventFilter = String(settings.event || '').trim();
+    const search = String(settings.search || '').trim().toLowerCase();
+    const ipFilter = String(settings.ip || '').trim().toLowerCase();
+    const returnMeta = Boolean(settings.returnMeta);
+    const files = fs.existsSync(LOG_DIR)
+      ? fs.readdirSync(LOG_DIR)
+        .filter(name => /^gateway-\d{4}-\d{2}-\d{2}\.log$/.test(name))
+        .sort()
+        .reverse()
+        .map(name => path.join(LOG_DIR, name))
+      : [];
+    const logs = [];
+    const events = new Set();
+    let total = 0;
+    for (const file of files) {
+      const content = fs.readFileSync(file, 'utf-8').trim();
+      if (!content) continue;
+      const lines = content.split('\n').filter(Boolean);
+      for (let i = lines.length - 1; i >= 0; i--) {
+        let entry;
+        try {
+          entry = JSON.parse(lines[i]);
+        } catch {
+          entry = { timestamp: null, event: 'parse_error', raw: truncateText(lines[i]) };
+        }
+        if (HIDDEN_UI_LOG_EVENTS.has(entry.event)) continue;
+        if (entry.event) events.add(entry.event);
+        if (eventFilter && entry.event !== eventFilter) continue;
+        if (ipFilter) {
+          const entryIp = String(entry.clientIp || entry.ip || '').trim().toLowerCase();
+          if (!entryIp.includes(ipFilter)) continue;
+        }
+        if (search && !JSON.stringify(entry).toLowerCase().includes(search)) continue;
+        if (total >= offset && logs.length < limit) logs.push(entry);
+        total += 1;
       }
     }
-    return logs;
+    return returnMeta ? { logs, total, events: [...events].sort() } : logs;
   } catch (err) {
-    return [{ timestamp: new Date().toISOString(), event: 'read_error', error: err.message }];
+    const logs = [{ timestamp: new Date().toISOString(), event: 'read_error', error: err.message }];
+    return typeof options === 'object' && options?.returnMeta
+      ? { logs, total: 1, events: ['read_error'] }
+      : logs;
   }
 }
 
 function clearCurrentGatewayLog() {
   ensureLogDir();
-  fs.writeFileSync(currentLogFile(), '');
+  const file = currentLogFile();
+  const sourceFile = logSourceName(file);
+  fs.writeFileSync(file, '');
+  if (logDb) {
+    logDb.prepare('DELETE FROM gateway_logs WHERE source_file = ?').run(sourceFile);
+    logDb.prepare(`
+      INSERT INTO gateway_log_files (source_file, indexed_size)
+      VALUES (?, 0)
+      ON CONFLICT(source_file) DO UPDATE SET indexed_size = 0
+    `).run(sourceFile);
+  }
 }
 
 function newRequestId() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function fingerprintKey(key = '') {
+initializeLogIndex();
+
+function fingerprintKey(key = '', scope = '') {
   if (!key) return '';
-  return crypto.createHash('sha256').update(key).digest('hex').slice(0, 12);
+  // scope（一般为渠道 key）参与哈希，避免不同渠道使用相同上游 Key 时统计混算
+  const material = scope ? `${scope}\n${key}` : key;
+  return crypto.createHash('sha256').update(material).digest('hex').slice(0, 12);
 }
 
 function toTokenNumber(value) {

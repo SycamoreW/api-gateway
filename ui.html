@@ -1072,6 +1072,32 @@
       max-width: 100%
     }
 
+    .logs-toolbar input[type="date"],
+    .logs-toolbar input[type="time"],
+    .logs-toolbar input[type="number"] {
+      min-width: 0;
+      width: auto
+    }
+
+    .log-pagination {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      justify-content: center;
+      flex-wrap: wrap;
+      margin-top: 10px
+    }
+
+    .log-pagination input {
+      width: 76px;
+      min-width: 0;
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      color: #c9d1d9;
+      padding: 5px 8px
+    }
+
     .log-file {
       font-size: 13px;
       color: #8b949e;
@@ -1852,6 +1878,67 @@
       padding: 14px 16px
     }
 
+    .website-panel {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 10px;
+      padding: 16px 18px;
+      margin-bottom: 20px
+    }
+
+    .website-panel-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 12px;
+      margin-bottom: 14px;
+      flex-wrap: wrap
+    }
+
+    .website-panel-title {
+      font-size: 16px;
+      font-weight: 700;
+      color: #f0f6fc;
+      margin-bottom: 2px
+    }
+
+    .website-buttons {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap
+    }
+
+    .website-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      text-decoration: none;
+      color: #c9d1d9;
+      background: #21262d;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 9px 15px;
+      font-size: 14px;
+      font-weight: 500;
+      transition: all .15s ease;
+      white-space: nowrap
+    }
+
+    .website-btn:hover {
+      background: #30363d;
+      border-color: #58a6ff;
+      color: #58a6ff;
+      transform: translateY(-1px)
+    }
+
+    .website-list-row {
+      display: grid;
+      grid-template-columns: 1fr 1.6fr auto;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 8px
+    }
+
     @media (max-width: 720px) {
       .container {
         padding: 0
@@ -1955,6 +2042,14 @@
 
     <div class="stats" id="stats"></div>
 
+    <div class="website-panel">
+      <div class="website-panel-head">
+        <div><div class="website-panel-title">🔗 网站入口</div><div class="channel-info">统一入口优先使用 api.wutongsama.xyz/xxx；按钮可手动添加。</div></div>
+        <button class="btn btn-outline btn-sm" onclick="showWebsiteButtonsModal()">管理按钮</button>
+      </div>
+      <div class="website-buttons" id="websiteButtons"><span class="channel-info">加载中...</span></div>
+    </div>
+
     <div class="tabs">
       <button class="tab-btn active" data-tab="channels" onclick="switchTab('channels')">📦 渠道</button>
       <button class="tab-btn" data-tab="logs" onclick="switchTab('logs')">🧾 日志</button>
@@ -1966,6 +2061,7 @@
         <div class="section-title">📦 渠道 <span class="badge" id="chCount"></span></div>
         <div class="global-actions">
           <button class="btn btn-primary btn-sm" onclick="showAddChannel()">+ 添加渠道</button>
+          <button class="btn btn-outline btn-sm" onclick="showWebsiteButtonsModal()">🔗 网站按钮</button>
           <button class="btn btn-outline btn-sm" onclick="exportBackup()">导出备份</button>
           <button class="btn btn-outline btn-sm" onclick="importBackup()">导入备份</button>
           <button class="btn btn-primary btn-sm" onclick="showClientKeysModal()">🔐 调用 Key</button>
@@ -1984,22 +2080,27 @@
           <div class="left">
             <button class="btn btn-outline btn-sm" onclick="loadLogs()">刷新</button>
             <button class="btn btn-danger btn-sm" onclick="clearLogs()">清空日志</button>
-            <select id="logEventFilter" onchange="renderLogs()">
+            <select id="logEventFilter" onchange="loadLogs(1)">
               <option value="">全部事件</option>
             </select>
-            <input id="logSearch" placeholder="搜索模型 / 渠道 / 错误 / requestId" oninput="renderLogs()">
-            <select id="logLimit" onchange="loadLogs()">
-              <option value="50">最近 50 条</option>
-              <option value="100" selected>最近 100 条</option>
-              <option value="200">最近 200 条</option>
-              <option value="500">最近 500 条</option>
-            </select>
+            <input id="logSearch" placeholder="搜索模型 / 渠道 / 错误 / requestId" onchange="loadLogs(1)">
+            <input id="logIpSearch" placeholder="按 IP 搜索" inputmode="decimal" onchange="loadLogs(1)">
+            <label class="channel-info">每页</label>
+            <input id="logPageSize" type="number" min="1" step="1" value="100" title="每页条数" onchange="loadLogs(1)">
           </div>
           <span class="channel-info">请求链路 / 路由 / 上游错误</span>
         </div>
         <div class="log-file" id="logFile">未加载</div>
         <div class="log-list" id="logs">
           <div class="empty">暂无日志</div>
+        </div>
+        <div class="log-pagination">
+          <button class="btn btn-outline btn-sm" id="logPrevPage" onclick="loadLogs(logPage - 1)">上一页</button>
+          <span class="channel-info" id="logPageInfo">第 1 / 1 页，共 0 条</span>
+          <button class="btn btn-outline btn-sm" id="logNextPage" onclick="loadLogs(logPage + 1)">下一页</button>
+          <label class="channel-info">跳至</label>
+          <input id="logPageJump" type="number" min="1" value="1" onchange="loadLogs(Number(this.value) || 1)">
+          <span class="channel-info">页</span>
         </div>
       </div>
     </div>
@@ -2094,18 +2195,10 @@
       return /^[\x21-\x7E]+$/.test(String(value));
     }
 
-    function promptForAdminKey(message = '聚合渠道管理 Key（初始默认 123456）') {
-      const nextKey = prompt(message) || '';
-      KEY = nextKey.trim();
-      if (KEY && !isSafeHeaderValue(KEY)) {
-        KEY = '';
-        localStorage.removeItem(KEY_STORAGE);
-        alert('管理 Key 只能包含英文、数字和常见英文符号，请不要粘贴中文、空格或 emoji。');
-      } else if (KEY) {
-        localStorage.setItem(KEY_STORAGE, KEY);
-      }
-      document.getElementById('apiKeyLabel').textContent = KEY ? '已保存在本浏览器' : '未设置';
-      return KEY;
+    function promptForAdminKey() {
+      // 管理 Key 已移除：管理面板由 Nginx 通用登录保护，无需再输入 Key。
+      document.getElementById('apiKeyLabel').textContent = '通用登录';
+      return true;
     }
     if (!KEY) promptForAdminKey();
     const HOST = location.hostname || '170.106.64.129';
@@ -2118,10 +2211,15 @@
     document.getElementById('apiKeyLabel').textContent = KEY ? '已保存在本浏览器' : '未设置';
 
     let channels = {};
+    let websiteButtons = [];
     let editingKey = null;
     let gatewayLogs = [];
     let renderedLogs = [];
     let logFile = '';
+    let logPage = 1;
+    let logTotal = 0;
+    let logTotalPages = 1;
+    let logAvailableEvents = [];
     let gatewayStats = null;
     let clientKeys = [];
     let channelFilter = 'all';
@@ -2213,6 +2311,67 @@
       return candidate;
     }
 
+
+    function normalizeWebsiteUrl(url = '') {
+      let value = String(url || '').trim();
+      if (!value) return '';
+      if (!/^https?:\/\//i.test(value)) value = 'https://' + value;
+      try { return new URL(value).toString(); } catch (_) { return ''; }
+    }
+
+    function renderWebsiteButtons() {
+      const el = document.getElementById('websiteButtons');
+      if (!el) return;
+      const buttons = Array.isArray(websiteButtons) ? websiteButtons.filter(item => item && item.name && item.url) : [];
+      el.innerHTML = buttons.length
+        ? buttons.map(item => `<a class="website-btn" href="${escapeHtml(item.url)}" target="_blank" rel="noopener">🔗 ${escapeHtml(item.name)}</a>`).join('')
+        : '<span class="channel-info">暂无网站按钮，点“管理按钮”添加。</span>';
+    }
+
+    function showWebsiteButtonsModal() {
+      const rows = Array.isArray(websiteButtons) && websiteButtons.length ? websiteButtons : [{ name: '', url: '' }];
+      document.getElementById('modalContent').innerHTML = `
+    <h3>网站按钮管理</h3>
+    <div class="hint">每行一个按钮。名称和网址会保存到 config.json；网址不填协议时会自动补 https://。</div>
+    <div id="websiteRows">
+      ${rows.map((item, index) => websiteRowHtml(item, index)).join('')}
+    </div>
+    <button class="btn btn-outline btn-sm" onclick="addWebsiteRow()">+ 添加一行</button>
+    <div class="actions">
+      <button class="btn btn-outline" onclick="closeModal()">取消</button>
+      <button class="btn btn-primary" onclick="saveWebsiteButtons()">保存</button>
+    </div>`;
+      document.getElementById('modal').classList.add('active');
+    }
+
+    function websiteRowHtml(item = {}, index = 0) {
+      return `<div class="website-list-row">
+      <input class="website-name" value="${escapeHtml(item.name || '')}" placeholder="名称，例如 Stacker">
+      <input class="website-url" value="${escapeHtml(item.url || '')}" placeholder="https://api.wutongsama.xyz/stacker/">
+      <button class="btn btn-danger btn-sm" onclick="this.closest('.website-list-row').remove()">删除</button>
+    </div>`;
+    }
+
+    function addWebsiteRow() {
+      const box = document.getElementById('websiteRows');
+      if (box) box.insertAdjacentHTML('beforeend', websiteRowHtml({}, box.children.length));
+    }
+
+    async function saveWebsiteButtons() {
+      const rows = [...document.querySelectorAll('#websiteRows .website-list-row')].map(row => {
+        const name = row.querySelector('.website-name')?.value.trim() || '';
+        const url = normalizeWebsiteUrl(row.querySelector('.website-url')?.value || '');
+        return { name, url };
+      }).filter(item => item.name && item.url);
+      try {
+        const res = await api('/api/config/website-buttons/save', { method: 'POST', body: JSON.stringify({ website_buttons: rows }) });
+        websiteButtons = res.website_buttons || rows;
+        toast('网站按钮已保存');
+        closeModal();
+        renderWebsiteButtons();
+      } catch (e) { toast('保存失败: ' + e.message, false); }
+    }
+
     function showApiKeyModal() {
       document.getElementById('modalContent').innerHTML = `
     <h3>修改管理 Key</h3>
@@ -2278,7 +2437,7 @@
     }
 
     async function exportBackup() {
-      if (!confirm('备份会包含所有渠道 Key 和管理 Key，确定导出？')) return;
+      if (!confirm('备份会包含所有渠道 Key、管理 Key、调用 Key、网站按钮和用量统计，确定导出？')) return;
       try {
         const res = await fetch('/api/config/export', {
           headers: { 'Authorization': `Bearer ${KEY}` },
@@ -2317,12 +2476,13 @@
           const text = await file.text();
           const data = JSON.parse(text);
           const importedConfig = data?.config && typeof data.config === 'object' ? data.config : data;
+          const hasStats = Boolean(data?.stats && typeof data.stats === 'object' && !Array.isArray(data.stats));
           const channelCount = Object.keys(importedConfig?.channels || {}).length;
           const modelCount = Array.isArray(importedConfig?.models) ? importedConfig.models.length : 0;
           if (!importedConfig?.channels || typeof importedConfig.channels !== 'object' || Array.isArray(importedConfig.channels)) {
             throw new Error('备份文件缺少 channels');
           }
-          const warning = `确定导入这个备份？\n\n渠道: ${channelCount}\n模型: ${modelCount}\n\n导入会覆盖当前配置，包含管理 Key 和所有渠道 Key。`;
+          const warning = `确定导入这个备份？\n\n渠道: ${channelCount}\n模型: ${modelCount}\n用量统计: ${hasStats ? '包含（会覆盖当前统计）' : '不包含（旧版备份）'}\n\n导入会覆盖当前配置，包含管理 Key、调用 Key、网站按钮和所有渠道 Key。`;
           if (!confirm(warning)) return;
           const res = await api('/api/config/import', {
             method: 'POST',
@@ -2333,7 +2493,7 @@
             localStorage.setItem(KEY_STORAGE, KEY);
             document.getElementById('apiKeyLabel').textContent = '已保存在本浏览器';
           }
-          toast(`备份已导入：${res.channels} 个渠道`);
+          toast(`备份已导入：${res.channels} 个渠道${res.statsRestored ? '（含用量统计）' : ''}`);
           await load();
         } catch (e) {
           toast('导入失败: ' + e.message, false);
@@ -2346,22 +2506,9 @@
       try {
         const d = await api('/api/config');
         channels = d.channels || {};
+        websiteButtons = d.website_buttons || [];
         clientKeys = d.api_keys || [];
       } catch (e) {
-        if (e.status === 401) {
-          localStorage.removeItem(KEY_STORAGE);
-          document.getElementById('apiKeyLabel').textContent = 'Key 错误';
-          if (promptForAdminKey('管理 Key 不正确，请重新输入')) {
-            return load();
-          }
-          document.getElementById('stats').innerHTML = `
-        <div class="stat"><div class="num" style="color:#f85149">!</div><div class="label">认证失败</div></div>
-      `;
-          document.getElementById('chCount').textContent = '认证失败';
-          document.getElementById('channels').innerHTML = '<div class="empty">管理 Key 不正确<br><button class="btn btn-primary" onclick="promptForAdminKey() && load()" style="margin-top:12px">重新输入 Key</button></div>';
-          toast('管理 Key 不正确，已清除本地保存值', false);
-          return;
-        }
         toast(`加载配置失败: ${e.message || '未知错误'}`, false);
         return;
       }
@@ -2395,18 +2542,48 @@
       }
     }
 
-    async function loadLogs() {
+    async function loadLogs(page = logPage) {
       try {
-        const limit = document.getElementById('logLimit')?.value || '100';
-        const d = await api(`/api/logs?limit=${limit}`);
+        const pageSize = Math.max(1, Math.floor(Number(document.getElementById('logPageSize')?.value) || 100));
+        const params = new URLSearchParams({
+          limit: 'all',
+          page: String(Math.max(1, Math.floor(Number(page) || 1))),
+          pageSize: String(pageSize),
+        });
+        const event = document.getElementById('logEventFilter')?.value || '';
+        const search = document.getElementById('logSearch')?.value || '';
+        const ip = document.getElementById('logIpSearch')?.value.trim() || '';
+        if (event) params.set('event', event);
+        if (search) params.set('search', search);
+        if (ip) params.set('ip', ip);
+        const d = await api(`/api/logs?${params.toString()}`);
         gatewayLogs = d.logs || [];
         logFile = d.file || '';
+        logPage = Number(d.page) || 1;
+        logTotal = Number(d.total) || 0;
+        logTotalPages = Number(d.totalPages) || 1;
+        logAvailableEvents = d.events || [];
         renderLogFilter();
         renderLogs();
+        renderLogPagination();
       } catch (e) {
         document.getElementById('logs').innerHTML = '<div class="empty">日志加载失败</div>';
         toast('日志加载失败: ' + e.message, false);
       }
+    }
+
+    function renderLogPagination() {
+      const info = document.getElementById('logPageInfo');
+      const jump = document.getElementById('logPageJump');
+      const prev = document.getElementById('logPrevPage');
+      const next = document.getElementById('logNextPage');
+      if (info) info.textContent = `第 ${logPage} / ${logTotalPages} 页，共 ${formatNumber(logTotal)} 条`;
+      if (jump) {
+        jump.value = logPage;
+        jump.max = logTotalPages;
+      }
+      if (prev) prev.disabled = logPage <= 1;
+      if (next) next.disabled = logPage >= logTotalPages;
     }
 
     async function clearLogs() {
@@ -2414,9 +2591,13 @@
       try {
         const d = await api('/api/logs/clear', { method: 'POST', body: '{}' });
         gatewayLogs = [];
+        logPage = 1;
+        logTotal = 0;
+        logTotalPages = 1;
         logFile = d.file || logFile;
         renderLogFilter();
         renderLogs();
+        renderLogPagination();
         toast('日志已清空');
       } catch (e) {
         toast('清空日志失败: ' + e.message, false);
@@ -2426,7 +2607,7 @@
     function renderLogFilter() {
       const select = document.getElementById('logEventFilter');
       const current = select.value;
-      const events = [...new Set(gatewayLogs.map(l => l.event).filter(Boolean))]
+      const events = [...new Set(logAvailableEvents.length ? logAvailableEvents : gatewayLogs.map(l => l.event).filter(Boolean))]
         .filter(event => !HIDDEN_LOG_EVENTS.has(event))
         .sort();
       select.innerHTML = '<option value="">全部事件</option>' + events.map(e => `<option value="${escapeHtml(e)}">${escapeHtml(e)}</option>`).join('');
@@ -2517,12 +2698,11 @@
     }
 
     function renderLogs() {
-      const filter = document.getElementById('logEventFilter').value;
-      const search = document.getElementById('logSearch')?.value || '';
       const visibleLogs = gatewayLogs.filter(l => !HIDDEN_LOG_EVENTS.has(l.event));
-      renderedLogs = visibleLogs
-        .filter(l => !filter || l.event === filter)
-        .filter(l => logMatchesSearch(l, search));
+      // Event, keyword and IP filtering are already applied server-side before
+      // pagination. Filtering the current page again here can hide valid rows
+      // while the server still reports a non-zero total.
+      renderedLogs = visibleLogs;
       document.getElementById('logCount').textContent = renderedLogs.length;
       document.getElementById('logFile').textContent = logFile || '未加载';
       if (!renderedLogs.length) {
@@ -3688,6 +3868,7 @@
       const keys = Object.keys(channels);
       const filteredEntries = getFilteredChannelEntries();
       renderHeaderStats();
+      renderWebsiteButtons();
       renderChannelFilter();
       document.getElementById('chCount').textContent = channelFilter === 'all' ? keys.length : `${filteredEntries.length}/${keys.length}`;
 
@@ -4071,7 +4252,6 @@
       </div>
       <div class="channel-actions">
         <button class="btn btn-outline btn-sm" onclick="testChannel(${jsArg(ckey)})">测试渠道</button>
-        ${ch.website ? `<button class="btn btn-outline btn-sm" onclick="window.open(${jsArg(ch.website)}, '_blank', 'noopener')">官网</button>` : ''}
         <button class="btn btn-outline btn-sm" onclick="setChannelEnabled(${jsArg(ckey)}, ${enabled ? 'false' : 'true'})">${enabled ? '禁用' : '启用'}</button>
         <button class="btn btn-outline btn-sm" onclick="editChannel(${jsArg(ckey)})">编辑</button>
         <button class="btn btn-danger btn-sm" onclick="deleteChannel(${jsArg(ckey)})">删除</button>
@@ -4107,15 +4287,17 @@
     <div class="hint">模型会显示为 [ds]model-name</div>
     <label>API 地址</label>
     <input id="chUrl" placeholder="https://api.example.com/v1">
-    <label>官网地址（可选）</label>
-    <input id="chWebsite" placeholder="https://example.com">
-    <div class="hint">填写后渠道会显示一个直达官网的按钮。</div>
     <label>API Key（每行一个，会按请求轮询）</label>
     <textarea id="chKeys" placeholder="sk-xxx&#10;sk-yyy" style="min-height:60px"></textarea>
     <label class="checkbox-label">
       <input id="chEnabled" type="checkbox" checked>
       启用渠道
     </label>
+    <label class="checkbox-label">
+      <input id="chAutoTruncate" type="checkbox">
+      自动截断
+    </label>
+    <div class="hint">开启后每次请求会在最后一条 user 消息前注入解题指令，流式输出检测到 &lt;answer&gt; 即自动截断（非流式响应也会剪掉 &lt;answer&gt; 之后的内容）。</div>
 	    <label>上游格式</label>
 	    <select id="chFormat" onchange="toggleAnthropicFields()">
 	      <option value="">OpenAI 兼容</option>
@@ -4303,15 +4485,17 @@
     <div class="hint">留空时模型名不加前缀；渠道内部 key 会保持不变。</div>
     <label>API 地址</label>
     <input id="chUrl" value="${escapeHtml(ch.base_url || '')}">
-    <label>官网地址（可选）</label>
-    <input id="chWebsite" value="${escapeHtml(ch.website || '')}" placeholder="https://example.com">
-    <div class="hint">填写后渠道会显示一个直达官网的按钮。</div>
     <label>Key 管理</label>
     <div id="chKeyList"></div>
     <label class="checkbox-label">
       <input id="chEnabled" type="checkbox" ${ch.enabled === false ? '' : 'checked'}>
       启用渠道
     </label>
+    <label class="checkbox-label">
+      <input id="chAutoTruncate" type="checkbox" ${ch.auto_truncate ? 'checked' : ''}>
+      自动截断
+    </label>
+    <div class="hint">开启后每次请求会在最后一条 user 消息前注入解题指令，流式输出检测到 &lt;answer&gt; 即自动截断（非流式响应也会剪掉 &lt;answer&gt; 之后的内容）。</div>
 	    <label>上游格式</label>
 	    <select id="chFormat" onchange="toggleAnthropicFields()">
 	      <option value="" ${!ch.format ? 'selected' : ''}>OpenAI 兼容</option>
@@ -4401,6 +4585,7 @@
       const thinkingDisplay = document.getElementById('chThinkingDisplay')?.value || '';
       return {
         enabled,
+        auto_truncate: Boolean(document.getElementById('chAutoTruncate')?.checked),
         ...(format ? { format } : {}),
         ...(format === 'anthropic' ? { anthropic_version: document.getElementById('chAnthropicVersion')?.value.trim() || '2023-06-01' } : {}),
         prompt_cache_enabled: promptCacheEnabled,
@@ -4416,7 +4601,6 @@
       const name = document.getElementById('chName').value.trim();
       const prefix = document.getElementById('chPrefix')?.value.trim() || '';
       const url = document.getElementById('chUrl').value.trim();
-      const website = document.getElementById('chWebsite')?.value.trim() || '';
       const key = document.getElementById('chKey')?.value.trim() || '';
       const upstreamKeys = editingKey
         ? getChannelKeys(channels[editingKey])
@@ -4442,7 +4626,6 @@
             body: JSON.stringify({
               channelKey: ckey,
               name, base_url: url,
-              website,
               key: upstreamKeys[0] || key,
               keys: upstreamKeys,
               models: finalModels,
@@ -4469,7 +4652,6 @@
             previousChannelKey: editingKey,
             channelKey: ckey,
             name, base_url: url,
-            website,
             key: upstreamKeys[0] || key || channels[editingKey]?.key,
             keys: upstreamKeys.length ? upstreamKeys : getChannelKeys(channels[editingKey]),
             models: finalModels,

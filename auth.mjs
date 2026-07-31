@@ -101,7 +101,7 @@ function getModelQuotaCost(modelName = '') {
 function consumeClientQuota(req, modelName = '') {
   if (req.clientApiKeyType === 'admin') return { ok: true, cost: 0, remaining: Infinity };
   const entries = getClientKeyEntries();
-
+  
   // Find entry by key
   const index = entries.findIndex(entry => entry.key === req.clientApiKey);
   if (index < 0) return { ok: false, statusCode: 401, message: 'Invalid API key' };
@@ -163,9 +163,9 @@ function rejectAuth(req, res, message = 'Invalid API key', type = 'auth_error') 
 }
 
 function adminAuth(req, res) {
-  if (getBearerToken(req) !== config.api_key) {
-    return rejectAuth(req, res);
-  }
+  // 管理 Key 校验已移除：管理面板由前置的 Nginx 通用登录保护，
+  // 且服务仅监听 127.0.0.1，不直接对外暴露。任何到达 /api/ 的请求
+  // 都视为管理员上下文。对外调用 Key（/v1/ 的 clientAuth）不受影响。
   req.clientApiKey = config.api_key;
   req.clientApiKeyFingerprint = fingerprintKey(config.api_key);
   req.clientApiKeyType = 'admin';
