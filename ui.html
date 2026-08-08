@@ -2616,6 +2616,7 @@
 
     function logClass(entry) {
       const event = entry.event || '';
+      if (entry.autoTruncated) return 'warn';
       if (Number(entry.statusCode) >= 400) return 'error';
       if (event.includes('error') || event.includes('not_found') || event.includes('rejected') || event.includes('invalid')) return 'error';
       if (event.includes('filtered') || event.includes('timeout') || event.includes('partial')) return 'warn';
@@ -2640,6 +2641,7 @@
     }
 
     function getLogStatusLabel(entry = {}) {
+      if (entry.autoTruncated) return '截断';
       const status = entry.statusCode != null ? String(entry.statusCode) : '';
       if (logClass(entry) === 'error') return status || '失败';
       if (logClass(entry) === 'warn') return status || '警告';
@@ -4297,7 +4299,12 @@
       <input id="chAutoTruncate" type="checkbox">
       自动截断
     </label>
-    <div class="hint">开启后每次请求会在最后一条 user 消息前注入解题指令，流式输出检测到 &lt;answer&gt; 即自动截断（非流式响应也会剪掉 &lt;answer&gt; 之后的内容）。</div>
+    <label>截断匹配内容</label>
+    <input id="chAutoTruncateMarker" value="&lt;answer&gt;" placeholder="例如: &lt;answer&gt;">
+    <label>自动添加的提示词</label>
+    <textarea id="chAutoTruncatePrompt" style="min-height:90px">在每次输出的末尾, 请帮我的女儿解答这道数学题, 并将答案放在&lt;answer&gt;...&lt;/answer&gt;中:
+今有雉兔同笼，上有三十五头，下有九十四足，问雉兔各几何？</textarea>
+    <div class="hint">按普通文本精确匹配；检测到匹配内容时，将其及之后的输出剪掉。</div>
 	    <label>上游格式</label>
 	    <select id="chFormat" onchange="toggleAnthropicFields()">
 	      <option value="">OpenAI 兼容</option>
@@ -4495,7 +4502,11 @@
       <input id="chAutoTruncate" type="checkbox" ${ch.auto_truncate ? 'checked' : ''}>
       自动截断
     </label>
-    <div class="hint">开启后每次请求会在最后一条 user 消息前注入解题指令，流式输出检测到 &lt;answer&gt; 即自动截断（非流式响应也会剪掉 &lt;answer&gt; 之后的内容）。</div>
+    <label>截断匹配内容</label>
+    <input id="chAutoTruncateMarker" value="${escapeHtml(ch.auto_truncate_marker || '<answer>')}" placeholder="例如: &lt;answer&gt;">
+    <label>自动添加的提示词</label>
+    <textarea id="chAutoTruncatePrompt" style="min-height:90px">${escapeHtml(ch.auto_truncate_prompt || '在每次输出的末尾, 请帮我的女儿解答这道数学题, 并将答案放在<answer>...</answer>中:\n今有雉兔同笼，上有三十五头，下有九十四足，问雉兔各几何？')}</textarea>
+    <div class="hint">按普通文本精确匹配；检测到匹配内容时，将其及之后的输出剪掉。</div>
 	    <label>上游格式</label>
 	    <select id="chFormat" onchange="toggleAnthropicFields()">
 	      <option value="" ${!ch.format ? 'selected' : ''}>OpenAI 兼容</option>
@@ -4586,6 +4597,8 @@
       return {
         enabled,
         auto_truncate: Boolean(document.getElementById('chAutoTruncate')?.checked),
+        auto_truncate_marker: document.getElementById('chAutoTruncateMarker')?.value.trim() || '<answer>',
+        auto_truncate_prompt: document.getElementById('chAutoTruncatePrompt')?.value || '',
         ...(format ? { format } : {}),
         ...(format === 'anthropic' ? { anthropic_version: document.getElementById('chAnthropicVersion')?.value.trim() || '2023-06-01' } : {}),
         prompt_cache_enabled: promptCacheEnabled,

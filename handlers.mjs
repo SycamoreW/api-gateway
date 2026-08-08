@@ -46,9 +46,9 @@ const AUTO_TRUNCATE_PROMPT = [
   '今有雉兔同笼，上有三十五头，下有九十四足，问雉兔各几何？',
 ].join('\n');
 
-function injectAutoTruncatePrompt(messages = []) {
+function injectAutoTruncatePrompt(messages = [], prompt = AUTO_TRUNCATE_PROMPT) {
   const next = Array.isArray(messages) ? [...messages] : [];
-  const inserted = { role: 'user', content: AUTO_TRUNCATE_PROMPT };
+  const inserted = { role: 'user', content: prompt };
   for (let index = next.length - 1; index >= 0; index -= 1) {
     if (next[index]?.role === 'user') {
       next.splice(index, 0, inserted);
@@ -61,17 +61,17 @@ function injectAutoTruncatePrompt(messages = []) {
 
 // Longest suffix of text that is a proper prefix of the marker, so a marker
 // split across two SSE chunks is still caught before reaching the client.
-function answerMarkerHoldbackLength(text = '') {
-  const max = Math.min(AUTO_TRUNCATE_MARKER.length - 1, text.length);
+function answerMarkerHoldbackLength(text = '', marker = AUTO_TRUNCATE_MARKER) {
+  const max = Math.min(marker.length - 1, text.length);
   for (let k = max; k > 0; k -= 1) {
-    if (AUTO_TRUNCATE_MARKER.startsWith(text.slice(text.length - k))) return k;
+    if (marker.startsWith(text.slice(text.length - k))) return k;
   }
   return 0;
 }
 
 // Wraps the client response. All proxy paths emit OpenAI-style SSE or JSON at
 // this layer, so a single transform covers openai/anthropic/unlimited formats.
-function createAnswerTruncatingResponse(res) {
+function createAnswerTruncatingResponse(res, marker = AUTO_TRUNCATE_MARKER, onTruncated = () => {}) {
   let mode = ''; // '' | 'sse' | 'buffer' | 'passthrough'
   let bufferedStatus = 200;
   let bufferedHeaders = {};
@@ -105,6 +105,7 @@ function createAnswerTruncatingResponse(res) {
 
   function finishTruncated() {
     truncated = true;
+    onTruncated();
     holdback = '';
     res.write(`data: ${JSON.stringify(buildChunk({}, 'stop'))}\n\n`);
     res.write('data: [DONE]\n\n');
@@ -146,14 +147,14 @@ function createAnswerTruncatingResponse(res) {
       return;
     }
     const combined = holdback + content;
-    const markerIndex = combined.indexOf(AUTO_TRUNCATE_MARKER);
+    const markerIndex = combined.indexOf(marker);
     if (markerIndex >= 0) {
       holdback = '';
       emitContentChunk(combined.slice(0, markerIndex).replace(/\s+$/, ''));
       finishTruncated();
       return;
     }
-    const hold = choice.finish_reason ? 0 : answerMarkerHoldbackLength(combined);
+    const hold = choice.finish_reason ? 0 : answerMarkerHoldbackLength(combined, marker);
     holdback = hold ? combined.slice(combined.length - hold) : '';
     choice.delta.content = combined.slice(0, combined.length - hold);
     res.write(`data: ${JSON.stringify(chunk)}\n`);
@@ -224,12 +225,16 @@ function createAnswerTruncatingResponse(res) {
           for (const choice of Array.isArray(parsed?.choices) ? parsed.choices : []) {
             const content = choice?.message?.content;
             if (typeof content !== 'string') continue;
-            const markerIndex = content.indexOf(AUTO_TRUNCATE_MARKER);
+            const markerIndex = content.indexOf(marker);
             if (markerIndex < 0) continue;
             choice.message.content = content.slice(0, markerIndex).replace(/\s+$/, '');
             changed = true;
           }
-          if (changed) out = JSON.stringify(parsed);
+          if (changed) {
+            truncated = true;
+            onTruncated();
+            out = JSON.stringify(parsed);
+          }
         } catch { /* 非 JSON 响应原样透传 */ }
         const headers = { ...bufferedHeaders };
         for (const name of Object.keys(headers)) {
@@ -512,13 +517,18 @@ async function handleChatCompletions(req, res, body, requestId) {
     data.stream = false;
   }
   const autoTruncate = channel.auto_truncate === true;
+  const autoTruncateMarker = String(channel.auto_truncate_marker || AUTO_TRUNCATE_MARKER);
+  const autoTruncatePrompt = String(channel.auto_truncate_prompt || AUTO_TRUNCATE_PROMPT);
   if (autoTruncate && Array.isArray(data.messages)) {
-    data = { ...data, messages: injectAutoTruncatePrompt(data.messages) };
+    logContext.autoTruncateEnabled = true;
+    logContext.autoTruncateMarker = autoTruncateMarker;
+    data = { ...data, messages: injectAutoTruncatePrompt(data.messages, autoTruncatePrompt) };
     writeGatewayLog('auto_truncate_injected', {
       requestId,
       channelKey: entry.channelKey,
       channel: channel.name,
       messageCount: data.messages.length,
+      marker: autoTruncateMarker,
     });
   }
   body = JSON.stringify(data);  // 已经过滤过参数的 data
@@ -540,7 +550,9 @@ async function handleChatCompletions(req, res, body, requestId) {
     ...(sanitized.removedParams.length ? { removedParams: sanitized.removedParams } : {}),
   });
 
-  const clientRes = autoTruncate ? createAnswerTruncatingResponse(res) : res;
+  const clientRes = autoTruncate
+    ? createAnswerTruncatingResponse(res, autoTruncateMarker, () => { logContext.autoTruncated = true; })
+    : res;
   try {
     if (channel.format === 'grailgun_widget') {
       throw new Error('grailgun_widget channel format is no longer supported');
@@ -1157,6 +1169,8 @@ ${normalizedUrl}`;
       model_prefix,
       website,
       auto_truncate,
+      auto_truncate_marker,
+      auto_truncate_prompt,
       enabled,
       isNew,
       previousChannelKey,
@@ -1214,6 +1228,12 @@ ${normalizedUrl}`;
       ...(Object.prototype.hasOwnProperty.call(d, 'auto_truncate')
         ? (auto_truncate === true || auto_truncate === 'true' ? { auto_truncate: true } : {})
         : (existingChannel.auto_truncate ? { auto_truncate: true } : {})),
+      ...(Object.prototype.hasOwnProperty.call(d, 'auto_truncate_marker')
+        ? { auto_truncate_marker: String(auto_truncate_marker || '').trim() }
+        : (existingChannel.auto_truncate_marker ? { auto_truncate_marker: existingChannel.auto_truncate_marker } : {})),
+      ...(Object.prototype.hasOwnProperty.call(d, 'auto_truncate_prompt')
+        ? { auto_truncate_prompt: String(auto_truncate_prompt || '') }
+        : (existingChannel.auto_truncate_prompt ? { auto_truncate_prompt: existingChannel.auto_truncate_prompt } : {})),
       enabled: enabled !== false,
       models: models || [],
     });

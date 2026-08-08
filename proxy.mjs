@@ -93,6 +93,46 @@ function responseHasToolCalls(responseData = '') {
   return false;
 }
 
+function shouldRepairToolArguments(channelKey = '', modelName = '') {
+  return channelKey === 'aprilseries' && String(modelName).includes('claude-opus-5');
+}
+
+function repairToolArgumentsPayload(payload) {
+  if (!payload || typeof payload !== 'object') return payload;
+  if (Array.isArray(payload)) {
+    payload.forEach(repairToolArgumentsPayload);
+    return payload;
+  }
+  const args = payload.function?.arguments;
+  if (typeof args === 'string' && args.startsWith('{}') && args.length > 2) {
+    const repaired = args.slice(2);
+    try {
+      JSON.parse(repaired);
+      payload.function.arguments = repaired;
+    } catch {}
+  }
+  Object.values(payload).forEach(repairToolArgumentsPayload);
+  return payload;
+}
+
+function repairToolArgumentsResponse(responseData = '') {
+  const raw = String(responseData || '');
+  if (!raw.trim()) return raw;
+  try {
+    return JSON.stringify(repairToolArgumentsPayload(JSON.parse(raw)));
+  } catch {}
+  return raw.split(/(?<=\n)/).map((line) => {
+    const match = line.match(/^(data:\s*)(.*?)(\r?\n)?$/);
+    if (!match || !match[2] || match[2] === '[DONE]') return line;
+    try {
+      const payload = repairToolArgumentsPayload(JSON.parse(match[2]));
+      return `${match[1]}${JSON.stringify(payload)}${match[3] || ''}`;
+    } catch {
+      return line;
+    }
+  }).join('');
+}
+
 function isEmptyUpstreamSuccess(channelKey, modelName, responseDetails, responseData) {
   if (!isWorkBuddySensitiveClaudeChannel(channelKey, modelName)) return false;
   return Number(responseDetails?.totalTokens || 0) === 0
@@ -380,6 +420,7 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
   const reqPath = req.url.startsWith('/v1/') ? req.url.slice(3) : req.url;
   const fullUrl = `${channel.base_url}${reqPath}`;
   const requestedBuffering = shouldBufferNonStreamResponse(channelKey, modelName, body);
+  const repairToolArguments = shouldRepairToolArguments(channelKey, modelName);
 
   const headers = {};
   // Forward only necessary headers
@@ -431,7 +472,7 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
     const proxy = transport.request(options, (proxyRes) => {
       // Always hold error responses until they have been classified so another
       // key can be tried without leaking the failed response to the client.
-      const bufferResponse = requestedBuffering || proxyRes.statusCode >= 400;
+      const bufferResponse = requestedBuffering || repairToolArguments || proxyRes.statusCode >= 400;
       if (!bufferResponse) {
         res.writeHead(proxyRes.statusCode, proxyRes.headers);
       }
@@ -444,8 +485,16 @@ async function proxyRequest(channel, req, res, body, modelName = '', requestId =
       });
 
       proxyRes.on('end', () => {
+        if (repairToolArguments && proxyRes.statusCode < 400) {
+          responseData = repairToolArgumentsResponse(responseData);
+        }
         // 尝试解析 token 使用量和输出内容
         const responseDetails = extractResponseLogDetails(responseData);
+        if (logContext.autoTruncateEnabled
+          && logContext.autoTruncateMarker
+          && responseData.includes(logContext.autoTruncateMarker)) {
+          logContext.autoTruncated = true;
+        }
         const emptySuccess = proxyRes.statusCode < 400
           && !responseDetails.errorMessage
           && isEmptyUpstreamSuccess(channelKey, modelName, responseDetails, responseData);

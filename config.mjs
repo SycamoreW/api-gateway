@@ -60,6 +60,12 @@ function normalizeChannelForSave(channel = {}) {
   }
   if (next.auto_truncate) next.auto_truncate = true;
   else delete next.auto_truncate;
+  const autoTruncateMarker = String(next.auto_truncate_marker || '').trim();
+  if (autoTruncateMarker) next.auto_truncate_marker = autoTruncateMarker;
+  else delete next.auto_truncate_marker;
+  const autoTruncatePrompt = String(next.auto_truncate_prompt || '');
+  if (autoTruncatePrompt) next.auto_truncate_prompt = autoTruncatePrompt;
+  else delete next.auto_truncate_prompt;
   if (keys.length > 0) {
     next.key = keys[0];
     if (keys.length > 1) next.keys = keys;

@@ -468,6 +468,7 @@ function buildLogContext(req, data = {}) {
 
 function responseLogFields(context = {}, extra = {}) {
   const fields = { ...extra };
+  if (context.autoTruncated) fields.autoTruncated = true;
   if (context.clientIp) fields.clientIp = context.clientIp;
   if (context.requestedModel && context.requestedModel !== extra.model) fields.requestedModel = context.requestedModel;
   if (context.inputContent) fields.inputContent = context.inputContent;
