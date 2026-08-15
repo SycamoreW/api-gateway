@@ -1,6 +1,10 @@
 config.json
-config.json.*
-stats.json
-logs/
+config.json.bak
 *.bak*
+*.mjs.bak*
+stats.json
+*.log
 node_modules/
+.env
+.env.*
+.git.unlinked*/
