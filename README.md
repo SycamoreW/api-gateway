@@ -1,4 +1,4 @@
-# API Gateway
+# API Gateway 2.0
 
 OpenAI-compatible aggregate API gateway with a WebUI for channels, models, logs, stats, key rotation, and Pioneer billing status.
 
