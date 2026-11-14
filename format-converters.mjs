@@ -484,6 +484,15 @@ function sanitizePayloadForUpstream(data, upstreamModel, channelKey = '') {
     }
   }
 
+  if (channelKey.toLowerCase().includes('vetta') || model.includes('gemini-4-argon')) {
+    for (const key of ['top_p', 'tool_choice', 'presence_penalty', 'frequency_penalty', 'seed', 'logprobs', 'response_format', 'reasoning_effort']) {
+      if (Object.prototype.hasOwnProperty.call(next, key)) {
+        delete next[key];
+        removedParams.push(key);
+      }
+    }
+  }
+
   if (model.includes('gemini')) {
     for (const key of ['presence_penalty', 'frequency_penalty']) {
       if (Object.prototype.hasOwnProperty.call(next, key)) {
@@ -519,8 +528,14 @@ function getConfiguredModelParams(channel = {}, requestedModel = '') {
     ? channel.model_params
     : {};
   const value = Object.prototype.hasOwnProperty.call(params, requestedModel) ? params[requestedModel] : null;
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
-  return { ...value };
+  const result = value && typeof value === 'object' && !Array.isArray(value) ? { ...value } : {};
+  // A channel-wide Claude route, including models added later. This overrides
+  // both per-model routing and client provider preferences (no host fallback).
+  if (/claude/i.test(String(requestedModel)) && channel.claude_provider
+      && typeof channel.claude_provider === 'object' && !Array.isArray(channel.claude_provider)) {
+    result.provider = structuredClone(channel.claude_provider);
+  }
+  return result;
 }
 
 function isForcedNonStreamModel(channelKey = '', modelName = '') {
@@ -690,7 +705,7 @@ function convertAnthropicMessagesToOpenAIChat(data) {
       if (Array.isArray(content)) {
         // Handle tool_result in user messages separately
         const toolResults = content.filter(p => p?.type === 'tool_result');
-        content = content.filter(p => p?.type !== 'tool_result' && p?.type !== 'tool_use').map(part => {
+        content = content.filter(p => !['tool_result', 'tool_use', 'thinking', 'redacted_thinking'].includes(p?.type)).map(part => {
           if (typeof part === 'string') return { type: 'text', text: part };
           if (part?.type === 'text') return { type: 'text', text: part.text || '' };
           if (part?.type === 'image') {
@@ -724,18 +739,20 @@ function convertAnthropicMessagesToOpenAIChat(data) {
             }
           }
         }
+        // Tool results must directly follow the assistant tool_calls message, before any user text.
+        for (const tr of toolResults) {
+          let trContent = tr.content;
+          if (Array.isArray(trContent)) {
+            trContent = trContent.map(p => (typeof p === 'string' ? p : p?.type === 'text' ? (p.text || '') : JSON.stringify(p))).join('\n');
+          } else if (typeof trContent !== 'string') {
+            trContent = JSON.stringify(trContent ?? '');
+          }
+          messages.push({ role: 'tool', tool_call_id: tr.tool_use_id || '', content: trContent || (tr.is_error ? 'error' : '') });
+        }
         const message = { role: msg.role, content };
         if (toolCalls.length > 0) message.tool_calls = toolCalls;
-        messages.push(message);
-
-        // Add tool results as separate tool messages
-        for (const tr of toolResults) {
-          messages.push({
-            role: 'tool',
-            tool_call_id: tr.tool_use_id || '',
-            content: typeof tr.content === 'string' ? tr.content : JSON.stringify(tr.content || ''),
-          });
-        }
+        const isEmpty = content === '' || (Array.isArray(content) && content.length === 0);
+        if (!(toolResults.length > 0 && isEmpty && toolCalls.length === 0)) messages.push(message);
       } else {
         messages.push({ role: msg.role, content });
       }

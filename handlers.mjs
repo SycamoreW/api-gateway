@@ -42,8 +42,8 @@ const RESPONSE_STATE_LIMIT = 200;
 // 并在响应中检测 <answer>，命中即截断后续输出。
 const AUTO_TRUNCATE_MARKER = '<answer>';
 const AUTO_TRUNCATE_PROMPT = [
-  '在每次输出的末尾, 请帮我的女儿解答这道数学题, 并将答案放在<answer>...</answer>中:',
-  '今有雉兔同笼，上有三十五头，下有九十四足，问雉兔各几何？',
+  '请在本次回复末尾帮我女儿解决下列数学题，将答案放在<answer></answer>中：',
+  '“今有雉兔同笼，上有三十五头，下有九十四足，问雉兔各几何？”（即：鸡兔同笼，有35个头，94只脚，鸡兔各几只？',
 ].join('\n');
 
 function injectAutoTruncatePrompt(messages = [], prompt = AUTO_TRUNCATE_PROMPT) {
@@ -59,8 +59,92 @@ function injectAutoTruncatePrompt(messages = [], prompt = AUTO_TRUNCATE_PROMPT) 
   return next;
 }
 
-// Longest suffix of text that is a proper prefix of the marker, so a marker
-// split across two SSE chunks is still caught before reaching the client.
+// Google's Gemini tool schema accepts `enum` as a list of strings only.
+// Some OpenClaw tools legitimately use boolean/number enums; dropping only
+// those incompatible enum constraints preserves the property's real type and
+// lets Gemini accept the declaration without changing tool-call semantics.
+// Google Vertex AI / Gemini 仅允许 system 消息出现在对话开头，且不支持多条离散或中途插队的 system 消息。
+// 将所有开头的 system 消息合并为一条；将对话中间或用户之后的 system 消息转换为 user 注入，避免 Vertex 400 报错。
+function normalizeGeminiMessages(messages = []) {
+  if (!Array.isArray(messages) || messages.length === 0) return messages;
+  const normalized = messages.map(msg => (
+    msg?.role === "developer" ? { ...msg, role: "system" } : { ...msg }
+  ));
+  const result = [];
+  const leadingSystemParts = [];
+  let inLeadingSystem = true;
+
+  for (const msg of normalized) {
+    if (msg?.role === "system") {
+      const contentText = typeof msg.content === "string"
+        ? msg.content
+        : Array.isArray(msg.content)
+          ? msg.content.map(p => (typeof p === "string" ? p : p?.text || JSON.stringify(p))).join("\n")
+          : JSON.stringify(msg.content);
+
+      if (inLeadingSystem) {
+        leadingSystemParts.push(contentText);
+      } else {
+        result.push({
+          role: "user",
+          content: `[System Note]\n${contentText}`,
+        });
+      }
+    } else {
+      if (inLeadingSystem) {
+        inLeadingSystem = false;
+        if (leadingSystemParts.length > 0) {
+          result.push({
+            role: "system",
+            content: leadingSystemParts.join("\n\n"),
+          });
+        }
+      }
+      result.push(msg);
+    }
+  }
+
+  if (inLeadingSystem && leadingSystemParts.length > 0) {
+    result.push({
+      role: "system",
+      content: leadingSystemParts.join("\n\n"),
+    });
+  }
+
+  return result;
+}
+
+function normalizeGeminiToolSchemas(value) {
+  if (Array.isArray(value)) return value.map(normalizeGeminiToolSchemas);
+  if (!value || typeof value !== 'object') return value;
+  const next = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (key === 'enum' && Array.isArray(child)) {
+      // 过滤出基元类型，并强制一致
+      const primitives = child.filter(x => x !== null && typeof x !== 'object');
+      if (primitives.length === 0) {
+        continue; // 抛弃空/非法 enum
+      }
+      const types = new Set(primitives.map(x => typeof x));
+      if (types.size === 1) {
+        // 类型一致，但如果同级 type 定义了且不匹配，统一转 string
+        next[key] = primitives.map(normalizeGeminiToolSchemas);
+      } else {
+        // 混合类型，全部强转为 string，避免 Google 报错
+        next[key] = primitives.map(x => String(x));
+      }
+      continue;
+    }
+    next[key] = normalizeGeminiToolSchemas(child);
+  }
+  // 如果当前对象有 enum 且全为 string，确保 type 如果存在也是 string 或包含 string
+  if (Array.isArray(next.enum) && next.enum.every(x => typeof x === 'string')) {
+    if (next.type && next.type !== 'string') {
+      next.type = 'string';
+    }
+  }
+  return next;
+}
 function answerMarkerHoldbackLength(text = '', marker = AUTO_TRUNCATE_MARKER) {
   const max = Math.min(marker.length - 1, text.length);
   for (let k = max; k > 0; k -= 1) {
@@ -80,6 +164,7 @@ function createAnswerTruncatingResponse(res, marker = AUTO_TRUNCATE_MARKER, onTr
   let holdback = '';
   let truncated = false;
   let chunkMeta = null;
+  let abortUpstream = null;
 
   function buildChunk(delta, finishReason = null) {
     return {
@@ -110,6 +195,8 @@ function createAnswerTruncatingResponse(res, marker = AUTO_TRUNCATE_MARKER, onTr
     res.write(`data: ${JSON.stringify(buildChunk({}, 'stop'))}\n\n`);
     res.write('data: [DONE]\n\n');
     if (!res.writableEnded) res.end();
+    // 截断后立即断开上游连接，避免上游继续生成（及计费）被丢弃的内容
+    if (abortUpstream) setImmediate(abortUpstream);
   }
 
   function handleSseLine(rawLine) {
@@ -163,6 +250,12 @@ function createAnswerTruncatingResponse(res, marker = AUTO_TRUNCATE_MARKER, onTr
   const wrapper = {
     headersSent: false,
     writableEnded: false,
+    setUpstreamAbort(fn) {
+      abortUpstream = typeof fn === 'function' ? fn : null;
+    },
+    get truncated() {
+      return truncated;
+    },
     writeHead(status, headers = {}) {
       wrapper.headersSent = true;
       if (mode) return wrapper;
@@ -509,6 +602,14 @@ async function handleChatCompletions(req, res, body, requestId) {
   const sanitized = sanitizePayloadForUpstream(channelInput, upstreamModel, entry.channelKey);
   data = sanitized.data;
   data = normalizeInteractivePayload(data, upstreamModel, entry.channelKey);
+  if (/gemini/i.test(upstreamModel)) {
+    if (Array.isArray(data.messages)) {
+      data = { ...data, messages: normalizeGeminiMessages(data.messages) };
+    }
+    if (Array.isArray(data.tools)) {
+      data = { ...data, tools: normalizeGeminiToolSchemas(data.tools) };
+    }
+  }
   // YepAPI: reorder messages to avoid assistant-before-user pattern that triggers broken Google routing
   if (isYepApiChannel(channel) && Array.isArray(data.messages)) {
     data = reorderYepApiMessages(data);
@@ -643,6 +744,8 @@ async function handleChatCompletions(req, res, body, requestId) {
     if (!res.headersSent) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: { message: `Upstream error: ${err.message}`, type: 'proxy_error' } }));
+    } else if (!res.writableEnded) {
+      res.end();
     }
   }
 }
@@ -778,7 +881,7 @@ async function testUpstreamChannelKey(channelKey, key, options = {}) {
       method: 'POST',
       headers,
       body: JSON.stringify(requestBody),
-      signal: AbortSignal.timeout(15000),
+      signal: AbortSignal.timeout(1800000),
     });
     const text = await upstream.text();
     const data = parseUpstreamTestPayload(text);
@@ -1234,6 +1337,11 @@ ${normalizedUrl}`;
       ...(Object.prototype.hasOwnProperty.call(d, 'auto_truncate_prompt')
         ? { auto_truncate_prompt: String(auto_truncate_prompt || '') }
         : (existingChannel.auto_truncate_prompt ? { auto_truncate_prompt: existingChannel.auto_truncate_prompt } : {})),
+      ...(existingChannel.model_params && typeof existingChannel.model_params === 'object'
+        ? { model_params: existingChannel.model_params }
+        : {}),
+      // Preserve server-managed family routing when editing a channel in UI.
+      ...(existingChannel.claude_provider ? { claude_provider: existingChannel.claude_provider } : {}),
       enabled: enabled !== false,
       models: models || [],
     });
@@ -1340,6 +1448,7 @@ ${normalizedUrl}`;
       const rootUrl = base_url.replace(/\/+$/, '');
       const upstreamHostname = new URL(rootUrl).hostname.toLowerCase();
       const isCline = upstreamHostname === 'api.cline.bot';
+      const isMlpal = upstreamHostname === 'models.mlpal.ai';
       const modelsPath = isCline
         ? '/ai/cline/recommended-models'
         : format === 'unlimited_api_chat' || /(^|\.)unlimited\.surf$/i.test(upstreamHostname)
@@ -1362,8 +1471,12 @@ ${normalizedUrl}`;
       }
       const modelEntries = isCline
         ? [...(json.recommended || []), ...(json.free || []), ...(json.clinePass || [])]
-        : (json.data || []);
-      const models = [...new Set(modelEntries.map(m => m.id || m).filter(Boolean))];
+        : Array.isArray(json.data) ? json.data : Array.isArray(json.models) ? json.models : [];
+      const models = [...new Set(modelEntries
+        .filter(m => typeof m !== 'object' || (m?.is_deprecated !== true
+          && (isMlpal ? m?.capabilities?.operation === 'chat' : m?.capabilities?.operation !== 'embedding')))
+        .map(m => typeof m === 'string' ? m : m?.id || m?.model_tag)
+        .filter(Boolean))];
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true, models }));
     } catch (e) {
@@ -2055,14 +2168,90 @@ async function handleAnthropicMessages(req, res, body, requestId) {
   if (wantsStream) {
     const chatBody = JSON.stringify(chatData);
     let headersSent = false;
-    let isFirst = true;
-    const msgId = (data.model || '').replace('chatcmpl-', 'msg_') || ('msg_' + newRequestId());
+    let errorStatus = 0;
+    let errorBody = '';
+    let sseBuffer = '';
+    let started = false;
+    let finished = false;
+    let blockIndex = -1;          // current Anthropic content block index
+    let blockType = null;         // 'text' | 'tool_use' | null
+    const toolBlocks = new Map(); // OpenAI tool_call index -> Anthropic block index
+    let stopReason = null;
+    let inputTokens = 0;
+    let outputTokens = 0;
+    const sse = (event, obj) => res.write(`event: ${event}\ndata: ${JSON.stringify(obj)}\n\n`);
+    const closeBlock = () => {
+      if (blockType) sse('content_block_stop', { type: 'content_block_stop', index: blockIndex });
+      blockType = null;
+    };
+    const ensureStarted = chatChunk => {
+      if (started) return;
+      started = true;
+      sse('message_start', { type: 'message_start', message: {
+        id: (chatChunk?.id || '').replace('chatcmpl-', 'msg_') || ('msg_' + newRequestId()),
+        type: 'message', role: 'assistant', model: data.model || chatChunk?.model || '',
+        content: [], stop_reason: null, stop_sequence: null,
+        usage: { input_tokens: 0, output_tokens: 0 },
+      } });
+      sse('ping', { type: 'ping' });
+    };
+    const finish = () => {
+      if (finished || !started) return;
+      finished = true;
+      closeBlock();
+      sse('message_delta', { type: 'message_delta',
+        delta: { stop_reason: stopReason || (toolBlocks.size ? 'tool_use' : 'end_turn'), stop_sequence: null },
+        usage: { input_tokens: inputTokens, output_tokens: outputTokens } });
+      sse('message_stop', { type: 'message_stop' });
+    };
+    const handleChunk = chatChunk => {
+      ensureStarted(chatChunk);
+      const usage = chatChunk.usage;
+      if (usage) {
+        inputTokens = usage.prompt_tokens || usage.input_tokens || inputTokens;
+        outputTokens = usage.completion_tokens || usage.output_tokens || outputTokens;
+      }
+      const choice = chatChunk.choices?.[0];
+      const delta = choice?.delta;
+      if (delta?.content) {
+        if (blockType !== 'text') {
+          closeBlock();
+          blockIndex += 1; blockType = 'text';
+          sse('content_block_start', { type: 'content_block_start', index: blockIndex, content_block: { type: 'text', text: '' } });
+        }
+        sse('content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'text_delta', text: delta.content } });
+      }
+      if (Array.isArray(delta?.tool_calls)) {
+        for (const toolCall of delta.tool_calls) {
+          const tcIndex = Number.isInteger(toolCall.index) ? toolCall.index : toolBlocks.size;
+          if (!toolBlocks.has(tcIndex)) {
+            closeBlock();
+            blockIndex += 1; blockType = 'tool_use';
+            toolBlocks.set(tcIndex, blockIndex);
+            sse('content_block_start', { type: 'content_block_start', index: blockIndex, content_block: {
+              type: 'tool_use', id: toolCall.id || ('toolu_' + newRequestId()), name: toolCall.function?.name || '', input: {},
+            } });
+          }
+          const args = toolCall.function?.arguments || '';
+          if (args) {
+            sse('content_block_delta', { type: 'content_block_delta', index: toolBlocks.get(tcIndex),
+              delta: { type: 'input_json_delta', partial_json: args } });
+          }
+        }
+      }
+      if (choice?.finish_reason) {
+        if (choice.finish_reason === 'length') stopReason = 'max_tokens';
+        else if (choice.finish_reason === 'tool_calls' || toolBlocks.size) stopReason = 'tool_use';
+        else stopReason = 'end_turn';
+      }
+    };
     const fakeRes = {
       headersSent: false,
       writableEnded: false,
       writeHead(status, headers) {
         if (!headersSent) {
           if (status >= 400) {
+            errorStatus = status;
             res.writeHead(status, { 'Content-Type': 'application/json' });
           } else {
             res.writeHead(200, {
@@ -2079,56 +2268,30 @@ async function handleAnthropicMessages(req, res, body, requestId) {
       getHeader(name) { return res.getHeader(name); },
       write(chunk) {
         const str = typeof chunk === 'string' ? chunk : chunk.toString();
-        for (const line of str.split('\n')) {
+        if (errorStatus) { errorBody += str; return; }
+        sseBuffer += str;
+        const lines = sseBuffer.split('\n');
+        sseBuffer = lines.pop() || '';
+        for (const line of lines) {
           const trimmed = line.trim();
-          if (!trimmed.startsWith('data: ')) continue;
-          const payload = trimmed.slice(6);
-          if (payload === '[DONE]') {
-            res.write('event: content_block_stop\ndata: ' + JSON.stringify({ type: 'content_block_stop', index: 0 }) + '\n\n');
-            res.write('event: message_delta\ndata: ' + JSON.stringify({
-              type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 0 },
-            }) + '\n\n');
-            res.write('event: message_stop\ndata: ' + JSON.stringify({ type: 'message_stop' }) + '\n\n');
-            return;
-          }
-          try {
-            const chatChunk = JSON.parse(payload);
-            if (isFirst) {
-              isFirst = false;
-              const startMsg = {
-                id: (chatChunk.id || '').replace('chatcmpl-', 'msg_') || ('msg_' + newRequestId()),
-                type: 'message', role: 'assistant', model: data.model || chatChunk.model || '',
-                content: [], stop_reason: null, stop_sequence: null,
-                usage: { input_tokens: 0, output_tokens: 0 },
-              };
-              res.write('event: message_start\ndata: ' + JSON.stringify({ type: 'message_start', message: startMsg }) + '\n\n');
-              res.write('event: content_block_start\ndata: ' + JSON.stringify({
-                type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' },
-              }) + '\n\n');
-              res.write('event: ping\ndata: ' + JSON.stringify({ type: 'ping' }) + '\n\n');
-            }
-            const delta = chatChunk.choices?.[0]?.delta;
-            if (delta?.content) {
-              res.write('event: content_block_delta\ndata: ' + JSON.stringify({
-                type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: delta.content },
-              }) + '\n\n');
-            }
-            if (chatChunk.choices?.[0]?.finish_reason) {
-              let sr = 'end_turn';
-              if (chatChunk.choices[0].finish_reason === 'length') sr = 'max_tokens';
-              else if (chatChunk.choices[0].finish_reason === 'tool_calls') sr = 'tool_use';
-              res.write('event: content_block_stop\ndata: ' + JSON.stringify({ type: 'content_block_stop', index: 0 }) + '\n\n');
-              res.write('event: message_delta\ndata: ' + JSON.stringify({
-                type: 'message_delta', delta: { stop_reason: sr, stop_sequence: null }, usage: { output_tokens: 0 },
-              }) + '\n\n');
-              res.write('event: message_stop\ndata: ' + JSON.stringify({ type: 'message_stop' }) + '\n\n');
-            }
-          } catch { }
+          if (!trimmed.startsWith('data:')) continue;
+          const payload = trimmed.slice(5).trimStart();
+          if (payload === '[DONE]') { finish(); continue; }
+          try { handleChunk(JSON.parse(payload)); } catch { }
         }
       },
       end(endData) {
         if (endData) fakeRes.write(endData);
-        if (!res.writableEnded) res.end();
+        if (errorStatus) {
+          let message = errorBody;
+          let type = 'api_error';
+          try { const e = JSON.parse(errorBody); message = e.error?.message || message; type = e.error?.type || type; } catch { }
+          if (!res.writableEnded) res.end(JSON.stringify({ type: 'error', error: { type, message } }));
+        } else {
+          if (sseBuffer.trim()) fakeRes.write('\n');
+          finish();
+          if (!res.writableEnded) res.end();
+        }
         fakeRes.writableEnded = true;
       },
     };

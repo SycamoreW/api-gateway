@@ -8,3 +8,13 @@ node_modules/
 .env
 .env.*
 .git.unlinked*/
+# local-only (added 2026-11-14)
+backups/
+.backup-*
+*.before*
+*.db
+*.db-*
+logs/
+data/
+lm-detector-dist/
+.lm-detector-updates/

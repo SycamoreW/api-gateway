@@ -121,10 +121,18 @@ const HARD_KEY_FAILURE_PATTERNS = [
 
 function classifyUpstreamKeyFailure(status = 0, message = '') {
   const text = String(message || '');
+  // A rejected message is not a revoked credential. In particular a warning
+  // about a future suspension must not match the generic 'suspend' pattern.
+  if (Number(status) === 403 && /your message was flagged/i.test(text) && /platform_abuse/i.test(text)) {
+    return { disable: false, retry: false, reason: 'content_policy_rejected', status: 403 };
+  }
   for (const item of HARD_KEY_FAILURE_PATTERNS) {
     if (item.re.test(text)) return { disable: true, reason: item.reason, status: Number(status) || null };
   }
   const code = Number(status) || 0;
+  if (code === 409 && /premium_allowance/i.test(text)) {
+    return { disable: true, retry: true, reason: "premium_allowance_exhausted", status: 409 };
+  }
   if ([401, 402, 403].includes(code)) return { disable: true, reason: `http_${code}`, status: code };
   if (code === 429) return { disable: false, retry: true, reason: 'rate_limited', status: code };
   if (code >= 500) return { disable: false, retry: true, reason: `http_${code}`, status: code };

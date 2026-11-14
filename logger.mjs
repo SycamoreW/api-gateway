@@ -1,3 +1,4 @@
+import child_process from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -273,16 +274,50 @@ function readVisibleGatewayLogs(options = 100) {
 
 function clearCurrentGatewayLog() {
   ensureLogDir();
-  const file = currentLogFile();
-  const sourceFile = logSourceName(file);
-  fs.writeFileSync(file, '');
+  const todayFile = currentLogFile();
+  const todaySource = logSourceName(todayFile);
+
+  // 1. 自动打包备份所有现有日志到 backups 目录
+  try {
+    const backupDir = path.join(path.dirname(LOG_DIR), "backups");
+    if (!fs.existsSync(backupDir)) {
+      fs.mkdirSync(backupDir, { recursive: true });
+    }
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const backupTar = path.join(backupDir, `logs-backup-${stamp}.tar.gz`);
+    const logFiles = fs.readdirSync(LOG_DIR).filter(f => f.startsWith("gateway-") && f.endsWith(".log"));
+    if (logFiles.length > 0) {
+      child_process.execFileSync("tar", ["-czf", backupTar, "-C", LOG_DIR, ...logFiles]);
+    }
+  } catch (backupErr) {
+    console.error("[logger] 备份日志失败:", backupErr);
+  }
+
+  // 2. 删除所有历史 gateway-*.log 文件，重新初始化今天的空日志
+  try {
+    const files = fs.readdirSync(LOG_DIR).filter(f => f.startsWith("gateway-") && f.endsWith(".log"));
+    for (const f of files) {
+      const fullPath = path.join(LOG_DIR, f);
+      try { fs.unlinkSync(fullPath); } catch {}
+    }
+  } catch (err) {
+    console.error("[logger] 删除旧日志文件失败:", err);
+  }
+  fs.writeFileSync(todayFile, "");
+
+  // 3. 清空 SQLite 数据库中的全部日志索引（网页展示全量清空）
   if (logDb) {
-    logDb.prepare('DELETE FROM gateway_logs WHERE source_file = ?').run(sourceFile);
-    logDb.prepare(`
-      INSERT INTO gateway_log_files (source_file, indexed_size)
-      VALUES (?, 0)
-      ON CONFLICT(source_file) DO UPDATE SET indexed_size = 0
-    `).run(sourceFile);
+    try {
+      logDb.prepare("DELETE FROM gateway_logs").run();
+      logDb.prepare("DELETE FROM gateway_log_files").run();
+      logDb.prepare(`
+        INSERT INTO gateway_log_files (source_file, indexed_size)
+        VALUES (?, 0)
+      `).run(todaySource);
+      logDb.pragma("vacuum");
+    } catch (dbErr) {
+      console.error("[logger] 清空日志数据库失败:", dbErr);
+    }
   }
 }
 
