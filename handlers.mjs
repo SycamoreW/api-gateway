@@ -624,6 +624,24 @@ async function handleChatCompletions(req, res, body, requestId) {
       if (allowed.has(k)) filtered[k] = data[k];
     }
     if (filtered.n !== undefined && filtered.n !== 1) filtered.n = 1;
+    if (Array.isArray(filtered.messages)) {
+      filtered.messages = filtered.messages
+        .map(m => {
+          if (!m || typeof m !== 'object') return null;
+          let text = '';
+          if (typeof m.content === 'string') {
+            text = m.content;
+          } else if (Array.isArray(m.content)) {
+            text = m.content
+              .filter(p => p && (p.type === 'text' || typeof p.text === 'string'))
+              .map(p => p.text || '')
+              .join('\n');
+          }
+          if (!text || !text.trim()) return null;
+          return { role: m.role, content: text };
+        })
+        .filter(Boolean);
+    }
     data = filtered;
   }
   const autoTruncate = channel.auto_truncate === true;
