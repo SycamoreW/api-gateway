@@ -60,6 +60,8 @@ function normalizeChannelForSave(channel = {}) {
   }
   if (next.auto_truncate) next.auto_truncate = true;
   else delete next.auto_truncate;
+  if (next.key_strategy === 'sticky') next.key_strategy = 'sticky';
+  else delete next.key_strategy;
   const autoTruncateMarker = String(next.auto_truncate_marker || '').trim();
   if (autoTruncateMarker) next.auto_truncate_marker = autoTruncateMarker;
   else delete next.auto_truncate_marker;

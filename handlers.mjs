@@ -617,6 +617,15 @@ async function handleChatCompletions(req, res, body, requestId) {
   if (isForcedNonStreamModel(entry.channelKey, upstreamModel)) {
     data.stream = false;
   }
+  if (entry.channelKey === 'tracerml') {
+    const allowed = new Set(['model', 'messages', 'max_tokens', 'max_completion_tokens', 'stream', 'stream_options', 'response_format', 'n']);
+    const filtered = {};
+    for (const k of Object.keys(data)) {
+      if (allowed.has(k)) filtered[k] = data[k];
+    }
+    if (filtered.n !== undefined && filtered.n !== 1) filtered.n = 1;
+    data = filtered;
+  }
   const autoTruncate = channel.auto_truncate === true;
   const autoTruncateMarker = String(channel.auto_truncate_marker || AUTO_TRUNCATE_MARKER);
   const autoTruncatePrompt = String(channel.auto_truncate_prompt || AUTO_TRUNCATE_PROMPT);
@@ -1274,6 +1283,7 @@ ${normalizedUrl}`;
       auto_truncate,
       auto_truncate_marker,
       auto_truncate_prompt,
+      key_strategy,
       enabled,
       isNew,
       previousChannelKey,
@@ -1337,6 +1347,9 @@ ${normalizedUrl}`;
       ...(Object.prototype.hasOwnProperty.call(d, 'auto_truncate_prompt')
         ? { auto_truncate_prompt: String(auto_truncate_prompt || '') }
         : (existingChannel.auto_truncate_prompt ? { auto_truncate_prompt: existingChannel.auto_truncate_prompt } : {})),
+      ...(Object.prototype.hasOwnProperty.call(d, 'key_strategy')
+        ? (key_strategy === 'sticky' ? { key_strategy: 'sticky' } : {})
+        : (existingChannel.key_strategy === 'sticky' ? { key_strategy: 'sticky' } : {})),
       ...(existingChannel.model_params && typeof existingChannel.model_params === 'object'
         ? { model_params: existingChannel.model_params }
         : {}),

@@ -42,11 +42,17 @@ function selectChannelKey(channel = {}, channelKey = '', excludedKeys = new Set(
   const excluded = excludedKeys instanceof Set ? excludedKeys : new Set(excludedKeys || []);
   const activeKeys = getActiveChannelKeys(channel).filter(key => !excluded.has(key));
   if (allKeys.length === 0 || activeKeys.length === 0) return { key: '', index: -1, count: allKeys.length, fingerprint: '' };
-  const cursorKey = channelKey || channel.name || channel.base_url || 'default';
-  const cursor = channelKeyCursors.get(cursorKey) || 0;
-  const index = cursor % activeKeys.length;
-  channelKeyCursors.set(cursorKey, (cursor + 1) % activeKeys.length);
-  const selectedKey = activeKeys[index];
+  let selectedKey;
+  let index = 0;
+  if (channel.key_strategy === 'sticky') {
+    selectedKey = activeKeys[0];
+  } else {
+    const cursorKey = channelKey || channel.name || channel.base_url || 'default';
+    const cursor = channelKeyCursors.get(cursorKey) || 0;
+    index = cursor % activeKeys.length;
+    channelKeyCursors.set(cursorKey, (cursor + 1) % activeKeys.length);
+    selectedKey = activeKeys[index];
+  }
   // index in allKeys for logging purposes
   const allIndex = allKeys.indexOf(selectedKey);
   return {

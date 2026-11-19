@@ -2930,6 +2930,7 @@ function channelFlags(ch = {}) {
     flags.push(html`<${Badge} tone="accent" icon="brain" title="Anthropic 思考模式">思考 ${ch.anthropic_thinking_type}${extra}<//>`);
   }
   if (ch.auto_truncate) flags.push(html`<${Badge} tone="warn" icon="scissors" title=${`截断标记：${ch.auto_truncate_marker || DEFAULT_TRUNCATE_MARKER}`}>自动截断<//>`);
+  if (ch.key_strategy === 'sticky') flags.push(html`<${Badge} tone="accent" icon="key" title="固定使用第一个可用 Key，耗尽禁用后再切下一个">单 Key 耗尽<//>`);
   if (isObj(ch.model_params) && Object.keys(ch.model_params).length) flags.push(html`<${Badge} icon="sliders" title="部分模型配置了附加参数（model_params）">模型参数<//>`);
   return flags;
 }
@@ -3147,6 +3148,7 @@ function ChannelDetailPage({ ckey }) {
                   : `adaptive${ch.anthropic_output_effort ? ` · effort ${ch.anthropic_output_effort}` : ''}${ch.anthropic_thinking_display ? ` · ${ch.anthropic_thinking_display}` : ''}`}</dd>` : null}
               ${ch.prompt_cache_enabled ? html`<dt>Prompt 缓存</dt><dd>TTL ${ch.prompt_cache_ttl || '5m'}</dd>` : null}
               ${ch.auto_truncate ? html`<dt>截断标记</dt><dd class="mono small">${ch.auto_truncate_marker || DEFAULT_TRUNCATE_MARKER}</dd>` : null}
+              ${ch.key_strategy === 'sticky' ? html`<dt>Key 策略</dt><dd>单 Key 耗尽切换</dd>` : null}
               ${agg.lastUsedAt ? html`<dt>最近调用</dt><dd><${LiveTime} ts=${agg.lastUsedAt} /></dd>` : null}
             </dl>
           </div>
@@ -3635,6 +3637,7 @@ function ChannelEditor({ editKey = '', close, requestClose, setGuard }) {
     truncate: Boolean(orig.auto_truncate),
     marker: orig.auto_truncate_marker || DEFAULT_TRUNCATE_MARKER,
     truncPrompt: orig.auto_truncate_prompt || '',
+    keyStrategy: orig.key_strategy === 'sticky' ? 'sticky' : 'round_robin',
     keysText: '',
     models: Array.isArray(orig.models) ? [...orig.models] : [],
   }), []);
@@ -3742,6 +3745,7 @@ function ChannelEditor({ editKey = '', close, requestClose, setGuard }) {
         auto_truncate: f.truncate,
         auto_truncate_marker: f.marker.trim() || DEFAULT_TRUNCATE_MARKER,
         auto_truncate_prompt: f.truncPrompt || '',
+        key_strategy: f.keyStrategy,
         ...(formatField ? { format: formatField } : {}),
         ...(fmt === 'anthropic' ? { anthropic_version: f.anthropicVersion.trim() || '2023-06-01' } : {}),
         prompt_cache_enabled: f.cache,
@@ -3879,6 +3883,9 @@ function ChannelEditor({ editKey = '', close, requestClose, setGuard }) {
         <div class="section-title"><${Icon} name="sliders" />高级</div>
         <div class="form-grid">
           <div class="col" style="gap:10px">
+            <${Field} label="Key 调度策略" hint="轮询：多 Key 依次分摊请求；单 Key 耗尽：固定使用第一个可用 Key，额度耗尽自动禁用后再切下一个。">
+              <${Seg} value=${f.keyStrategy} onChange=${v => set('keyStrategy', v)} options=${[{ value: 'round_robin', label: '轮询' }, { value: 'sticky', label: '单 Key 耗尽' }]} />
+            <//>
             <${Switch} checked=${f.cache} onChange=${v => set('cache', v)} label="启用 Prompt 缓存"
               hint=${f.format === 'anthropic' ? '为 Anthropic Messages 请求添加顶层缓存控制' : '在最后一个可复用消息块上添加 cache_control（需上游支持）'} />
             ${f.cache ? html`
